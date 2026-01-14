@@ -9,5 +9,3 @@ This system visualizes real-time vibration, acceleration, and tilt data from MEM
 - Backend: Node.js / FastAPI (sensor gateway + database)
 - Transport: REST + WebSockets
 - Database: PostgreSQL
-
-aaaaa
