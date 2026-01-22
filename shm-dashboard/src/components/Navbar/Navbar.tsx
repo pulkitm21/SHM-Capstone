@@ -11,18 +11,18 @@ const Navbar = () => {
   const [activeItem, setActiveItem] = useState('home');
 
   const navItems: NavItem[] = [
-    { id: 'home', label: 'Home', icon: '' },
-    { id: 'sensor control', label: 'Sensor Control', icon: '' },
-    { id: 'system analytics', label: 'System Analytics', icon: '' },
-    { id: 'export', label: 'Export', icon: '' },
-    { id: 'user management', label: 'User Management', icon: '' },
-    { id: 'settings', label: 'Settings', icon: '' },
+    { id: 'home', label: 'Home', icon: '📈' },
+    { id: 'sensor control', label: 'Sensor Control', icon: '📈' },
+    { id: 'system analytics', label: 'System Analytics', icon: '📈' },
+    { id: 'export', label: 'Export', icon: '📈' },
+    { id: 'user management', label: 'User Management', icon: '📈' },
+    { id: 'settings', label: 'Settings', icon: '📈' },
   ];
 
   return (
     <nav className="navbar">
-      <div className="navbar-brand">
-        <h2>Cape Scott</h2>
+      <div className="navbar-title-block">
+        <h1>Cape Scott, BC</h1>
       </div>
       <ul className="navbar-menu">
         {navItems.map((item) => (
