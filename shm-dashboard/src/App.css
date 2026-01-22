@@ -1,5 +1,19 @@
-.background {
-  background-color: #3b35e5;
+html, body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+}
+
+.app-shell {
   min-height: 100vh;
-  display: flex;
+}
+
+
+.main {
+  margin-left: 275px;               /* navbar width */
+  width: calc(100% - 275px);
+  min-height: 100vh;
 }
