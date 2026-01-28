@@ -4,21 +4,22 @@
   position: fixed;
   left: 0;
   top: 0;
-  background: #1281b1;
+  background: #1689ba;
   box-shadow: 2px 0 10px rgba(0, 0, 0, 0.1);
   padding: 20px 0;
+  border-radius: 5px;
 }
 
 .navbar-title-block {
-  padding: 0 20px 20px;
-  border-bottom: 1px solid #000000;
+  padding: 10px 20px 20px;
+  border-bottom: 5px solid #000000;
   margin-bottom: 25px;
 }
 
-.navbar-title h1 {
+.navbar-title-block h1 {
   color: #000000;
-  font-size: 24px;
-  font-weight: 600;
+  font-size: 20px;
+  font-weight: 500;
 }
 
 .navbar-menu {
@@ -32,8 +33,7 @@
   padding: 20px 20px;
   cursor: pointer;
   transition: all 0.3s ease;
-  color: #000000;
-  text-decoration: none;
+  color: #ffffff;
 }
 
 .navbar-item:hover {
@@ -45,6 +45,7 @@
   font-weight: bold;
   background: #e3f2fd;
   color: #000000;
+  border-radius: 10px;
 }
 
 .navbar-icon {
@@ -53,6 +54,6 @@
 }
 
 .navbar-label {
-  font-size: 28px;
-  font-weight: 500;
+  font-size: 20px;
+  font-weight: 300;
 }
