@@ -32,6 +32,7 @@ def main():
             while True:
                 data = conn.recv(1024)
                 if not data:
+                    print("No more data received")
                     break
 
                 # Decode incoming CSV line(s)
