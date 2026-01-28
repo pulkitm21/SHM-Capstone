@@ -1,28 +1,24 @@
-import './App.css';
-import Navbar from './components/Navbar/Navbar';
-import Topbar from './components/TopBar/TopBar';
-import Tiles from './components/Tiles/Tiles';
+import "./App.css";
+import Layout from "./Layout/Layout";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import Home from "./Pages/Home/Home";
+import Users from "./Pages/Users/Users";
+import SensorControl from "./Pages/SensorControl/SensorControl";
+import Export from "./Pages/Export/Export";
 
 function App() {
-  const tiles = [
-    {
-      id: '1',
-      title: 'Template Tile',
-      count: 1,
-      color: '#e3f2fd',
-      icon: '🧩',
-    },
-  ];
-
   return (
-    <div className="app-shell">
-      <Navbar />
-      <div className="main">
-        <Topbar />
-        <Tiles tiles={tiles} />
-      </div>
-    </div>
+   <BrowserRouter>
+      <Routes>
+        <Route path="/" element={<Layout />}>
+          <Route index element={<Home />} />
+          <Route path="/sensorcontrol" element={<SensorControl />} />
+          <Route path="/export" element={<Export />} />
+          <Route path="/users" element={<Users />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Route>
+      </Routes>
+    </BrowserRouter>
   );
 }
-
 export default App;

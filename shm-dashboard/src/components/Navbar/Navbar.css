@@ -33,6 +33,7 @@
   cursor: pointer;
   transition: all 0.3s ease;
   color: #000000;
+  text-decoration: none;
 }
 
 .navbar-item:hover {
@@ -51,7 +52,7 @@
   margin-right: 12px;
 }
 
-.navbar-labels {
+.navbar-label {
   font-size: 28px;
   font-weight: 500;
 }
