@@ -10,7 +10,7 @@ HOST = "127.0.0.1"
 PORT = 5000
 
 BUFFER_SIZE = 100        # samples in RAM before writing
-WRITE_INTERVAL = 5       # seconds
+WRITE_INTERVAL = 0.1       # seconds
 DATA_PATH = "/home/pi/Data/accel_data.csv"  # microSD storage
 
 data_buffer = queue.Queue()
