@@ -1,54 +1,72 @@
 import socket
+import json
+import queue
+import threading
+import time
+import csv
 import os
-from datetime import datetime
 
-# Configuration
-HOST = ""                  # Listen on all interfaces
-PORT = 9000
-DATA_DIR = "/home/pi/data"
-FILENAME = "accel_data.csv"
+HOST = "127.0.0.1"
+PORT = 5000
 
-# Ensure storage directory exists (microSD)
-os.makedirs(DATA_DIR, exist_ok=True)
-file_path = os.path.join(DATA_DIR, FILENAME)
+BUFFER_SIZE = 100        # samples in RAM before writing
+WRITE_INTERVAL = 5       # seconds
+DATA_PATH = "/home/pi/Data/accel_data.csv"  # microSD storage
 
-def main():
-    # Create TCP socket
+data_buffer = queue.Queue()
+
+# ---------- Socket Receiver ----------
+def receive_data():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind((HOST, PORT))
     server.listen(1)
-
-    print(f"Listening for data on port {PORT}...")
+    print("Receiver listening...")
 
     conn, addr = server.accept()
-    print(f"Connected by {addr}")
+    print("Connected to generator")
 
-    with open(file_path, "a") as f:
-        # Write CSV header once
-        if f.tell() == 0:
-            f.write("timestamp,node_id,ax,ay,az\n")
+    with conn:
+        buffer = ""
+        while True:
+            chunk = conn.recv(1024).decode()
+            if not chunk:
+                break
 
-        try:
-            while True:
-                data = conn.recv(1024)
-                if not data:
-                    print("No more data received")
-                    break
+            buffer += chunk
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                data_buffer.put(json.loads(line))
 
-                # Decode incoming CSV line(s)
-                decoded = data.decode("utf-8")
 
-                # Optional: add receive timestamp
-                for line in decoded.strip().split("\n"):
-                    f.write(line + "\n")
+# ---------- Writer to microSD ----------
+def write_to_sd():
+    file_exists = os.path.isfile(DATA_PATH)
 
-                f.flush()  # ensure data is written to microSD
+    while True:
+        time.sleep(WRITE_INTERVAL)
 
-        except KeyboardInterrupt:
-            print("Stopping receiver...")
+        rows = []
+        while not data_buffer.empty() and len(rows) < BUFFER_SIZE:
+            rows.append(data_buffer.get())
 
-    conn.close()
-    server.close()
+        if rows:
+            with open(DATA_PATH, "a", newline="") as f:
+                writer = csv.DictWriter(
+                    f, fieldnames=["timestamp","node id", "ax", "ay", "az"]
+                )
+                if not file_exists:
+                    writer.writeheader()
+                    file_exists = True
+                writer.writerows(rows)
 
+            print(f"Wrote {len(rows)} samples to SD")
+
+
+# ---------- Main ----------
 if __name__ == "__main__":
-    main()
+    threading.Thread(target=receive_data, daemon=True).start()
+    threading.Thread(target=write_to_sd, daemon=True).start()
+
+    print("Receiver running. Press Ctrl+C to stop.")
+    while True:
+        time.sleep(1)

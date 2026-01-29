@@ -2,6 +2,14 @@ import time
 import math
 import random
 from datetime import datetime
+import socket
+import json
+
+HOST = "127.0.0.1"   # localhost
+PORT = 5000
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.connect((HOST, PORT))
 
 # Simulation parameters
 SAMPLING_FREQ = 200          # Hz
@@ -22,26 +30,38 @@ def generate_sample(t):
     return ax, ay, az
 
 def main():
-    print("timestamp,node_id,ax,ay,az")
+    try:
+        print("timestamp,node_id,ax,ay,az")
 
-    start_time = time.time()
-    next_sample_time = start_time
+        start_time = time.time()
+        next_sample_time = start_time
+        samples = int(SIM_DURATION * SAMPLING_FREQ)
 
-    samples = int(SIM_DURATION * SAMPLING_FREQ)
+        for i in range(samples):
+            now = time.time()
+            t = now - start_time
 
-    for i in range(samples):
-        now = time.time()
-        t = now - start_time
+            ax, ay, az = generate_sample(t)
 
-        ax, ay, az = generate_sample(t)
+            timestamp = datetime.utcnow().isoformat()
+            print(f"{timestamp},{NODE_ID},{ax:.5f},{ay:.5f},{az:.5f}")
+            data = {
+                "timestamp": timestamp,
+                "node id": NODE_ID,
+                "ax": ax,
+                "ay": ay,
+                "az": az
+            }
+            sock.sendall((json.dumps(data) + "\n").encode())
 
-        timestamp = datetime.utcnow().isoformat()
-        print(f"{timestamp},{NODE_ID},{ax:.5f},{ay:.5f},{az:.5f}")
-
-        next_sample_time += DT
-        sleep_time = next_sample_time - time.time()
-        if sleep_time > 0:
-            time.sleep(sleep_time)
+            next_sample_time += DT
+            sleep_time = next_sample_time - time.time()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+    except KeyboardInterrupt:
+        print("Generator stopped.")
+    finally:
+        sock.close()
 
 if __name__ == "__main__":
     main()
