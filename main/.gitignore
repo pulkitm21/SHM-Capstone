@@ -1,0 +1,17 @@
+# ESP-IDF build output
+build/
+
+# ESP-IDF configuration (machine-specific)
+sdkconfig
+sdkconfig.old
+
+# Python junk
+__pycache__/
+*.pyc
+
+# VS Code settings
+.vscode/
+
+# OS junk
+.DS_Store
+Thumbs.db
