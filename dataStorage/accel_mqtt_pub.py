@@ -11,7 +11,7 @@ PI_IPS = [
     "192.168.1.42",   # Pi router-assigned IP (change this)
     "192.168.2.2"    # Pi static direct-Ethernet IP
 ]
-HOST = "192.168.2.2"
+HOST = "127.0.0.1"
 PORT = 1883
 TOPIC = "shm/windturbine/node01/accel"
 
