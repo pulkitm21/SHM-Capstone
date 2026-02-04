@@ -1,0 +1,26 @@
+Command: cmake -G Ninja -DPYTHON_DEPS_CHECKED=1 -DPYTHON=C:\Espressif\python_env\idf5.5_py3.13_env\Scripts\python.exe -DESP_PLATFORM=1 -DCCACHE_ENABLE=1 C:\Users\emili\Desktop\School\MANU430 Capstone\CapstoneFirmware\firmware
+CMake Warning at C:/Espressif/frameworks/esp-idf-v5.5.2/tools/cmake/build.cmake:627 (message):
+  WARNING: The following Kconfig variables were used in "if" clauses, but not
+  found in any Kconfig file:
+
+      ETHERNET_PHY_USE_LAN867X, introduced by espressif/lan867x, defined in (unknown)
+      ETHERNET_SPI_USE_CH390, introduced by espressif/ch390, defined in (unknown)
+      ETHERNET_SPI_USE_DM9051, introduced by espressif/dm9051, defined in (unknown)
+      ETHERNET_SPI_USE_ENC28J60, introduced by espressif/enc28j60, defined in (unknown)
+      ETHERNET_SPI_USE_KSZ8851SNL, introduced by espressif/ksz8851snl, defined in (unknown)
+      ETHERNET_SPI_USE_LAN865X, introduced by espressif/lan865x, defined in (unknown)
+      ETHERNET_SPI_USE_W5500, introduced by espressif/w5500, defined in (unknown)
+
+  
+
+Call Stack (most recent call first):
+  C:/Espressif/frameworks/esp-idf-v5.5.2/tools/cmake/project.cmake:740 (idf_build_process)
+  CMakeLists.txt:6 (project)
+
+
+CMake Warning at C:/Espressif/frameworks/esp-idf-v5.5.2/tools/cmake/project.cmake:753 (message):
+  Missing kconfig option.  Re-run the build process...
+Call Stack (most recent call first):
+  CMakeLists.txt:6 (project)
+
+
