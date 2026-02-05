@@ -1,0 +1,27 @@
+.sc-card {
+  background: #fff;
+  border-radius: 16px;
+  padding: 14px 14px 12px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.08);
+}
+
+.sc-card-title {
+  font-weight: 800;
+  font-size: 18px;
+  margin-bottom: 10px;
+}
+
+.sc-card-body {
+  font-size: 14px;
+}
+
+.sc-muted {
+  color: #444;
+}
+
+.sc-two-col .sc-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 6px 0;
+}

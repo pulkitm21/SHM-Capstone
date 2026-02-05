@@ -1,0 +1,29 @@
+/* Reuse same base card class names (sc-card, sc-card-title, sc-card-body, sc-muted) */
+.sc-config-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sc-config-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+
+.sc-mini-select {
+  background: #f1f1f1;
+  border: 1px solid #bbb;
+  border-radius: 10px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.sc-pill {
+  background: #f1f1f1;
+  border: 1px solid #bbb;
+  border-radius: 10px;
+  padding: 6px 10px;
+  font-weight: 600;
+}

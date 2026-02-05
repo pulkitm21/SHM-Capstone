@@ -1,0 +1,56 @@
+.fault-log {
+  width: 100%;
+}
+
+.fault-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.fault-table thead th {
+  text-align: left;
+  font-weight: 700;
+  padding: 8px 6px;
+  border-bottom: 2px solid #ddd;
+}
+
+.fault-table tbody td {
+  padding: 8px 6px;
+  border-bottom: 1px solid #eee;
+  vertical-align: middle;
+}
+
+.fault-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+/* monospace timestamps */
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Status pills */
+.status-pill {
+  display: inline-block;
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-weight: 700;
+  font-size: 12px;
+  border: 1px solid #000;
+}
+
+.status-pill.high {
+  background: #f8d7da;
+  color: #842029;
+}
+
+.status-pill.warning {
+  background: #fff3cd;
+  color: #664d03;
+}
+
+.status-pill.info {
+  background: #cff4fc;
+  color: #055160;
+}
