@@ -29,7 +29,7 @@ extern "C" {
  ******************************************************************************/
 
 // MQTT Broker settings - UPDATE THESE FOR YOUR SETUP
-#define MQTT_BROKER_URI         "mqtt://192.168.1.100:1883"  // Change to your Mac's IP
+#define MQTT_BROKER_URI         "mqtt://192.168.2.2:1883"  // Change to your Mac's IP
 #define MQTT_CLIENT_ID          "wind_turbine_esp32"
 
 // MQTT Topics

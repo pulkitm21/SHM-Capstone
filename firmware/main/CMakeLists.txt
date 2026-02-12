@@ -12,6 +12,7 @@ idf_component_register(
          sensor_task.c
          mqtt.c
          data_processing_and_mqtt_task.c
+         fake_daq_task.c
     INCLUDE_DIRS "."
     PRIV_INCLUDE_DIRS
     REQUIRES esp_driver_i2c
