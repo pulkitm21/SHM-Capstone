@@ -10,6 +10,8 @@ idf_component_register(
          adxl355.c
          scl3300.c
          sensor_task.c
+         mqtt.c
+         data_processing_and_mqtt_task.c
     INCLUDE_DIRS "."
     PRIV_INCLUDE_DIRS
     REQUIRES esp_driver_i2c
@@ -23,4 +25,5 @@ idf_component_register(
                   esp_event
                   ethernet_init
                   nvs_flash
+                  mqtt
 )
