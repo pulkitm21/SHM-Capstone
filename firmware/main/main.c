@@ -475,7 +475,14 @@ static const char *TAG = "main";
 #define ETH_IP_TIMEOUT_MS       30000   // 30 seconds to get IP
 #define MQTT_CONNECT_TIMEOUT_MS 30000   // 30 seconds to connect to broker
 
-
+// ===== Static IP test setup (no router/DHCP) =====
+// Set these to match your Raspberry Pi's subnet.
+// Example: Pi = 192.168.2.2/24  -> ESP32 can be 192.168.2.50/24
+#define USE_STATIC_IP           1
+#define ESP32_STATIC_IP_A       192
+#define ESP32_STATIC_IP_B       168
+#define ESP32_STATIC_IP_C       2
+#define ESP32_STATIC_IP_D       50
 /*******************************************************************************
  * Statistics Monitor Task
  ******************************************************************************/
@@ -538,26 +545,60 @@ static void print_banner(void)
 
 static esp_err_t init_network(void)
 {
-    ESP_LOGI(TAG, "Initializing Ethernet...");
-    
-    if (ethernet_init() != ESP_OK) {
-        ESP_LOGE(TAG, "Ethernet init failed");
-        return ESP_FAIL;
-    }
-    
-    ESP_LOGI(TAG, "Waiting for IP address (timeout: %d sec)...", ETH_IP_TIMEOUT_MS / 1000);
-    esp_err_t ret = ethernet_wait_for_ip(ETH_IP_TIMEOUT_MS);
-    
-    if (ret == ESP_OK) {
-        esp_netif_ip_info_t ip_info;
-        ethernet_get_ip_info(&ip_info);
-        ESP_LOGI(TAG, "Network ready: " IPSTR, IP2STR(&ip_info.ip));
-    } else {
-        ESP_LOGW(TAG, "No IP address yet - continuing anyway");
-    }
-    
-    return ESP_OK;
+//	ESP_LOGI(TAG, "Initializing Ethernet...");
+//
+//	    if (ethernet_init() != ESP_OK) {
+//	        ESP_LOGE(TAG, "Ethernet init failed");
+//	        return ESP_FAIL;
+//	    }
+//
+//	    // COMMENTED OUT - Using DHCP from router instead of static IP
+//	    // vTaskDelay(pdMS_TO_TICKS(1000));
+//	    // ESP_LOGI(TAG, "Assigning STATIC IP to ESP32...");
+//	    // if (ethernet_set_static_ip(192, 168, 1, 20) != ESP_OK) {
+//	    //     ESP_LOGE(TAG, "Failed to set static IP");
+//	    //     return ESP_FAIL;
+//	    // }
+//
+//	    // Wait for DHCP to assign IP (longer timeout)
+//	    ESP_LOGI(TAG, "Waiting for IP address from DHCP (timeout: 30 sec)...");
+//	    if (ethernet_wait_for_ip(30000) != ESP_OK) {
+//	        ESP_LOGW(TAG, "No IP address yet - continuing anyway");
+//	    }
+//
+//	    esp_netif_ip_info_t ip_info;
+//	    if (ethernet_get_ip_info(&ip_info) == ESP_OK) {
+//	        ESP_LOGI(TAG, "================================");
+//	        ESP_LOGI(TAG, "ESP32 IP FROM DHCP:");
+//	        ESP_LOGI(TAG, "IP: " IPSTR, IP2STR(&ip_info.ip));
+//	        ESP_LOGI(TAG, "Netmask: " IPSTR, IP2STR(&ip_info.netmask));
+//	        ESP_LOGI(TAG, "Gateway: " IPSTR, IP2STR(&ip_info.gw));
+//	        ESP_LOGI(TAG, "================================");
+//	    }
+//
+//	    return ESP_OK;
+
+	 ESP_LOGI(TAG, "Initializing Ethernet...");
+
+	    if (ethernet_init() != ESP_OK) {
+	        ESP_LOGE(TAG, "Ethernet init failed");
+	        return ESP_FAIL;
+	    }
+
+	    // Wait for link to come up
+	    vTaskDelay(pdMS_TO_TICKS(2000));
+
+	    // Set static IP (no DHCP needed)
+	    ESP_LOGI(TAG, "Setting static IP...");
+	    if (ethernet_set_static_ip(192, 168, 2, 100) != ESP_OK) {
+	        ESP_LOGE(TAG, "Failed to set static IP");
+	        return ESP_FAIL;
+	    }
+
+	    ESP_LOGI(TAG, "Static IP set: 192.168.2.100");
+	    return ESP_OK;
 }
+
 
 static esp_err_t init_mqtt(void)
 {

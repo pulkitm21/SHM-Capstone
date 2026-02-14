@@ -9,7 +9,6 @@ idf_component_register(
          adt7420.c
          adxl355.c
          scl3300.c
-         sensor_task.c
          mqtt.c
          data_processing_and_mqtt_task.c
          fake_daq_task.c
