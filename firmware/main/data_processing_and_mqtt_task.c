@@ -43,45 +43,45 @@ static bool s_has_temp_data = false;
 
 /******************************************************************************
  * UNIT CONVERSION FUNCTIONS
+ *
+ * All conversions happen HERE - sensor drivers only provide raw data.
  *****************************************************************************/
 
 /**
  * @brief Convert raw ADXL355 value to g
+ *
+ * ADXL355 in ±2g range: 256,000 LSB/g
+ * Scale factor = 1/256000 = 3.906e-6 g/LSB
  */
 static inline float convert_adxl355_to_g(int32_t raw)
 {
-    return (float)raw * ADXL355_SCALE_FACTOR;
+    return (float)raw * (1.0f / 256000.0f);
 }
 
 /**
- * @brief Convert raw SCL3300 value to g (acceleration mode)
- */
-static inline float convert_scl3300_to_g(int16_t raw)
-{
-    return (float)raw * SCL3300_ACCEL_SCALE;
-}
-
-/**
- * @brief Convert raw SCL3300 value to degrees (angle mode)
+ * @brief Convert raw SCL3300 angle value to degrees
+ *
+ * SCL3300 Mode 3 (Inclination): 0.0055 deg/LSB (from datasheet)
  */
 static inline float convert_scl3300_to_deg(int16_t raw)
 {
-    return (float)raw * SCL3300_ANGLE_SCALE;
+    return (float)raw * 0.0055f;
 }
 
 /**
  * @brief Convert raw ADT7420 value to Celsius
+ *
+ * ADT7420 13-bit resolution: 0.0625 °C/LSB
+ * The raw value is already sign-extended by the ISR
  */
 static inline float convert_adt7420_to_celsius(uint16_t raw)
 {
-    // ADT7420 13-bit format: upper 13 bits of 16-bit value
-    // If bit 12 is set, it's negative (two's complement)
-    int16_t temp_raw = (int16_t)(raw >> 3);  // Shift to get 13-bit value
-    if (temp_raw & 0x1000) {
-        // Negative temperature - sign extend
-        temp_raw |= 0xE000;
-    }
-    return (float)temp_raw * ADT7420_TEMP_SCALE;
+    // ADT7420 13-bit format
+    // If using 13-bit mode: temp = raw * 0.0625
+    // If using 16-bit mode: temp = raw / 128.0
+    // Assuming 13-bit mode (default)
+    int16_t temp_raw = (int16_t)raw;
+    return (float)temp_raw * 0.0625f;
 }
 
 /******************************************************************************
@@ -93,6 +93,10 @@ static void data_processing_task(void *pvParameters)
     ESP_LOGI(TAG, "Data processing and MQTT task started");
     ESP_LOGI(TAG, "  Batch size: %d accel samples", ACCEL_SAMPLES_PER_BATCH);
     ESP_LOGI(TAG, "  Processing interval: %d ms", PROCESSING_INTERVAL_MS);
+    ESP_LOGI(TAG, "  Conversions:");
+    ESP_LOGI(TAG, "    ADXL355: raw * (1/256000) = g");
+    ESP_LOGI(TAG, "    SCL3300: raw * 0.0055 = degrees");
+    ESP_LOGI(TAG, "    ADT7420: raw * 0.0625 = Celsius");
 
     adxl355_raw_sample_t adxl_sample;
     scl3300_raw_sample_t scl_sample;
@@ -173,11 +177,10 @@ static void data_processing_task(void *pvParameters)
         // =====================================================================
         while (scl3300_data_available()) {
             if (scl3300_read_sample(&scl_sample)) {
-                // Convert to engineering units
-                // Note: Using acceleration conversion - change to angle if needed
-                s_latest_incl_x = convert_scl3300_to_g(scl_sample.raw_x);
-                s_latest_incl_y = convert_scl3300_to_g(scl_sample.raw_y);
-                s_latest_incl_z = convert_scl3300_to_g(scl_sample.raw_z);
+                // Convert to DEGREES (using correct 0.0055 deg/LSB factor)
+                s_latest_incl_x = convert_scl3300_to_deg(scl_sample.raw_x);
+                s_latest_incl_y = convert_scl3300_to_deg(scl_sample.raw_y);
+                s_latest_incl_z = convert_scl3300_to_deg(scl_sample.raw_z);
                 s_has_incl_data = true;
             }
         }

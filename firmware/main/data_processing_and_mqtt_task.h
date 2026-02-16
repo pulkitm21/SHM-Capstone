@@ -7,6 +7,11 @@
  * 2. Converts raw values to engineering units (g, degrees, °C)
  * 3. Packages data as JSON
  * 4. Publishes to MQTT broker
+ *
+ * UNIT CONVERSIONS (all done in this file):
+ * - ADXL355: raw * (1/256000) = acceleration in g
+ * - SCL3300: raw * 0.0055 = angle in degrees (Mode 3)
+ * - ADT7420: raw * 0.0625 = temperature in °C (13-bit mode)
  */
 
 #ifndef DATA_PROCESSING_AND_MQTT_TASK_H
@@ -35,23 +40,6 @@ extern "C" {
 
 // Processing interval (how often to check ring buffers)
 #define PROCESSING_INTERVAL_MS      50
-
-/******************************************************************************
- * UNIT CONVERSION CONSTANTS
- *****************************************************************************/
-
-// ADXL355: ±2g range, 256000 LSB/g (from datasheet)
-// Scale factor = 1/256000 = 3.9e-6 g/LSB
-#define ADXL355_SCALE_FACTOR    (1.0f / 256000.0f)
-
-// SCL3300 Mode 3: Inclinometer mode
-// Sensitivity for acceleration: 18000 LSB/g
-// Sensitivity for angle: 182 LSB/degree (approximately)
-#define SCL3300_ACCEL_SCALE     (1.0f / 18000.0f)
-#define SCL3300_ANGLE_SCALE     (1.0f / 182.0f)
-
-// ADT7420: 13-bit resolution, 0.0625°C/LSB
-#define ADT7420_TEMP_SCALE      0.0625f
 
 /******************************************************************************
  * PUBLIC FUNCTIONS
