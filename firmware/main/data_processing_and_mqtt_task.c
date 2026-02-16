@@ -1,179 +1,258 @@
 /**
  * @file data_processing_and_mqtt_task.c
- * @brief SIMPLIFIED MQTT Task - Sends 1 sample at a time for debugging
+ * @brief MQTT Publishing Task - Reads from sensor_task ring buffers
+ *
+ * Reads raw samples from ring buffers, converts to engineering units,
+ * packages as JSON, and publishes via MQTT.
  */
 
 #include "data_processing_and_mqtt_task.h"
-#include "sensor_types.h"
+#include "sensor_task.h"  // Ring buffer access functions
 #include "mqtt.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
 #include "esp_timer.h"
+#include <string.h>
+#include <math.h>
 
-static const char *TAG = "MQTT_TASK";
+static const char *TAG = "DATA_PROC";
 
-static QueueHandle_t s_sample_queue = NULL;
-static TaskHandle_t s_mqtt_task_handle = NULL;
+static TaskHandle_t s_task_handle = NULL;
 static volatile bool s_task_running = false;
 
+// Statistics
 static volatile uint32_t s_samples_published = 0;
 static volatile uint32_t s_packets_sent = 0;
 static volatile uint32_t s_samples_dropped = 0;
 
-/*******************************************************************************
- * Unit Conversion Functions
- ******************************************************************************/
+// Buffers for batching accelerometer data
+static float s_accel_x[ACCEL_SAMPLES_PER_BATCH];
+static float s_accel_y[ACCEL_SAMPLES_PER_BATCH];
+static float s_accel_z[ACCEL_SAMPLES_PER_BATCH];
+static uint32_t s_accel_ticks[ACCEL_SAMPLES_PER_BATCH];
 
-static inline float convert_accel_to_g(int32_t raw)
+// Latest inclinometer and temperature values
+static float s_latest_incl_x = 0.0f;
+static float s_latest_incl_y = 0.0f;
+static float s_latest_incl_z = 0.0f;
+static bool s_has_incl_data = false;
+
+static float s_latest_temp = 0.0f;
+static bool s_has_temp_data = false;
+
+/******************************************************************************
+ * UNIT CONVERSION FUNCTIONS
+ *****************************************************************************/
+
+/**
+ * @brief Convert raw ADXL355 value to g
+ */
+static inline float convert_adxl355_to_g(int32_t raw)
 {
-    return (float)raw * ACCEL_SCALE_2G;
+    return (float)raw * ADXL355_SCALE_FACTOR;
 }
 
-static inline float convert_angle_to_deg(int16_t raw)
+/**
+ * @brief Convert raw SCL3300 value to g (acceleration mode)
+ */
+static inline float convert_scl3300_to_g(int16_t raw)
 {
-    return (float)raw * ANGLE_SCALE;
+    return (float)raw * SCL3300_ACCEL_SCALE;
 }
 
-static inline float convert_temp_to_celsius(int16_t raw)
+/**
+ * @brief Convert raw SCL3300 value to degrees (angle mode)
+ */
+static inline float convert_scl3300_to_deg(int16_t raw)
 {
-    return (float)raw * TEMP_SCALE;
+    return (float)raw * SCL3300_ANGLE_SCALE;
 }
 
-/*******************************************************************************
- * MQTT Publishing Task - SIMPLIFIED (1 sample at a time)
- ******************************************************************************/
-
-static void mqtt_publish_task(void *pvParameters)
+/**
+ * @brief Convert raw ADT7420 value to Celsius
+ */
+static inline float convert_adt7420_to_celsius(uint16_t raw)
 {
-    ESP_LOGI(TAG, "MQTT task started - SIMPLIFIED (1 sample at a time)");
+    // ADT7420 13-bit format: upper 13 bits of 16-bit value
+    // If bit 12 is set, it's negative (two's complement)
+    int16_t temp_raw = (int16_t)(raw >> 3);  // Shift to get 13-bit value
+    if (temp_raw & 0x1000) {
+        // Negative temperature - sign extend
+        temp_raw |= 0xE000;
+    }
+    return (float)temp_raw * ADT7420_TEMP_SCALE;
+}
 
-    raw_sample_t sample;
-    mqtt_sensor_packet_t packet = {0};
+/******************************************************************************
+ * DATA PROCESSING AND MQTT PUBLISHING TASK
+ *****************************************************************************/
+
+static void data_processing_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "Data processing and MQTT task started");
+    ESP_LOGI(TAG, "  Batch size: %d accel samples", ACCEL_SAMPLES_PER_BATCH);
+    ESP_LOGI(TAG, "  Processing interval: %d ms", PROCESSING_INTERVAL_MS);
+
+    adxl355_raw_sample_t adxl_sample;
+    scl3300_raw_sample_t scl_sample;
+    adt7420_raw_sample_t adt_sample;
+
+    int accel_batch_count = 0;
+    uint32_t first_tick = 0;
 
     while (s_task_running) {
-        // Wait for 1 sample
-        if (xQueueReceive(s_sample_queue, &sample, pdMS_TO_TICKS(1000)) != pdTRUE) {
-            continue;  // Timeout, try again
+
+        // =====================================================================
+        // Read ALL available ADXL355 samples from ring buffer
+        // =====================================================================
+        while (adxl355_data_available() && s_task_running) {
+            if (adxl355_read_sample(&adxl_sample)) {
+                // Store first tick for timestamp
+                if (accel_batch_count == 0) {
+                    first_tick = adxl_sample.tick;
+                }
+
+                // Convert and store in batch buffer
+                s_accel_x[accel_batch_count] = convert_adxl355_to_g(adxl_sample.raw_x);
+                s_accel_y[accel_batch_count] = convert_adxl355_to_g(adxl_sample.raw_y);
+                s_accel_z[accel_batch_count] = convert_adxl355_to_g(adxl_sample.raw_z);
+                s_accel_ticks[accel_batch_count] = adxl_sample.tick;
+
+                accel_batch_count++;
+
+                // If batch is full, publish it
+                if (accel_batch_count >= ACCEL_SAMPLES_PER_BATCH) {
+                    if (mqtt_is_connected()) {
+                        // Build and publish packet
+                        mqtt_sensor_packet_t packet = {0};
+                        packet.timestamp = TICKS_TO_US(first_tick);
+                        packet.accel_count = accel_batch_count;
+
+                        // Copy accelerometer data
+                        for (int i = 0; i < accel_batch_count; i++) {
+                            packet.accel[i].x = s_accel_x[i];
+                            packet.accel[i].y = s_accel_y[i];
+                            packet.accel[i].z = s_accel_z[i];
+                        }
+
+                        // Add latest inclinometer data if available
+                        packet.has_angle = s_has_incl_data;
+                        if (s_has_incl_data) {
+                            packet.angle_x = s_latest_incl_x;
+                            packet.angle_y = s_latest_incl_y;
+                            packet.angle_z = s_latest_incl_z;
+                        }
+
+                        // Add latest temperature if available
+                        packet.has_temp = s_has_temp_data;
+                        if (s_has_temp_data) {
+                            packet.temperature = s_latest_temp;
+                        }
+
+                        // Publish
+                        if (mqtt_publish_sensor_data(&packet) == ESP_OK) {
+                            s_samples_published += accel_batch_count;
+                            s_packets_sent++;
+                        } else {
+                            s_samples_dropped += accel_batch_count;
+                        }
+                    } else {
+                        // MQTT not connected
+                        s_samples_dropped += accel_batch_count;
+                    }
+
+                    // Reset batch
+                    accel_batch_count = 0;
+                }
+            }
         }
 
-        // Check if MQTT is connected
-        if (!mqtt_is_connected()) {
-            ESP_LOGW(TAG, "MQTT not connected, dropping sample");
-            s_samples_dropped++;
-            continue;
+        // =====================================================================
+        // Read ALL available SCL3300 samples from ring buffer
+        // =====================================================================
+        while (scl3300_data_available()) {
+            if (scl3300_read_sample(&scl_sample)) {
+                // Convert to engineering units
+                // Note: Using acceleration conversion - change to angle if needed
+                s_latest_incl_x = convert_scl3300_to_g(scl_sample.raw_x);
+                s_latest_incl_y = convert_scl3300_to_g(scl_sample.raw_y);
+                s_latest_incl_z = convert_scl3300_to_g(scl_sample.raw_z);
+                s_has_incl_data = true;
+            }
         }
 
-        // Build packet with just 1 sample
-        packet.timestamp = sample.timestamp_us;
-        packet.accel_count = 1;
-
-        // Convert accelerometer
-        packet.accel[0].x = convert_accel_to_g(sample.accel_x_raw);
-        packet.accel[0].y = convert_accel_to_g(sample.accel_y_raw);
-        packet.accel[0].z = convert_accel_to_g(sample.accel_z_raw);
-
-        // Convert inclinometer
-        if (sample.flags & SAMPLE_FLAG_HAS_ANGLE) {
-            packet.has_angle = true;
-            packet.angle_x = convert_angle_to_deg(sample.angle_x_raw);
-            packet.angle_y = convert_angle_to_deg(sample.angle_y_raw);
-            packet.angle_z = convert_angle_to_deg(sample.angle_z_raw);
-        } else {
-            packet.has_angle = false;
+        // =====================================================================
+        // Read ALL available ADT7420 samples from ring buffer
+        // =====================================================================
+        while (adt7420_data_available()) {
+            if (adt7420_read_sample(&adt_sample)) {
+                s_latest_temp = convert_adt7420_to_celsius(adt_sample.raw_temp);
+                s_has_temp_data = true;
+            }
         }
 
-        // Convert temperature
-        if (sample.flags & SAMPLE_FLAG_HAS_TEMP) {
-            packet.has_temp = true;
-            packet.temperature = convert_temp_to_celsius(sample.temp_raw);
-        } else {
-            packet.has_temp = false;
-        }
-
-        // Log what we're sending (for debugging)
-        ESP_LOGI(TAG, "Sending: accel=[%.4f, %.4f, %.4f]g, angle=[%.2f, %.2f, %.2f]deg, temp=%.2fC",
-                 packet.accel[0].x, packet.accel[0].y, packet.accel[0].z,
-                 packet.angle_x, packet.angle_y, packet.angle_z,
-                 packet.temperature);
-
-        // Publish
-        esp_err_t ret = mqtt_publish_sensor_data(&packet);
-        if (ret == ESP_OK) {
-            s_samples_published++;
-            s_packets_sent++;
-        } else {
-            ESP_LOGW(TAG, "Failed to publish: %s", esp_err_to_name(ret));
-            s_samples_dropped++;
-        }
+        // Sleep before next poll
+        vTaskDelay(pdMS_TO_TICKS(PROCESSING_INTERVAL_MS));
     }
 
-    ESP_LOGI(TAG, "MQTT publish task stopped");
+    ESP_LOGI(TAG, "Data processing and MQTT task stopped");
     vTaskDelete(NULL);
 }
 
-/*******************************************************************************
- * Public Functions
- ******************************************************************************/
+/******************************************************************************
+ * PUBLIC FUNCTIONS
+ *****************************************************************************/
 
-esp_err_t mqtt_task_init(void)
+esp_err_t data_processing_and_mqtt_task_init(void)
 {
-    ESP_LOGI(TAG, "Initializing MQTT task (SIMPLIFIED - 1 sample mode)...");
+    ESP_LOGI(TAG, "Initializing data processing and MQTT task...");
 
-    // Smaller queue for debugging
-    s_sample_queue = xQueueCreate(10, sizeof(raw_sample_t));
-    if (s_sample_queue == NULL) {
-        ESP_LOGE(TAG, "Failed to create sample queue");
-        return ESP_ERR_NO_MEM;
-    }
+    // Reset statistics
+    s_samples_published = 0;
+    s_packets_sent = 0;
+    s_samples_dropped = 0;
+
+    // Reset data flags
+    s_has_incl_data = false;
+    s_has_temp_data = false;
 
     s_task_running = true;
 
     BaseType_t ret = xTaskCreatePinnedToCore(
-        mqtt_publish_task,
-        "mqtt_task",
-        8192,
+        data_processing_task,
+        "data_proc_mqtt",
+        DATA_PROCESSING_TASK_STACK_SIZE,
         NULL,
-        MQTT_TASK_PRIORITY,
-        &s_mqtt_task_handle,
-        MQTT_TASK_CORE
+        DATA_PROCESSING_TASK_PRIORITY,
+        &s_task_handle,
+        DATA_PROCESSING_TASK_CORE
     );
 
     if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create MQTT task");
-        vQueueDelete(s_sample_queue);
-        s_sample_queue = NULL;
+        ESP_LOGE(TAG, "Failed to create task");
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "MQTT task started");
+    ESP_LOGI(TAG, "Task started (priority=%d, core=%d)",
+             DATA_PROCESSING_TASK_PRIORITY, DATA_PROCESSING_TASK_CORE);
+
     return ESP_OK;
 }
 
-QueueHandle_t mqtt_task_get_queue(void)
+esp_err_t data_processing_and_mqtt_task_stop(void)
 {
-    return s_sample_queue;
-}
-
-esp_err_t mqtt_task_stop(void)
-{
+    ESP_LOGI(TAG, "Stopping data processing and MQTT task...");
     s_task_running = false;
     vTaskDelay(pdMS_TO_TICKS(200));
-
-    if (s_sample_queue != NULL) {
-        vQueueDelete(s_sample_queue);
-        s_sample_queue = NULL;
-    }
-
-    s_mqtt_task_handle = NULL;
-    ESP_LOGI(TAG, "MQTT task stopped");
+    s_task_handle = NULL;
+    ESP_LOGI(TAG, "Task stopped");
     return ESP_OK;
 }
 
-void mqtt_task_get_stats(uint32_t *samples_published,
-                         uint32_t *packets_sent,
-                         uint32_t *samples_dropped)
+void data_processing_and_mqtt_task_get_stats(uint32_t *samples_published,
+                                              uint32_t *packets_sent,
+                                              uint32_t *samples_dropped)
 {
     if (samples_published) *samples_published = s_samples_published;
     if (packets_sent) *packets_sent = s_packets_sent;

@@ -11,7 +11,7 @@ idf_component_register(
          scl3300.c
          mqtt.c
          data_processing_and_mqtt_task.c
-         fake_daq_task.c
+         sensor_task.c
     INCLUDE_DIRS "."
     PRIV_INCLUDE_DIRS
     REQUIRES esp_driver_i2c
@@ -21,9 +21,9 @@ idf_component_register(
     			   esp_timer 
     			   freertos
     			   esp_eth
-                  esp_netif
-                  esp_event
-                  ethernet_init
-                  nvs_flash
-                  mqtt
+                   esp_netif
+                   esp_event
+                   ethernet_init
+                   nvs_flash
+                   mqtt
 )
