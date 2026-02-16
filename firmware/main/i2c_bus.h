@@ -10,8 +10,8 @@
 #include "driver/i2c_master.h"
 
 // I2C Configuration for Olimex ESP32-POE-ISO
-#define I2C_MASTER_SDA_IO       16
-#define I2C_MASTER_SCL_IO       13
+#define I2C_MASTER_SDA_IO       13
+#define I2C_MASTER_SCL_IO       16
 #define I2C_MASTER_FREQ_HZ      100000    // 100kHz standard mode
 
 /**

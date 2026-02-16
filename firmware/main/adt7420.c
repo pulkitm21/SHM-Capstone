@@ -10,7 +10,8 @@
 static const char *TAG = "ADT7420";
 
 // Device handle for the ADT7420
-static i2c_master_dev_handle_t adt7420_handle = NULL;
+i2c_master_dev_handle_t adt7420_i2c_handle = NULL;  // Exposed for ISR
+static i2c_master_dev_handle_t adt7420_handle = NULL; // Internal handle for driver functions
 
 
 esp_err_t adt7420_init(void)
@@ -36,6 +37,8 @@ esp_err_t adt7420_init(void)
         ESP_LOGE(TAG, "Failed to add ADT7420 to I2C bus: %s", esp_err_to_name(ret));
         return ret;
     }
+
+    adt7420_i2c_handle = adt7420_handle;  // Expose handle for ISR access
     
     // Verify device ID (should be 0xCB)
     uint8_t reg_addr = ADT7420_REG_ID;

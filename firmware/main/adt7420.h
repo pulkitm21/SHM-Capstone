@@ -7,6 +7,9 @@
 #define ADT7420_H
 
 #include "esp_err.h"
+#include "driver/i2c_master.h"
+
+extern i2c_master_dev_handle_t adt7420_i2c_handle;
 
 // ADT7420 I2C Address (A0=A1=0)
 #define ADT7420_I2C_ADDR        0x48

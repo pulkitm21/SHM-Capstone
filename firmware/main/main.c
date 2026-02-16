@@ -1,744 +1,289 @@
-//
-///**
-// * @file main.c
-// * @brief Wind Turbine Structural Health Monitor
-// *
-// * Architecture:
-// * - DAQ Task (high priority): Reads sensors, pushes raw data to queue
-// * - MQTT Task (low priority): Pulls from queue, converts units, publishes JSON
-// * - Ethernet connectivity for MQTT communication
-// *
-// * Data Flow:
-// * Sensors → DAQ Task → Queue → MQTT Task → JSON → Broker → Raspberry Pi
-// */
-//
-//
-//#include <stdio.h>
-//#include "freertos/FreeRTOS.h"
-//#include "freertos/task.h"
-//#include "esp_log.h"
-//
-//// Bus drivers
-//#include "i2c_bus.h"
-//#include "spi_bus.h"
-//
-//// OLD: Sensor drivers (not needed - teammate handles sensors in DAQ task)
-//// #include "adt7420.h"
-//// #include "adxl355.h"
-//// #include "scl3300.h"
-//
-//// OLD: Acquisition system (replaced by DAQ task + MQTT task)
-//// #include "sensor_task.h"
-//
-//// Network & MQTT (NEW)
-//#include "ethernet.h"
-//#include "mqtt.h"
-//#include "mqtt_task.h"
-//
-//// Shared data types (NEW)
-//#include "sensor_types.h"
-//
-//static const char *TAG = "main";
-//
-//// Timeouts
-//#define ETH_IP_TIMEOUT_MS       30000   // 30 seconds to get IP
-//#define MQTT_CONNECT_TIMEOUT_MS 30000   // 30 seconds to connect to broker (NEW)
-//
-//
-///*******************************************************************************
-// * Statistics Monitor Task
-// *
-// * Periodically prints system statistics.
-// * Runs at very low priority.
-// ******************************************************************************/
-//
-//#define STATS_TASK_PRIORITY     1
-//#define STATS_TASK_STACK_SIZE   4096
-//#define STATS_INTERVAL_MS       10000   // Print stats every 10 seconds
-//
-//static void stats_monitor_task(void *pvParameters)
-//{
-//    // OLD: Used sensor_acquisition_get_stats
-//    // uint32_t samples_acquired, samples_dropped, max_acq_time;
-//    // uint32_t prev_samples = 0;
-//
-//    // NEW: Use mqtt_task_get_stats
-//    uint32_t samples_published, packets_sent, samples_dropped;
-//    esp_netif_ip_info_t ip_info;
-//
-//    for (;;) {
-//        vTaskDelay(pdMS_TO_TICKS(STATS_INTERVAL_MS));
-//
-//        // OLD: Get stats from old acquisition system
-//        // sensor_acquisition_get_stats(&samples_acquired, &samples_dropped, &max_acq_time);
-//        // uint32_t samples_this_interval = samples_acquired - prev_samples;
-//        // prev_samples = samples_acquired;
-//
-//        // NEW: Get MQTT task statistics
-//        mqtt_task_get_stats(&samples_published, &packets_sent, &samples_dropped);
-//
-//        ESP_LOGI("STATS", "==== System Statistics ====");
-//
-//        // OLD stats format
-//        // ESP_LOGI("STATS", "  Samples acquired: %lu total, %lu in last %d sec",
-//        //          (unsigned long)samples_acquired,
-//        //          (unsigned long)samples_this_interval,
-//        //          STATS_INTERVAL_MS / 1000);
-//        // ESP_LOGI("STATS", "  Samples dropped: %lu (queue full)",
-//        //          (unsigned long)samples_dropped);
-//        // ESP_LOGI("STATS", "  Max acquisition time: %lu us (jitter indicator)",
-//        //          (unsigned long)max_acq_time);
-//
-//        // NEW stats format
-//        ESP_LOGI("STATS", "  Samples published: %lu", (unsigned long)samples_published);
-//        ESP_LOGI("STATS", "  MQTT packets sent: %lu", (unsigned long)packets_sent);
-//        ESP_LOGI("STATS", "  Samples dropped:   %lu", (unsigned long)samples_dropped);
-//
-//        // Network status
-//        if (ethernet_is_connected()) {
-//            ethernet_get_ip_info(&ip_info);
-//            ESP_LOGI("STATS", "  Network: Connected (" IPSTR ")", IP2STR(&ip_info.ip));
-//        } else {
-//            ESP_LOGW("STATS", "  Network: Disconnected");
-//        }
-//
-//        // NEW: MQTT status
-//        if (mqtt_is_connected()) {
-//            ESP_LOGI("STATS", "  MQTT: Connected");
-//        } else {
-//            ESP_LOGW("STATS", "  MQTT: Disconnected");
-//        }
-//
-//        ESP_LOGI("STATS", "  Free heap: %lu bytes",
-//                 (unsigned long)esp_get_free_heap_size());
-//        ESP_LOGI("STATS", "===========================");
-//    }
-//}
-//
-//
-///*******************************************************************************
-// * Initialization Functions
-// ******************************************************************************/
-//
-//static void print_banner(void)
-//{
-//    ESP_LOGI(TAG, "");
-//    ESP_LOGI(TAG, "================================================");
-//    ESP_LOGI(TAG, "  Wind Turbine Structural Health Monitor");
-//    // OLD banner text
-//    // ESP_LOGI(TAG, "  TIMING-CRITICAL ACQUISITION VERSION");
-//    ESP_LOGI(TAG, "          Capstone Project");
-//    ESP_LOGI(TAG, "================================================");
-//    ESP_LOGI(TAG, "ESP-IDF: %s", esp_get_idf_version());
-//    ESP_LOGI(TAG, "Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
-//    ESP_LOGI(TAG, "");
-//    ESP_LOGI(TAG, "Architecture:");
-//    // OLD architecture description
-//    // ESP_LOGI(TAG, "  - Single HW timer at base rate");
-//    // ESP_LOGI(TAG, "  - High-priority acquisition task (no logging)");
-//    // ESP_LOGI(TAG, "  - Low-priority processing task (handles logging)");
-//    // ESP_LOGI(TAG, "  - Lock-free queue between tasks");
-//    // ESP_LOGI(TAG, "  - Ethernet connectivity (ESP32-POE-ISO)");
-//    // NEW architecture description
-//    ESP_LOGI(TAG, "  - DAQ Task: Sensor reading (high priority)");
-//    ESP_LOGI(TAG, "  - MQTT Task: Unit conversion + publishing (low priority)");
-//    ESP_LOGI(TAG, "  - FreeRTOS Queue between tasks");
-//    ESP_LOGI(TAG, "  - Ethernet → MQTT → Raspberry Pi");
-//    ESP_LOGI(TAG, "");
-//}
-//
-//static esp_err_t init_network(void)
-//{
-//    ESP_LOGI(TAG, "Initializing Ethernet...");
-//
-//    if (ethernet_init() != ESP_OK) {
-//        ESP_LOGE(TAG, "Ethernet init failed");
-//        return ESP_FAIL;
-//    }
-//
-//    ESP_LOGI(TAG, "Waiting for IP address (timeout: %d sec)...", ETH_IP_TIMEOUT_MS / 1000);
-//    esp_err_t ret = ethernet_wait_for_ip(ETH_IP_TIMEOUT_MS);
-//
-//    if (ret == ESP_OK) {
-//        esp_netif_ip_info_t ip_info;
-//        ethernet_get_ip_info(&ip_info);
-//        ESP_LOGI(TAG, "Network ready: " IPSTR, IP2STR(&ip_info.ip));
-//    } else {
-//        ESP_LOGW(TAG, "No IP address yet - continuing anyway");
-//        ESP_LOGW(TAG, "Check Ethernet cable connection");
-//    }
-//
-//    return ESP_OK;  // Don't fail - network might come up later
-//}
-//
-//// NEW: MQTT initialization function
-//static esp_err_t init_mqtt(void)
-//{
-//    ESP_LOGI(TAG, "Initializing MQTT client...");
-//
-//    if (mqtt_init() != ESP_OK) {
-//        ESP_LOGE(TAG, "MQTT init failed");
-//        return ESP_FAIL;
-//    }
-//
-//    ESP_LOGI(TAG, "Waiting for MQTT connection (timeout: %d sec)...", MQTT_CONNECT_TIMEOUT_MS / 1000);
-//    esp_err_t ret = mqtt_wait_for_connection(MQTT_CONNECT_TIMEOUT_MS);
-//
-//    if (ret == ESP_OK) {
-//        ESP_LOGI(TAG, "MQTT connected!");
-//        mqtt_publish_status("Wind Turbine Monitor Online");
-//    } else {
-//        ESP_LOGW(TAG, "MQTT connection timeout - will retry in background");
-//    }
-//
-//    return ESP_OK;
-//}
-//
-//static esp_err_t init_buses(void)
-//{
-//    esp_err_t ret;
-//
-//    ESP_LOGI(TAG, "Initializing I2C bus...");
-//    ret = i2c_bus_init();
-//    if (ret != ESP_OK) {
-//        ESP_LOGE(TAG, "I2C bus init failed");
-//        return ESP_FAIL;
-//    }
-//
-//    ESP_LOGI(TAG, "Initializing SPI bus...");
-//    ret = spi_bus_init();
-//    if (ret != ESP_OK) {
-//        ESP_LOGE(TAG, "SPI bus init failed");
-//        return ESP_FAIL;
-//    }
-//
-//    ESP_LOGI(TAG, "Communication buses initialized");
-//    return ESP_OK;
-//}
-//
-//// OLD: Sensor initialization (not needed - teammate handles in DAQ task)
-///*
-//static esp_err_t init_sensors(bool *temp_available)
-//{
-//    esp_err_t ret;
-//    *temp_available = false;
-//
-//    // Temperature sensor (non-critical)
-//    ESP_LOGI(TAG, "Initializing ADT7420 temperature sensor...");
-//    ret = adt7420_init();
-//    if (ret != ESP_OK) {
-//        ESP_LOGW(TAG, "ADT7420 init failed - continuing without temperature");
-//    } else {
-//        ESP_LOGI(TAG, "ADT7420 initialized");
-//        *temp_available = true;
-//    }
-//
-//    // Accelerometer (critical)
-//    ESP_LOGI(TAG, "Initializing ADXL355 accelerometer...");
-//    ret = adxl355_init();
-//    if (ret != ESP_OK) {
-//        ESP_LOGE(TAG, "ADXL355 init failed - CRITICAL");
-//        return ESP_FAIL;
-//    }
-//    ESP_LOGI(TAG, "ADXL355 initialized");
-//
-//    // Inclinometer (critical)
-//    ESP_LOGI(TAG, "Initializing SCL3300 inclinometer...");
-//    ret = scl3300_init();
-//    if (ret != ESP_OK) {
-//        ESP_LOGE(TAG, "SCL3300 init failed - CRITICAL");
-//        return ESP_FAIL;
-//    }
-//    ESP_LOGI(TAG, "SCL3300 initialized");
-//
-//    return ESP_OK;
-//}
-//*/
-//
-//// OLD: Print configuration (referenced old sensor_task.h defines)
-///*
-//static void print_config(bool temp_available)
-//{
-//    ESP_LOGI(TAG, "");
-//    ESP_LOGI(TAG, "================================================");
-//    ESP_LOGI(TAG, "  Acquisition Configuration");
-//    ESP_LOGI(TAG, "================================================");
-//    ESP_LOGI(TAG, "  Base timer period: %d us (%d Hz)",
-//             BASE_SAMPLE_PERIOD_US, (int)(1000000 / BASE_SAMPLE_PERIOD_US));
-//    ESP_LOGI(TAG, "  Accelerometer: %d Hz (decimation=%d)",
-//             (int)(1000000 / BASE_SAMPLE_PERIOD_US / ACCEL_DECIMATION), ACCEL_DECIMATION);
-//    ESP_LOGI(TAG, "  Inclinometer:  %d Hz (decimation=%d)",
-//             (int)(1000000 / BASE_SAMPLE_PERIOD_US / ANGLE_DECIMATION), ANGLE_DECIMATION);
-//    if (temp_available) {
-//        ESP_LOGI(TAG, "  Temperature:   %d Hz (decimation=%d)",
-//                 (int)(1000000 / BASE_SAMPLE_PERIOD_US / TEMP_DECIMATION), TEMP_DECIMATION);
-//    } else {
-//        ESP_LOGW(TAG, "  Temperature:   OFFLINE");
-//    }
-//    ESP_LOGI(TAG, "  Queue size: %d samples", SENSOR_QUEUE_SIZE);
-//    ESP_LOGI(TAG, "  Acquisition task: priority=%d, core=%d",
-//             ACQUISITION_TASK_PRIORITY, ACQUISITION_TASK_CORE);
-//    ESP_LOGI(TAG, "  Processing task:  priority=%d",
-//             PROCESSING_TASK_PRIORITY);
-//
-//    // Network status
-//    if (ethernet_is_connected()) {
-//        ESP_LOGI(TAG, "  Network: CONNECTED");
-//    } else {
-//        ESP_LOGW(TAG, "  Network: WAITING FOR CONNECTION");
-//    }
-//
-//    ESP_LOGI(TAG, "================================================");
-//    ESP_LOGI(TAG, "");
-//}
-//*/
-//
-//
-///*******************************************************************************
-// * Main Application Entry Point
-// ******************************************************************************/
-//
-//void app_main(void)
-//{
-//    // OLD: Used for sensor init
-//    // bool temp_sensor_available = false;
-//
-//    print_banner();
-//
-//    // =========================================
-//    // 1. Initialize Network (Ethernet)
-//    // =========================================
-//    ESP_LOGI(TAG, "--- Network Initialization ---");
-//    if (init_network() != ESP_OK) {
-//        ESP_LOGE(TAG, "*** Network init failed - continuing anyway ***");
-//    }
-//    ESP_LOGI(TAG, "");
-//
-//    // =========================================
-//    // 2. Initialize MQTT Client (NEW)
-//    // =========================================
-//    ESP_LOGI(TAG, "--- MQTT Initialization ---");
-//    if (init_mqtt() != ESP_OK) {
-//        ESP_LOGE(TAG, "*** MQTT init failed - continuing anyway ***");
-//    }
-//    ESP_LOGI(TAG, "");
-//
-//    // =========================================
-//    // 3. Initialize Communication Buses
-//    // =========================================
-//    ESP_LOGI(TAG, "--- Bus Initialization ---");
-//    if (init_buses() != ESP_OK) {
-//        ESP_LOGE(TAG, "*** SYSTEM HALTED: Bus init failed ***");
-//        return;
-//    }
-//    ESP_LOGI(TAG, "");
-//
-//    // OLD: Initialize sensors (not needed - teammate handles in DAQ task)
-//    /*
-//    ESP_LOGI(TAG, "--- Sensor Initialization ---");
-//    if (init_sensors(&temp_sensor_available) != ESP_OK) {
-//        ESP_LOGE(TAG, "*** SYSTEM HALTED: Critical sensor init failed ***");
-//        return;
-//    }
-//    */
-//
-//    // OLD: Print configuration
-//    // print_config(temp_sensor_available);
-//
-//    // OLD: Initialize old acquisition system
-//    /*
-//    ESP_LOGI(TAG, "--- Acquisition System Initialization ---");
-//    if (sensor_acquisition_init(temp_sensor_available) != ESP_OK) {
-//        ESP_LOGE(TAG, "*** SYSTEM HALTED: Acquisition init failed ***");
-//        return;
-//    }
-//    */
-//
-//    // =========================================
-//    // 4. Initialize MQTT Task (NEW - creates queue)
-//    // =========================================
-//    ESP_LOGI(TAG, "--- MQTT Task Initialization ---");
-//    if (mqtt_task_init() != ESP_OK) {
-//        ESP_LOGE(TAG, "*** SYSTEM HALTED: MQTT task init failed ***");
-//        return;
-//    }
-//    ESP_LOGI(TAG, "");
-//
-//    // =========================================
-//    // 5. Initialize DAQ Task (NEW - teammate adds this)
-//    // =========================================
-//    ESP_LOGI(TAG, "--- DAQ Task Initialization ---");
-//    // TODO: Your teammate adds daq_task_init() here
-//    // This task will:
-//    //   - Get queue handle: mqtt_task_get_queue()
-//    //   - Read sensors at 2000 Hz
-//    //   - Push raw_sample_t to queue
-//    ESP_LOGW(TAG, "DAQ task not implemented yet - waiting for teammate");
-//    ESP_LOGI(TAG, "");
-//
-//    // =========================================
-//    // 6. Create Statistics Monitor Task
-//    // =========================================
-//    ESP_LOGI(TAG, "--- Creating Statistics Monitor ---");
-//    xTaskCreate(
-//        stats_monitor_task,
-//        "stats_task",
-//        STATS_TASK_STACK_SIZE,
-//        NULL,
-//        STATS_TASK_PRIORITY,
-//        NULL
-//    );
-//    ESP_LOGI(TAG, "Statistics monitor created (interval=%d ms)", STATS_INTERVAL_MS);
-//
-//    // OLD: Start old acquisition system
-//    /*
-//    ESP_LOGI(TAG, "--- Starting Acquisition ---");
-//    if (sensor_acquisition_start() != ESP_OK) {
-//        ESP_LOGE(TAG, "*** SYSTEM HALTED: Failed to start acquisition ***");
-//        return;
-//    }
-//    */
-//
-//    // =========================================
-//    // System Running
-//    // =========================================
-//    ESP_LOGI(TAG, "");
-//    ESP_LOGI(TAG, "================================================");
-//    ESP_LOGI(TAG, "  SYSTEM RUNNING");
-//    ESP_LOGI(TAG, "  Waiting for DAQ task to push sensor data...");
-//    ESP_LOGI(TAG, "  Statistics printed every %d seconds", STATS_INTERVAL_MS / 1000);
-//    ESP_LOGI(TAG, "================================================");
-//    ESP_LOGI(TAG, "");
-//
-//    // OLD: Test loop (was just for testing ethernet)
-//    /*
-//    while (1) {
-//        if (ethernet_is_connected()) {
-//            ESP_LOGI(TAG, "Ethernet: CONNECTED");
-//        } else {
-//            ESP_LOGW(TAG, "Ethernet: Waiting...");
-//        }
-//        vTaskDelay(pdMS_TO_TICKS(5000));
-//    }
-//    */
-//
-//    // app_main() returns - tasks continue running
-//}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 /**
  * @file main.c
- * @brief Wind Turbine Structural Health Monitor - TESTING VERSION
- *
- * This version uses a FAKE DAQ task to test MQTT communication.
- * Replace fake_daq_task with real daq_task when ready.
+ * @brief Main application with ISR-based sensor acquisition
+ * 
+ * Workflow:
+ * =========
+ * 1. Initialize buses (I2C, SPI)
+ * 2. Initialize sensors using their init functions
+ * 3. Initialize ISR-based acquisition system
+ * 4. Start acquisition
+ * 5. Processing task reads from ring buffers and processes data
  */
 
-#include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+
+#include "esp_err.h"
 #include "esp_log.h"
 
-// Bus drivers
+#include "driver/gpio.h"
+
 #include "i2c_bus.h"
 #include "spi_bus.h"
 
-// Network & MQTT
-#include "ethernet.h"
-#include "mqtt.h"
-#include "data_processing_and_mqtt_task.h"
+#include "adt7420.h"
+#include "adxl355.h"
+#include "scl3300.h"
 
-// Shared data types
-#include "sensor_types.h"
-
-// TESTING: Fake DAQ task (DELETE when real DAQ is ready)
-#include "fake_daq_task.h"
+#include "sensor_task.h"
 
 static const char *TAG = "main";
 
-// Timeouts
-#define ETH_IP_TIMEOUT_MS       30000   // 30 seconds to get IP
-#define MQTT_CONNECT_TIMEOUT_MS 30000   // 30 seconds to connect to broker
-
-// ===== Static IP test setup (no router/DHCP) =====
-// Set these to match your Raspberry Pi's subnet.
-// Example: Pi = 192.168.2.2/24  -> ESP32 can be 192.168.2.50/24
-#define USE_STATIC_IP           1
-#define ESP32_STATIC_IP_A       192
-#define ESP32_STATIC_IP_B       168
-#define ESP32_STATIC_IP_C       2
-#define ESP32_STATIC_IP_D       50
-/*******************************************************************************
- * Statistics Monitor Task
- ******************************************************************************/
-
-#define STATS_TASK_PRIORITY     1
-#define STATS_TASK_STACK_SIZE   4096
-#define STATS_INTERVAL_MS       10000   // Print stats every 10 seconds
-
-static void stats_monitor_task(void *pvParameters)
+/**
+ * @brief Force SPI CS lines high before any initialization
+ * 
+ * This prevents accidental device selection during init
+ */
+static void force_spi_cs_high_early(void)
 {
-    uint32_t samples_published, packets_sent, samples_dropped;
-    esp_netif_ip_info_t ip_info;
+    gpio_set_direction(SPI_CS_ADXL355_IO, GPIO_MODE_OUTPUT);
+    gpio_set_direction(SPI_CS_SCL3300_IO, GPIO_MODE_OUTPUT);
+
+    gpio_set_level(SPI_CS_ADXL355_IO, 1);
+    gpio_set_level(SPI_CS_SCL3300_IO, 1);
+
+    vTaskDelay(pdMS_TO_TICKS(2));
+}
+
+/**
+ * @brief Halt system on critical error
+ */
+static void halt_forever(void)
+{
+    ESP_LOGE(TAG, "*** HALT: Critical sensor init failed ***");
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+/**
+ * @brief Processing task - reads from ring buffers and processes data
+ * 
+ * This task runs at low priority and can be interrupted at any time.
+ * It reads raw data from ring buffers, converts to real units, and
+ * eventually will publish via MQTT/Ethernet.
+ * 
+ * For now, it just logs the data periodically.
+ */
+static void sensor_processing_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "Processing task started on core %d", xPortGetCoreID());
+    
+    // Raw sample structures
+    adxl355_raw_sample_t adxl_raw;
+    scl3300_raw_sample_t scl_raw;
+    adt7420_raw_sample_t adt_raw;
+    
+    // Converted data (you'll use sensor driver functions to convert)
+    // For now, we'll just display raw values
+    
+    uint32_t loop_count = 0;
     
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(STATS_INTERVAL_MS));
-        
-        mqtt_task_get_stats(&samples_published, &packets_sent, &samples_dropped);
-
-        ESP_LOGI("STATS", "==== System Statistics ====");
-        ESP_LOGI("STATS", "  Samples published: %lu", (unsigned long)samples_published);
-        ESP_LOGI("STATS", "  MQTT packets sent: %lu", (unsigned long)packets_sent);
-        ESP_LOGI("STATS", "  Samples dropped:   %lu", (unsigned long)samples_dropped);
-        
-        // Network status
-        if (ethernet_is_connected()) {
-            ethernet_get_ip_info(&ip_info);
-            ESP_LOGI("STATS", "  Network: Connected (" IPSTR ")", IP2STR(&ip_info.ip));
-        } else {
-            ESP_LOGW("STATS", "  Network: Disconnected");
+        // Process ADXL355 data (highest rate - 2000 Hz)
+        while (adxl355_read_sample(&adxl_raw)) {
+            // TODO: Convert raw_x, raw_y, raw_z to g using ADXL355 conversion
+            // For now, just count samples
+            loop_count++;
         }
         
-        // MQTT status
-        if (mqtt_is_connected()) {
-            ESP_LOGI("STATS", "  MQTT: Connected");
-        } else {
-            ESP_LOGW("STATS", "  MQTT: Disconnected");
+        // Process SCL3300 data (medium rate - 20 Hz)
+        while (scl3300_read_sample(&scl_raw)) {
+            // TODO: Convert raw_x, raw_y, raw_z to degrees using SCL3300 conversion
         }
-
-        ESP_LOGI("STATS", "  Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
-        ESP_LOGI("STATS", "===========================");
+        
+        // Process ADT7420 data (low rate - 1 Hz)
+        while (adt7420_read_sample(&adt_raw)) {
+            // TODO: Convert raw_temp to Celsius using ADT7420 conversion
+        }
+        
+        // Periodic status logging (every 2 seconds)
+        if (loop_count % 1000 == 0) {
+            ESP_LOGI(TAG, "Buffer status:");
+            ESP_LOGI(TAG, "  ADXL355: %lu samples available, %lu total, %lu overflows",
+                     (unsigned long)adxl355_samples_available(),
+                     (unsigned long)adxl355_get_sample_count(),
+                     (unsigned long)adxl355_get_overflow_count());
+            ESP_LOGI(TAG, "  SCL3300: %lu samples available, %lu total, %lu overflows",
+                     (unsigned long)scl3300_samples_available(),
+                     (unsigned long)scl3300_get_sample_count(),
+                     (unsigned long)scl3300_get_overflow_count());
+            ESP_LOGI(TAG, "  ADT7420: %lu samples available, %lu total, %lu overflows",
+                     (unsigned long)adt7420_samples_available(),
+                     (unsigned long)adt7420_get_sample_count(),
+                     (unsigned long)adt7420_get_overflow_count());
+            
+            // Check for buffer overflows
+            if (adxl355_get_overflow_count() > 0 ||
+                scl3300_get_overflow_count() > 0 ||
+                adt7420_get_overflow_count() > 0) {
+                ESP_LOGW(TAG, "WARNING: Buffer overflows detected! Processing too slow!");
+            }
+        }
+        
+        // Yield to other tasks
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
-
-
-/*******************************************************************************
- * Initialization Functions
- ******************************************************************************/
-
-static void print_banner(void)
-{
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "================================================");
-    ESP_LOGI(TAG, "  Wind Turbine Structural Health Monitor");
-    ESP_LOGI(TAG, "  *** TESTING MODE - FAKE SENSOR DATA ***");
-    ESP_LOGI(TAG, "================================================");
-    ESP_LOGI(TAG, "ESP-IDF: %s", esp_get_idf_version());
-    ESP_LOGI(TAG, "Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
-    ESP_LOGI(TAG, "");
-}
-
-static esp_err_t init_network(void)
-{
-//	ESP_LOGI(TAG, "Initializing Ethernet...");
-//
-//	    if (ethernet_init() != ESP_OK) {
-//	        ESP_LOGE(TAG, "Ethernet init failed");
-//	        return ESP_FAIL;
-//	    }
-//
-//	    // COMMENTED OUT - Using DHCP from router instead of static IP
-//	    // vTaskDelay(pdMS_TO_TICKS(1000));
-//	    // ESP_LOGI(TAG, "Assigning STATIC IP to ESP32...");
-//	    // if (ethernet_set_static_ip(192, 168, 1, 20) != ESP_OK) {
-//	    //     ESP_LOGE(TAG, "Failed to set static IP");
-//	    //     return ESP_FAIL;
-//	    // }
-//
-//	    // Wait for DHCP to assign IP (longer timeout)
-//	    ESP_LOGI(TAG, "Waiting for IP address from DHCP (timeout: 30 sec)...");
-//	    if (ethernet_wait_for_ip(30000) != ESP_OK) {
-//	        ESP_LOGW(TAG, "No IP address yet - continuing anyway");
-//	    }
-//
-//	    esp_netif_ip_info_t ip_info;
-//	    if (ethernet_get_ip_info(&ip_info) == ESP_OK) {
-//	        ESP_LOGI(TAG, "================================");
-//	        ESP_LOGI(TAG, "ESP32 IP FROM DHCP:");
-//	        ESP_LOGI(TAG, "IP: " IPSTR, IP2STR(&ip_info.ip));
-//	        ESP_LOGI(TAG, "Netmask: " IPSTR, IP2STR(&ip_info.netmask));
-//	        ESP_LOGI(TAG, "Gateway: " IPSTR, IP2STR(&ip_info.gw));
-//	        ESP_LOGI(TAG, "================================");
-//	    }
-//
-//	    return ESP_OK;
-
-	 ESP_LOGI(TAG, "Initializing Ethernet...");
-
-	    if (ethernet_init() != ESP_OK) {
-	        ESP_LOGE(TAG, "Ethernet init failed");
-	        return ESP_FAIL;
-	    }
-
-	    // Wait for link to come up
-	    vTaskDelay(pdMS_TO_TICKS(2000));
-
-	    // Set static IP (no DHCP needed)
-	    ESP_LOGI(TAG, "Setting static IP...");
-	    if (ethernet_set_static_ip(192, 168, 2, 100) != ESP_OK) {
-	        ESP_LOGE(TAG, "Failed to set static IP");
-	        return ESP_FAIL;
-	    }
-
-	    ESP_LOGI(TAG, "Static IP set: 192.168.2.100");
-	    return ESP_OK;
-}
-
-
-static esp_err_t init_mqtt(void)
-{
-    ESP_LOGI(TAG, "Initializing MQTT client...");
-
-    if (mqtt_init() != ESP_OK) {
-        ESP_LOGE(TAG, "MQTT init failed");
-        return ESP_FAIL;
-    }
-
-    ESP_LOGI(TAG, "Waiting for MQTT connection (timeout: %d sec)...", MQTT_CONNECT_TIMEOUT_MS / 1000);
-    esp_err_t ret = mqtt_wait_for_connection(MQTT_CONNECT_TIMEOUT_MS);
-
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "MQTT connected!");
-        mqtt_publish_status("Wind Turbine Monitor Online - TEST MODE");
-    } else {
-        ESP_LOGW(TAG, "MQTT connection timeout - will retry in background");
-    }
-
-    return ESP_OK;
-}
-
-// Buses not needed for fake DAQ, but keep for when real DAQ is ready
-/*
-static esp_err_t init_buses(void)
-{
-    esp_err_t ret;
-
-    ESP_LOGI(TAG, "Initializing I2C bus...");
-    ret = i2c_bus_init();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "I2C bus init failed");
-        return ESP_FAIL;
-    }
-
-    ESP_LOGI(TAG, "Initializing SPI bus...");
-    ret = spi_bus_init();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "SPI bus init failed");
-        return ESP_FAIL;
-    }
-
-    ESP_LOGI(TAG, "Communication buses initialized");
-    return ESP_OK;
-}
-*/
-
-
-/*******************************************************************************
- * Main Application Entry Point
- ******************************************************************************/
 
 void app_main(void)
 {
-    print_banner();
+    ESP_LOGI(TAG, "======================================");
+    ESP_LOGI(TAG, " ISR-Based Sensor Acquisition System  ");
+    ESP_LOGI(TAG, "======================================");
 
-    // =========================================
-    // 1. Initialize Network (Ethernet)
-    // =========================================
-    ESP_LOGI(TAG, "--- Network Initialization ---");
-    if (init_network() != ESP_OK) {
-        ESP_LOGE(TAG, "*** Network init failed - continuing anyway ***");
-    }
-    ESP_LOGI(TAG, "");
+    esp_err_t ret;
+    bool temp_sensor_available = false;
 
-    // =========================================
-    // 2. Initialize MQTT Client
-    // =========================================
-    ESP_LOGI(TAG, "--- MQTT Initialization ---");
-    if (init_mqtt() != ESP_OK) {
-        ESP_LOGE(TAG, "*** MQTT init failed - continuing anyway ***");
-    }
-    ESP_LOGI(TAG, "");
+    // ---- Step 1: Force SPI CS high ----
+    ESP_LOGI(TAG, "Step 1: Forcing SPI CS lines high...");
+    force_spi_cs_high_early();
 
-    // =========================================
-    // 3. Buses (skip for testing - fake DAQ doesn't need them)
-    // =========================================
-    // Uncomment when using real DAQ task:
-    // ESP_LOGI(TAG, "--- Bus Initialization ---");
-    // if (init_buses() != ESP_OK) {
-    //     ESP_LOGE(TAG, "*** SYSTEM HALTED: Bus init failed ***");
-    //     return;
-    // }
-
-    // =========================================
-    // 4. Initialize MQTT Task (creates queue)
-    // =========================================
-    ESP_LOGI(TAG, "--- MQTT Task Initialization ---");
-    if (mqtt_task_init() != ESP_OK) {
-        ESP_LOGE(TAG, "*** SYSTEM HALTED: MQTT task init failed ***");
-        return;
-    }
-    ESP_LOGI(TAG, "");
-
-    // =========================================
-    // 5. Initialize DAQ Task
-    // =========================================
-    ESP_LOGI(TAG, "--- DAQ Task Initialization ---");
-
-    // TESTING: Use fake DAQ task
-    if (fake_daq_task_init() != ESP_OK) {
-        ESP_LOGE(TAG, "*** SYSTEM HALTED: Fake DAQ task init failed ***");
-        return;
+    // ---- Step 2: Initialize buses ----
+    ESP_LOGI(TAG, "Step 2: Initializing buses...");
+    
+    ret = i2c_bus_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2C bus init failed: %s", esp_err_to_name(ret));
+        halt_forever();
     }
 
-    // PRODUCTION: Use real DAQ task (uncomment when ready)
-    // if (daq_task_init() != ESP_OK) {
-    //     ESP_LOGE(TAG, "*** SYSTEM HALTED: DAQ task init failed ***");
-    //     return;
-    // }
+    ret = spi_bus_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SPI bus init failed: %s", esp_err_to_name(ret));
+        halt_forever();
+    }
 
-    ESP_LOGI(TAG, "");
+    // ---- Step 3: Initialize sensors ----
+    ESP_LOGI(TAG, "Step 3: Initializing sensors...");
+    
+    // ADT7420 (temperature - I2C)
+    ret = adt7420_init();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "ADT7420 init failed: %s (continuing without temperature)", 
+                 esp_err_to_name(ret));
+        temp_sensor_available = false;
+    } else {
+        ESP_LOGI(TAG, "ADT7420 initialized ✓");
+        temp_sensor_available = true;
+    }
 
-    // =========================================
-    // 6. Create Statistics Monitor Task
-    // =========================================
-    ESP_LOGI(TAG, "--- Creating Statistics Monitor ---");
-    xTaskCreate(
-        stats_monitor_task,
-        "stats_task",
-        STATS_TASK_STACK_SIZE,
+    // Ensure SCL3300 CS is high before ADXL355 init
+    gpio_set_level(SPI_CS_SCL3300_IO, 1);
+    vTaskDelay(pdMS_TO_TICKS(1));
+
+    // ADXL355 (accelerometer - SPI)
+    ret = adxl355_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ADXL355 init failed (CRITICAL): %s", esp_err_to_name(ret));
+        halt_forever();
+    }
+    ESP_LOGI(TAG, "ADXL355 initialized ✓");
+
+    // Ensure ADXL355 CS is high before SCL3300 init
+    gpio_set_level(SPI_CS_ADXL355_IO, 1);
+    vTaskDelay(pdMS_TO_TICKS(1));
+
+    // SCL3300 (inclinometer - SPI)
+    ret = scl3300_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SCL3300 init failed (CRITICAL): %s", esp_err_to_name(ret));
+        halt_forever();
+    }
+    ESP_LOGI(TAG, "SCL3300 initialized ✓");
+
+    ESP_LOGI(TAG, "All sensors initialized successfully ✅");
+
+    // ---- Step 4: Initialize ISR-based acquisition ----
+    ESP_LOGI(TAG, "Step 4: Initializing ISR-based acquisition...");
+    
+    ret = sensor_acquisition_init(temp_sensor_available);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Sensor acquisition init failed: %s", esp_err_to_name(ret));
+        halt_forever();
+    }
+    ESP_LOGI(TAG, "ISR acquisition initialized ✓");
+
+    // Temporary verification
+    ESP_LOGI(TAG, "Device handle check:");
+    ESP_LOGI(TAG, "  adxl355_spi_handle = %p", adxl355_spi_handle);
+    ESP_LOGI(TAG, "  scl3300_spi_handle = %p", scl3300_spi_handle);
+    ESP_LOGI(TAG, "  adt7420_i2c_handle = %p", adt7420_i2c_handle);
+
+if (adxl355_spi_handle == NULL) {
+    ESP_LOGE(TAG, "ERROR: adxl355_spi_handle not exposed!");
+}
+if (scl3300_spi_handle == NULL) {
+    ESP_LOGE(TAG, "ERROR: scl3300_spi_handle not exposed!");
+}
+if (adt7420_i2c_handle == NULL && temp_sensor_available) {
+    ESP_LOGE(TAG, "ERROR: adt7420_i2c_handle not exposed!");
+}
+
+    // ---- Step 5: Create processing task ----
+    ESP_LOGI(TAG, "Step 5: Creating processing task...");
+    
+    BaseType_t task_ret = xTaskCreatePinnedToCore(
+        sensor_processing_task,
+        "proc_task",
+        8192,           // Stack size
         NULL,
-        STATS_TASK_PRIORITY,
-        NULL
+        2,              // Low priority
+        NULL,
+        tskNO_AFFINITY  // Can run on any core
     );
-    ESP_LOGI(TAG, "");
+    
+    if (task_ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create processing task");
+        halt_forever();
+    }
+    ESP_LOGI(TAG, "Processing task created ✓");
 
-    // =========================================
-    // System Running
-    // =========================================
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "================================================");
-    ESP_LOGI(TAG, "  SYSTEM RUNNING - TEST MODE");
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "  Fake sensor data being generated");
-    ESP_LOGI(TAG, "  Check Raspberry Pi for MQTT messages");
-    ESP_LOGI(TAG, "  Topic: wind_turbine/data");
-    ESP_LOGI(TAG, "================================================");
-    ESP_LOGI(TAG, "");
+    // ---- Step 6: Start acquisition ----
+    ESP_LOGI(TAG, "Step 6: Starting data acquisition...");
+    
+    ret = sensor_acquisition_start();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start acquisition: %s", esp_err_to_name(ret));
+        halt_forever();
+    }
+    
+    ESP_LOGI(TAG, "======================================");
+    ESP_LOGI(TAG, " SYSTEM RUNNING ✅                    ");
+    ESP_LOGI(TAG, "======================================");
+    ESP_LOGI(TAG, "ISR collecting data at:");
+    ESP_LOGI(TAG, "  - ADXL355: 2000 Hz");
+    ESP_LOGI(TAG, "  - SCL3300: 20 Hz");
+    if (temp_sensor_available) {
+        ESP_LOGI(TAG, "  - ADT7420: 1 Hz");
+    }
+    ESP_LOGI(TAG, "======================================");
 
-    // app_main() returns - tasks continue running
+    // Main task has nothing else to do - just monitor system health
+    uint32_t last_tick = 0;
+    
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(5000));  // Every 5 seconds
+        
+        uint32_t current_tick = get_tick_count();
+        uint32_t elapsed_ticks = current_tick - last_tick;
+        float elapsed_sec = TICKS_TO_SEC(elapsed_ticks);
+        
+        ESP_LOGI(TAG, "System health: %.2f sec elapsed, tick=%lu", 
+                 elapsed_sec, (unsigned long)current_tick);
+        
+        last_tick = current_tick;
+        
+        // Get overall statistics
+        uint32_t acquired, dropped, max_time;
+        sensor_acquisition_get_stats(&acquired, &dropped, &max_time);
+        
+        ESP_LOGI(TAG, "Total: %lu acquired, %lu dropped",
+                 (unsigned long)acquired, (unsigned long)dropped);
+        
+        if (dropped > 0) {
+            ESP_LOGW(TAG, "⚠️  DATA LOSS: %lu samples dropped!", (unsigned long)dropped);
+        }
+    }
 }

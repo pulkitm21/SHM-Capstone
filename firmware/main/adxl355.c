@@ -1,240 +1,271 @@
 /**
  * @file adxl355.c
- * @brief ADXL355 Accelerometer Driver (SPI)
+ * @brief ADXL355 Accelerometer Driver (SPI) - datasheet-correct init + SPI framing
+ *
+ * Datasheet: ADXL354/ADXL355 Rev. D
+ *
+ * SPI protocol:
+ *  - CPOL=0, CPHA=0
+ *  - Command byte:
+ *      bit7 = R/W   (1 = read, 0 = write)
+ *      bit6 = MB    (1 = multibyte, 0 = single byte)
+ *      bit5..0 = register address
+ *
+ * Startup notes:
+ *  - Program configuration registers while in standby (POWER_CTL.STANDBY = 1)
+ *  - Then clear STANDBY to enter measurement mode
  */
 
 #include "adxl355.h"
 #include "spi_bus.h"
-#include "esp_log.h"
+
 #include "driver/spi_master.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include <stdbool.h>
 #include <string.h>
 
 static const char *TAG = "ADXL355";
 
-// SPI device handle
-static spi_device_handle_t adxl355_spi_handle = NULL;
+spi_device_handle_t adxl355_spi_handle = NULL; //exposed for ISR use
+static spi_device_handle_t s_dev = NULL; //internal handle for non-ISR use
+static uint8_t s_range_code = ADXL355_RANGE_2G;
 
-// Current range setting (for conversion)
-static uint8_t current_range = ADXL355_RANGE_2G;
+/* Small transfers only (IDs, config, burst accel/temp reads) */
+#define ADXL355_MAX_XFER_BYTES  16
 
-// Scale factors for each range (LSB to g conversion)
-// ADXL355 has 20-bit resolution, scale factor = range / 2^19
-static const float scale_factor[] = {
-    0.0000039f,     // ±2g: 3.9 µg/LSB
-    0.0000078f,     // ±4g: 7.8 µg/LSB
-    0.0000156f      // ±8g: 15.6 µg/LSB
-};
+/* Soft reset code (RESET register, addr 0x2F) */
+#define ADXL355_RESET_CODE      0x52
 
+/* ----- SPI helpers ----- */
 
-/**
- * @brief Read a register from ADXL355
- */
-static esp_err_t adxl355_read_reg(uint8_t reg, uint8_t *data, size_t len)
+static inline uint8_t adxl355_cmd(uint8_t reg, bool is_read)
 {
-    spi_transaction_t trans = {
-        .flags = 0,
-        .cmd = 0,
-        .addr = 0,
-        .length = 8 * (1 + len),        // Command byte + data bytes
-        .rxlength = 8 * (1 + len),
-        .tx_buffer = NULL,
-        .rx_buffer = NULL,
-    };
-
-    // Allocate buffers
-    uint8_t *tx_buf = heap_caps_malloc(1 + len, MALLOC_CAP_DMA);
-    uint8_t *rx_buf = heap_caps_malloc(1 + len, MALLOC_CAP_DMA);
-    if (!tx_buf || !rx_buf) {
-        free(tx_buf);
-        free(rx_buf);
-        return ESP_ERR_NO_MEM;
-    }
-
-    // First byte: register address with read bit (bit 0 = 1)
-    tx_buf[0] = (reg << 1) | 0x01;
-    memset(&tx_buf[1], 0, len);
-
-    trans.tx_buffer = tx_buf;
-    trans.rx_buffer = rx_buf;
-
-    esp_err_t ret = spi_device_transmit(adxl355_spi_handle, &trans);
-    if (ret == ESP_OK) {
-        memcpy(data, &rx_buf[1], len);
-    }
-
-    free(tx_buf);
-    free(rx_buf);
-    return ret;
+    // Datasheet: MOSI sends A6..A0 then R/W as bit0
+    // So command byte = (reg << 1) | R/W
+    return (uint8_t)((reg << 1) | (is_read ? 0x01 : 0x00));
 }
 
-
-/**
- * @brief Write a register to ADXL355
- */
-static esp_err_t adxl355_write_reg(uint8_t reg, uint8_t data)
+static esp_err_t adxl355_xfer(const uint8_t *tx, uint8_t *rx, size_t nbytes)
 {
-    spi_transaction_t trans = {
-        .flags = 0,
-        .length = 16,   // 2 bytes: command + data
-        .rxlength = 0,
-        .tx_buffer = NULL,
-        .rx_buffer = NULL,
-    };
+    if (!s_dev) return ESP_ERR_INVALID_STATE;
+    if (!tx || !rx || nbytes == 0) return ESP_ERR_INVALID_ARG;
 
-    uint8_t *tx_buf = heap_caps_malloc(2, MALLOC_CAP_DMA);
-    if (!tx_buf) {
-        return ESP_ERR_NO_MEM;
-    }
+    spi_transaction_t t;
+    memset(&t, 0, sizeof(t));
 
-    // First byte: register address with write bit (bit 0 = 0)
-    tx_buf[0] = (reg << 1) | 0x00;
-    tx_buf[1] = data;
+    t.length = (uint32_t)(nbytes * 8);
+    t.tx_buffer = tx;
+    t.rx_buffer = rx;
 
-    trans.tx_buffer = tx_buf;
-
-    esp_err_t ret = spi_device_transmit(adxl355_spi_handle, &trans);
-
-    free(tx_buf);
-    return ret;
+    return spi_device_transmit(s_dev, &t);
 }
 
+static esp_err_t adxl355_read_reg(uint8_t reg, uint8_t *out, size_t len)
+{
+    if (!out || len == 0) return ESP_ERR_INVALID_ARG;
+    if (len + 1 > ADXL355_MAX_XFER_BYTES) return ESP_ERR_INVALID_SIZE;
+
+    uint8_t tx[ADXL355_MAX_XFER_BYTES] = {0};
+    uint8_t rx[ADXL355_MAX_XFER_BYTES] = {0};
+
+    tx[0] = adxl355_cmd(reg, true);
+
+    esp_err_t err = adxl355_xfer(tx, rx, 1 + len);
+    if (err != ESP_OK) return err;
+
+    memcpy(out, &rx[1], len);
+    return ESP_OK;
+}
+
+static esp_err_t adxl355_write_reg(uint8_t reg, uint8_t val)
+{
+    uint8_t tx[2] = { adxl355_cmd(reg, false), val };
+    uint8_t rx[2] = {0};
+    return adxl355_xfer(tx, rx, sizeof(tx));
+}
+
+/* ----- Conversions ----- */
+
+static inline int32_t sign_extend_20b(uint32_t v)
+{
+    /* 20-bit two's complement: sign bit is bit19 */
+    if (v & (1u << 19)) {
+        return (int32_t)(v | 0xFFF00000u); /* extend sign through bit31 */
+    }
+    return (int32_t)v;
+}
+
+static float adxl355_lsb_per_g(uint8_t range_code)
+{
+    /* From datasheet sensitivity:
+       ±2 g: 3.9 µg/LSB  -> ~256000 LSB/g
+       ±4 g: 7.8 µg/LSB  -> ~128000 LSB/g
+       ±8 g: 15.6 µg/LSB -> ~ 64000 LSB/g
+    */
+    switch (range_code) {
+        case ADXL355_RANGE_2G: return 256000.0f;
+        case ADXL355_RANGE_4G: return 128000.0f;
+        case ADXL355_RANGE_8G: return  64000.0f;
+        default:               return 256000.0f;
+    }
+}
+
+/* ----- Public API ----- */
 
 esp_err_t adxl355_init(void)
 {
     ESP_LOGI(TAG, "Initializing ADXL355 accelerometer...");
 
-    // Configure SPI device
-    spi_device_interface_config_t dev_config = {
+    if (s_dev != NULL) {
+        ESP_LOGW(TAG, "ADXL355 already initialized");
+        return ESP_OK;
+    }
+
+    /* Add device to shared SPI bus */
+    spi_device_interface_config_t devcfg = {
         .clock_speed_hz = SPI_CLOCK_SPEED_HZ,
-        .mode = 0,                          // CPOL=0, CPHA=0
+        .mode = 0, /* CPOL=0, CPHA=0 */
         .spics_io_num = SPI_CS_ADXL355_IO,
         .queue_size = 1,
-        .command_bits = 0,
-        .address_bits = 0,
+        .flags = 0, /* full duplex */
     };
 
-    esp_err_t ret = spi_bus_add_device(spi_bus_get_host(), &dev_config, &adxl355_spi_handle);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to add SPI device: %s", esp_err_to_name(ret));
-        return ret;
+    esp_err_t err = spi_bus_add_device(spi_bus_get_host(), &devcfg, &s_dev);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "spi_bus_add_device failed: %s", esp_err_to_name(err));
+        return err;
     }
 
-    // Verify device ID
-    uint8_t dev_id = 0;
-    ret = adxl355_read_reg(ADXL355_REG_DEVID_AD, &dev_id, 1);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to read device ID: %s", esp_err_to_name(ret));
-        return ret;
-    }
+    adxl355_spi_handle = s_dev; //Expose handle for ISR access
 
-    if (dev_id != 0xAD) {
-        ESP_LOGE(TAG, "Unexpected device ID: 0x%02X (expected 0xAD)", dev_id);
+    /* Optional soft reset for a clean state */
+    (void)adxl355_write_reg(ADXL355_REG_RESET, ADXL355_RESET_CODE);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    /* Verify device IDs */
+    uint8_t devid_ad = 0, devid_mst = 0, partid = 0, revid = 0;
+    err = adxl355_read_reg(ADXL355_REG_DEVID_AD, &devid_ad, 1);   if (err != ESP_OK) return err;
+    err = adxl355_read_reg(ADXL355_REG_DEVID_MST, &devid_mst, 1); if (err != ESP_OK) return err;
+    err = adxl355_read_reg(ADXL355_REG_PARTID, &partid, 1);       if (err != ESP_OK) return err;
+    err = adxl355_read_reg(ADXL355_REG_REVID, &revid, 1);         if (err != ESP_OK) return err;
+
+    ESP_LOGI(TAG, "IDs: DEVID_AD=0x%02X DEVID_MST=0x%02X PARTID=0x%02X REVID=0x%02X",
+             devid_ad, devid_mst, partid, revid);
+
+    if (devid_ad != ADXL355_DEVID_AD_EXPECTED ||
+        devid_mst != ADXL355_DEVID_MST_EXPECTED ||
+        partid   != ADXL355_PARTID_EXPECTED) {
+        ESP_LOGE(TAG, "Unexpected IDs (got AD=0x%02X MST=0x%02X PART=0x%02X; expected AD=0x%02X MST=0x%02X PART=0x%02X)",
+                 devid_ad, devid_mst, partid,
+                 ADXL355_DEVID_AD_EXPECTED, ADXL355_DEVID_MST_EXPECTED, ADXL355_PARTID_EXPECTED);
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    // Verify part ID
-    uint8_t part_id = 0;
-    ret = adxl355_read_reg(ADXL355_REG_PARTID, &part_id, 1);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to read part ID: %s", esp_err_to_name(ret));
-        return ret;
+    /* Enter standby before changing configuration */
+    err = adxl355_write_reg(ADXL355_REG_POWER_CTL, ADXL355_POWER_STANDBY_BIT);
+    if (err != ESP_OK) return err;
+    vTaskDelay(pdMS_TO_TICKS(2));
+
+    /* FILTER: default to ODR=2000 Hz, HPF off */
+    err = adxl355_write_reg(ADXL355_REG_FILTER, ADXL355_FILTER_ODR_2000);
+    if (err != ESP_OK) return err;
+
+    /* Optional: route DATA_RDY to INT1 via INT_MAP (does not affect DRDY pin) */
+    err = adxl355_write_reg(ADXL355_REG_INT_MAP, ADXL355_INT_RDY_EN1);
+    if (err != ESP_OK) return err;
+
+    /* RANGE: default ±2 g (preserve upper bits like I2C_HS / INT_POL) */
+    err = adxl355_set_range(ADXL355_RANGE_2G);
+    if (err != ESP_OK) return err;
+
+    /* Exit standby -> measurement mode */
+    err = adxl355_write_reg(ADXL355_REG_POWER_CTL, 0x00);
+    if (err != ESP_OK) return err;
+
+    /* Cache range (read back for certainty) */
+    uint8_t range_reg = 0;
+    err = adxl355_read_reg(ADXL355_REG_RANGE, &range_reg, 1);
+    if (err == ESP_OK) {
+        s_range_code = (uint8_t)(range_reg & 0x03);
     }
 
-    if (part_id != 0xED) {
-        ESP_LOGE(TAG, "Unexpected part ID: 0x%02X (expected 0xED)", part_id);
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-
-    // Set default range (±2g)
-    ret = adxl355_set_range(ADXL355_RANGE_2G);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    // Enable measurement mode (exit standby)
-    ret = adxl355_write_reg(ADXL355_REG_POWER_CTL, ADXL355_POWER_ON);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to enable measurement mode: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ESP_LOGI(TAG, "ADXL355 initialized successfully (ID: 0x%02X, Part: 0x%02X)", dev_id, part_id);
+    ESP_LOGI(TAG, "ADXL355 init OK (range code=0x%02X)", s_range_code);
     return ESP_OK;
 }
-
-
-esp_err_t adxl355_read_acceleration(adxl355_accel_t *accel)
-{
-    if (accel == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    // Read all 9 bytes of acceleration data at once (X, Y, Z - 3 bytes each)
-    uint8_t data[9] = {0};
-    esp_err_t ret = adxl355_read_reg(ADXL355_REG_XDATA3, data, 9);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to read acceleration: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    // Convert raw data to signed 20-bit values
-    int32_t raw_x = ((int32_t)data[0] << 12) | ((int32_t)data[1] << 4) | (data[2] >> 4);
-    int32_t raw_y = ((int32_t)data[3] << 12) | ((int32_t)data[4] << 4) | (data[5] >> 4);
-    int32_t raw_z = ((int32_t)data[6] << 12) | ((int32_t)data[7] << 4) | (data[8] >> 4);
-
-    // Sign extend from 20-bit to 32-bit
-    if (raw_x & 0x80000) raw_x -= 0x100000;
-    if (raw_y & 0x80000) raw_y -= 0x100000;
-    if (raw_z & 0x80000) raw_z -= 0x100000;
-
-    // Convert to g using scale factor
-    float scale = scale_factor[current_range - 1];
-    accel->x = raw_x * scale;
-    accel->y = raw_y * scale;
-    accel->z = raw_z * scale;
-
-    return ESP_OK;
-}
-
 
 esp_err_t adxl355_set_range(uint8_t range)
 {
-    if (range < ADXL355_RANGE_2G || range > ADXL355_RANGE_8G) {
-        ESP_LOGE(TAG, "Invalid range: %d", range);
+    if (range != ADXL355_RANGE_2G &&
+        range != ADXL355_RANGE_4G &&
+        range != ADXL355_RANGE_8G) {
+        ESP_LOGE(TAG, "Invalid range code: 0x%02X", range);
         return ESP_ERR_INVALID_ARG;
     }
 
-    esp_err_t ret = adxl355_write_reg(ADXL355_REG_RANGE, range);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set range: %s", esp_err_to_name(ret));
-        return ret;
-    }
+    /* RANGE register reset is 0x81; keep upper bits, set lower 2 bits */
+    uint8_t reg = 0;
+    esp_err_t err = adxl355_read_reg(ADXL355_REG_RANGE, &reg, 1);
+    if (err != ESP_OK) return err;
 
-    current_range = range;
-    ESP_LOGI(TAG, "Range set to ±%dg", (1 << range));
+    reg = (uint8_t)((reg & ~0x03u) | (range & 0x03u));
+    err = adxl355_write_reg(ADXL355_REG_RANGE, reg);
+    if (err != ESP_OK) return err;
+
+    s_range_code = range;
+    ESP_LOGI(TAG, "Range set (code=0x%02X)", s_range_code);
     return ESP_OK;
 }
 
-
-esp_err_t adxl355_read_temperature(float *temperature)
+esp_err_t adxl355_read_acceleration(adxl355_accel_t *accel)
 {
-    if (temperature == NULL) {
-        return ESP_ERR_INVALID_ARG;
+    if (!accel) return ESP_ERR_INVALID_ARG;
+
+    uint8_t b[9] = {0};
+    esp_err_t err = adxl355_read_reg(ADXL355_REG_XDATA3, b, sizeof(b));
+    if (err != ESP_OK) return err;
+
+    uint32_t x_u = ((uint32_t)b[0] << 12) | ((uint32_t)b[1] << 4) | ((uint32_t)b[2] >> 4);
+    uint32_t y_u = ((uint32_t)b[3] << 12) | ((uint32_t)b[4] << 4) | ((uint32_t)b[5] >> 4);
+    uint32_t z_u = ((uint32_t)b[6] << 12) | ((uint32_t)b[7] << 4) | ((uint32_t)b[8] >> 4);
+
+    int32_t x = sign_extend_20b(x_u);
+    int32_t y = sign_extend_20b(y_u);
+    int32_t z = sign_extend_20b(z_u);
+
+    float lsb_per_g = adxl355_lsb_per_g(s_range_code);
+
+    accel->x = (float)x / lsb_per_g;
+    accel->y = (float)y / lsb_per_g;
+    accel->z = (float)z / lsb_per_g;
+
+    return ESP_OK;
+}
+
+esp_err_t adxl355_read_temperature(float *temperature_c)
+{
+    if (!temperature_c) return ESP_ERR_INVALID_ARG;
+
+    /* TEMP is not double-buffered. Read TEMP2, TEMP1, TEMP2 and verify TEMP2 stable. */
+    uint8_t t2a = 0, t1 = 0, t2b = 0;
+
+    for (int i = 0; i < 3; i++) {
+        esp_err_t err = adxl355_read_reg(ADXL355_REG_TEMP2, &t2a, 1);
+        if (err != ESP_OK) return err;
+        err = adxl355_read_reg(ADXL355_REG_TEMP1, &t1, 1);
+        if (err != ESP_OK) return err;
+        err = adxl355_read_reg(ADXL355_REG_TEMP2, &t2b, 1);
+        if (err != ESP_OK) return err;
+
+        if ((t2a & 0x0F) == (t2b & 0x0F)) break;
     }
 
-    uint8_t data[2] = {0};
-    esp_err_t ret = adxl355_read_reg(ADXL355_REG_TEMP2, data, 2);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to read temperature: %s", esp_err_to_name(ret));
-        return ret;
-    }
+    uint16_t raw12 = (uint16_t)(((t2b & 0x0F) << 8) | t1);
 
-    // Combine bytes into 12-bit value
-    int16_t raw_temp = ((int16_t)(data[0] & 0x0F) << 8) | data[1];
-
-    // Convert to Celsius
-    // Formula from datasheet: Temp = ((raw - 1852) / -9.05) + 25
-    *temperature = ((raw_temp - 1852) / -9.05f) + 25.0f;
+    /* Datasheet: nominal intercept = 1885 LSB @ 25°C, nominal slope = -9.05 LSB/°C */
+    *temperature_c = 25.0f + ((float)raw12 - 1885.0f) / (-9.05f);
 
     return ESP_OK;
 }
