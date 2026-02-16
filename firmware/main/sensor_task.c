@@ -41,6 +41,10 @@
 #include "driver/spi_master.h"
 #include "driver/i2c_master.h"
 
+#include "hal/i2c_hal.h"
+#include "hal/i2c_ll.h"
+#include "soc/i2c_struct.h"
+
 #include "spi_bus.h"
 #include "i2c_bus.h"
 #include "adt7420.h"
@@ -155,7 +159,7 @@ extern i2c_master_dev_handle_t adt7420_i2c_handle; // You'll need to expose this
  */
 static inline void IRAM_ATTR read_adxl355_raw(int32_t *raw_x, int32_t *raw_y, int32_t *raw_z)
 {
-    // ADXL355 SPI command: (reg << 1) | 0x01 for read
+     // ADXL355 SPI command: (reg << 1) | 0x01 for read
     // XDATA3 register = 0x08
     uint8_t tx[10] = {0};
     uint8_t rx[10] = {0};
@@ -168,17 +172,20 @@ static inline void IRAM_ATTR read_adxl355_raw(int32_t *raw_x, int32_t *raw_y, in
     t.tx_buffer = tx;
     t.rx_buffer = rx;
     
-    // Direct SPI transfer (blocking, but very fast)
-    // TODO: You'll need to expose s_dev from adxl355.c as adxl355_spi_handle
-    // For now, this is pseudocode - you'll implement after exposing the handle
-    // spi_device_polling_transmit(adxl355_spi_handle, &t);
+    // Direct SPI transfer (blocking, but very fast ~10-20 microseconds)
+    spi_device_polling_transmit(adxl355_spi_handle, &t);
     
     // Extract 20-bit values from bytes (big-endian)
+    // Byte layout from ADXL355 datasheet:
+    // rx[1] = XDATA3 (bits 19-12)
+    // rx[2] = XDATA2 (bits 11-4)
+    // rx[3] = XDATA1 (bits 3-0 in upper nibble)
     uint32_t x_u = ((uint32_t)rx[1] << 12) | ((uint32_t)rx[2] << 4) | ((uint32_t)rx[3] >> 4);
     uint32_t y_u = ((uint32_t)rx[4] << 12) | ((uint32_t)rx[5] << 4) | ((uint32_t)rx[6] >> 4);
     uint32_t z_u = ((uint32_t)rx[7] << 12) | ((uint32_t)rx[8] << 4) | ((uint32_t)rx[9] >> 4);
     
-    // Sign extend 20-bit to 32-bit
+    // Sign extend 20-bit to 32-bit (handle negative values)
+    // If bit 19 is set, it's negative in two's complement
     *raw_x = (x_u & 0x80000) ? (int32_t)(x_u | 0xFFF00000) : (int32_t)x_u;
     *raw_y = (y_u & 0x80000) ? (int32_t)(y_u | 0xFFF00000) : (int32_t)y_u;
     *raw_z = (z_u & 0x80000) ? (int32_t)(z_u | 0xFFF00000) : (int32_t)z_u;
@@ -198,43 +205,93 @@ static inline void IRAM_ATTR read_adxl355_raw(int32_t *raw_x, int32_t *raw_y, in
  */
 static inline void IRAM_ATTR read_scl3300_raw(int16_t *raw_x, int16_t *raw_y, int16_t *raw_z)
 {
-    // SCL3300 commands for angle reads (from scl3300.h)
-    // We need to do prime + fetch for each axis
-    
-    // For ISR efficiency, we'll read acceleration instead of angle
-    // (angle requires more SPI transactions due to off-frame protocol)
-    
     spi_transaction_t t;
     uint32_t cmd, resp;
     
-    // Read X acceleration (ACC_X)
+    // Note: We're reading ACCELERATION, not angle, for speed
+    // Each axis requires 2 SPI transactions (prime + fetch)
+    
+    //--------------------------------------------------------------------------
+    // Read X-axis acceleration
+    //--------------------------------------------------------------------------
     cmd = 0x040000F7u;  // SCL3300_CMD_READ_ACC_X
     
-    // Prime
+    // Prime: Send command
     memset(&t, 0, sizeof(t));
     t.flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
     t.length = 32;
+    t.rxlength = 32;
     t.tx_data[0] = (uint8_t)((cmd >> 24) & 0xFF);
     t.tx_data[1] = (uint8_t)((cmd >> 16) & 0xFF);
     t.tx_data[2] = (uint8_t)((cmd >> 8) & 0xFF);
     t.tx_data[3] = (uint8_t)(cmd & 0xFF);
     
-    // TODO: You'll need to expose s_scl3300 from scl3300.c as scl3300_spi_handle
-    // spi_device_polling_transmit(scl3300_spi_handle, &t);
+    spi_device_polling_transmit(scl3300_spi_handle, &t);
     
-    // Fetch
-    // spi_device_polling_transmit(scl3300_spi_handle, &t);
+    // Fetch: Send same command again to get response
+    spi_device_polling_transmit(scl3300_spi_handle, &t);
     
     resp = ((uint32_t)t.rx_data[0] << 24) |
            ((uint32_t)t.rx_data[1] << 16) |
            ((uint32_t)t.rx_data[2] << 8)  |
            (uint32_t)t.rx_data[3];
     
+    // Extract data from bits [23:8]
     *raw_x = (int16_t)((resp >> 8) & 0xFFFF);
     
-    // Similar for Y and Z (simplified for brevity - you'll implement all 3)
-    *raw_y = 0;  // TODO: Read Y axis
-    *raw_z = 0;  // TODO: Read Z axis
+    //--------------------------------------------------------------------------
+    // Read Y-axis acceleration
+    //--------------------------------------------------------------------------
+    cmd = 0x080000FDu;  // SCL3300_CMD_READ_ACC_Y
+    
+    // Prime
+    memset(&t, 0, sizeof(t));
+    t.flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
+    t.length = 32;
+    t.rxlength = 32;
+    t.tx_data[0] = (uint8_t)((cmd >> 24) & 0xFF);
+    t.tx_data[1] = (uint8_t)((cmd >> 16) & 0xFF);
+    t.tx_data[2] = (uint8_t)((cmd >> 8) & 0xFF);
+    t.tx_data[3] = (uint8_t)(cmd & 0xFF);
+    
+    spi_device_polling_transmit(scl3300_spi_handle, &t);
+    
+    // Fetch
+    spi_device_polling_transmit(scl3300_spi_handle, &t);
+    
+    resp = ((uint32_t)t.rx_data[0] << 24) |
+           ((uint32_t)t.rx_data[1] << 16) |
+           ((uint32_t)t.rx_data[2] << 8)  |
+           (uint32_t)t.rx_data[3];
+    
+    *raw_y = (int16_t)((resp >> 8) & 0xFFFF);
+    
+    //--------------------------------------------------------------------------
+    // Read Z-axis acceleration
+    //--------------------------------------------------------------------------
+    cmd = 0x0C0000FBu;  // SCL3300_CMD_READ_ACC_Z
+    
+    // Prime
+    memset(&t, 0, sizeof(t));
+    t.flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
+    t.length = 32;
+    t.rxlength = 32;
+    t.tx_data[0] = (uint8_t)((cmd >> 24) & 0xFF);
+    t.tx_data[1] = (uint8_t)((cmd >> 16) & 0xFF);
+    t.tx_data[2] = (uint8_t)((cmd >> 8) & 0xFF);
+    t.tx_data[3] = (uint8_t)(cmd & 0xFF);
+    
+    spi_device_polling_transmit(scl3300_spi_handle, &t);
+    
+    // Fetch
+    spi_device_polling_transmit(scl3300_spi_handle, &t);
+    
+    resp = ((uint32_t)t.rx_data[0] << 24) |
+           ((uint32_t)t.rx_data[1] << 16) |
+           ((uint32_t)t.rx_data[2] << 8)  |
+           (uint32_t)t.rx_data[3];
+    
+    *raw_z = (int16_t)((resp >> 8) & 0xFFFF);
 }
 
 /**
@@ -248,15 +305,8 @@ static inline void IRAM_ATTR read_scl3300_raw(int16_t *raw_x, int16_t *raw_y, in
  */
 static inline void IRAM_ATTR read_adt7420_raw(uint16_t *raw_temp)
 {
-    uint8_t reg_addr = 0x00;  // ADT7420_REG_TEMP_MSB
-    uint8_t data[2] = {0};
-    
-    // TODO: You'll need to expose adt7420_handle from adt7420.c as adt7420_i2c_handle
-    // Direct I2C read (blocking but fast)
-    // i2c_master_transmit_receive(adt7420_i2c_handle, &reg_addr, 1, data, 2, 1000);
-    
-    // Combine into 16-bit value (13-bit data is in upper bits)
-    *raw_temp = (uint16_t)((data[0] << 8) | data[1]);
+    // This function is not used - temperature read from processing task
+    *raw_temp = 0;
 }
 
 /******************************************************************************
@@ -356,6 +406,7 @@ static bool IRAM_ATTR timer_isr_handler(gptimer_handle_t timer,
     //--------------------------------------------------------------------------
     // ADT7420 Sampling (1 Hz - every 8000 ticks)
     //--------------------------------------------------------------------------
+    /*
     if (s_temp_available && (tick_counter - ADT7420_OFFSET) % ADT7420_TICK_DIVISOR == 0)
     {
         // Calculate next write position
@@ -384,6 +435,7 @@ static bool IRAM_ATTR timer_isr_handler(gptimer_handle_t timer,
             adt7420_sample_count++;
         }
     }
+    */
     
     // ISR complete - no context switch needed for pure data collection
     return false;
