@@ -29,7 +29,8 @@
 
 static const char *TAG = "ADXL355";
 
-static spi_device_handle_t s_dev = NULL;
+spi_device_handle_t adxl355_spi_handle = NULL; //exposed for ISR use
+static spi_device_handle_t s_dev = NULL; //internal handle for non-ISR use
 static uint8_t s_range_code = ADXL355_RANGE_2G;
 
 /* Small transfers only (IDs, config, burst accel/temp reads) */
@@ -137,6 +138,8 @@ esp_err_t adxl355_init(void)
         ESP_LOGE(TAG, "spi_bus_add_device failed: %s", esp_err_to_name(err));
         return err;
     }
+
+    adxl355_spi_handle = s_dev; //Expose handle for ISR access
 
     /* Optional soft reset for a clean state */
     (void)adxl355_write_reg(ADXL355_REG_RESET, ADXL355_RESET_CODE);

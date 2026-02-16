@@ -26,6 +26,8 @@
 
 #include "esp_err.h"
 #include <stdint.h>
+#include "driver/spi_master.h"
+extern spi_device_handle_t scl3300_spi_handle;
 
 #ifdef __cplusplus
 extern "C" {

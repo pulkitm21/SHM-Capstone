@@ -17,6 +17,8 @@
 
 #include <stdint.h>
 #include "esp_err.h"
+#include "driver/spi_master.h"
+extern spi_device_handle_t adxl355_spi_handle;
 
 #ifdef __cplusplus
 extern "C" {
