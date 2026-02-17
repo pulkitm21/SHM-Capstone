@@ -4,10 +4,16 @@
  *
  * Reads raw samples from ring buffers, converts to engineering units,
  * packages as JSON, and publishes via MQTT.
+ *
+ * NOTE: Temperature is read DIRECTLY in this task (not via ISR) because:
+ * - I2C is slower than SPI
+ * - Temperature only needs 1 Hz update rate
+ * - Keeps ISR fast and deterministic
  */
 
 #include "data_processing_and_mqtt_task.h"
 #include "sensor_task.h"  // Ring buffer access functions
+#include "adt7420.h"
 #include "mqtt.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -41,6 +47,9 @@ static bool s_has_incl_data = false;
 static float s_latest_temp = 0.0f;
 static bool s_has_temp_data = false;
 
+// Temperature reading interval
+#define TEMP_READ_INTERVAL_MS   1000    // Read temperature every 1 second
+
 /******************************************************************************
  * UNIT CONVERSION FUNCTIONS
  *
@@ -68,22 +77,6 @@ static inline float convert_scl3300_to_deg(int16_t raw)
     return (float)raw * 0.0055f;
 }
 
-/**
- * @brief Convert raw ADT7420 value to Celsius
- *
- * ADT7420 13-bit resolution: 0.0625 °C/LSB
- * The raw value is already sign-extended by the ISR
- */
-static inline float convert_adt7420_to_celsius(uint16_t raw)
-{
-    // ADT7420 13-bit format
-    // If using 13-bit mode: temp = raw * 0.0625
-    // If using 16-bit mode: temp = raw / 128.0
-    // Assuming 13-bit mode (default)
-    int16_t temp_raw = (int16_t)raw;
-    return (float)temp_raw * 0.0625f;
-}
-
 /******************************************************************************
  * DATA PROCESSING AND MQTT PUBLISHING TASK
  *****************************************************************************/
@@ -93,19 +86,43 @@ static void data_processing_task(void *pvParameters)
     ESP_LOGI(TAG, "Data processing and MQTT task started");
     ESP_LOGI(TAG, "  Batch size: %d accel samples", ACCEL_SAMPLES_PER_BATCH);
     ESP_LOGI(TAG, "  Processing interval: %d ms", PROCESSING_INTERVAL_MS);
+    ESP_LOGI(TAG, "  Temperature read interval: %d ms", TEMP_READ_INTERVAL_MS);
     ESP_LOGI(TAG, "  Conversions:");
     ESP_LOGI(TAG, "    ADXL355: raw * (1/256000) = g");
     ESP_LOGI(TAG, "    SCL3300: raw * 0.0055 = degrees");
-    ESP_LOGI(TAG, "    ADT7420: raw * 0.0625 = Celsius");
+    ESP_LOGI(TAG, "    ADT7420: read directly via I2C");
 
     adxl355_raw_sample_t adxl_sample;
     scl3300_raw_sample_t scl_sample;
-    adt7420_raw_sample_t adt_sample;
 
     int accel_batch_count = 0;
     uint32_t first_tick = 0;
 
+    // Temperature reading timer
+    uint32_t last_temp_read_ms = 0;
+
     while (s_task_running) {
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+        // =====================================================================
+        // Read Temperature directly via I2C (every 1 second)
+        // =====================================================================
+        if ((now_ms - last_temp_read_ms) >= TEMP_READ_INTERVAL_MS) {
+            last_temp_read_ms = now_ms;
+
+            // Use existing adt7420 driver function to read temperature
+            float temp_celsius = 0.0f;
+            esp_err_t err = adt7420_read_temperature(&temp_celsius);
+
+            if (err == ESP_OK) {
+                s_latest_temp = temp_celsius;
+                s_has_temp_data = true;
+                ESP_LOGD(TAG, "Temperature: %.2f C", s_latest_temp);
+            } else {
+                ESP_LOGW(TAG, "Failed to read temperature: %s", esp_err_to_name(err));
+                // Keep old value, don't clear s_has_temp_data
+            }
+        }
 
         // =====================================================================
         // Read ALL available ADXL355 samples from ring buffer
@@ -182,16 +199,6 @@ static void data_processing_task(void *pvParameters)
                 s_latest_incl_y = convert_scl3300_to_deg(scl_sample.raw_y);
                 s_latest_incl_z = convert_scl3300_to_deg(scl_sample.raw_z);
                 s_has_incl_data = true;
-            }
-        }
-
-        // =====================================================================
-        // Read ALL available ADT7420 samples from ring buffer
-        // =====================================================================
-        while (adt7420_data_available()) {
-            if (adt7420_read_sample(&adt_sample)) {
-                s_latest_temp = convert_adt7420_to_celsius(adt_sample.raw_temp);
-                s_has_temp_data = true;
             }
         }
 
