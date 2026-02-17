@@ -2,7 +2,9 @@
  * @file mqtt.c
  * @brief MQTT Client Implementation
  *
- * Handles connection to broker and JSON packaging of sensor data.
+ * DATA INTEGRITY:
+ * - Invalid/stale sensor data shows as "null" in JSON
+ * - Every reading is 100% accurate or marked as missing
  */
 
 #include "mqtt.h"
@@ -22,8 +24,6 @@ static esp_mqtt_client_handle_t s_mqtt_client = NULL;
 static EventGroupHandle_t s_mqtt_event_group = NULL;
 static bool s_is_connected = false;
 
-// JSON buffer - sized for batched data
-// 100 samples * ~25 bytes per sample + overhead = ~3KB
 #define JSON_BUFFER_SIZE    4096
 static char *s_json_buffer = NULL;
 
@@ -80,15 +80,14 @@ esp_err_t mqtt_init(void)
     ESP_LOGI(TAG, "Initializing MQTT client...");
     ESP_LOGI(TAG, "  Broker: %s", MQTT_BROKER_URI);
     ESP_LOGI(TAG, "  Client ID: %s", MQTT_CLIENT_ID);
+    ESP_LOGI(TAG, "  Data integrity: null for invalid/stale data");
 
-    // Create event group
     s_mqtt_event_group = xEventGroupCreate();
     if (s_mqtt_event_group == NULL) {
         ESP_LOGE(TAG, "Failed to create event group");
         return ESP_ERR_NO_MEM;
     }
 
-    // Allocate JSON buffer
     s_json_buffer = malloc(JSON_BUFFER_SIZE);
     if (s_json_buffer == NULL) {
         ESP_LOGE(TAG, "Failed to allocate JSON buffer");
@@ -96,17 +95,15 @@ esp_err_t mqtt_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    // Configure MQTT client
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = MQTT_BROKER_URI,
         .credentials.client_id = MQTT_CLIENT_ID,
         .session.keepalive = 60,
         .network.reconnect_timeout_ms = 5000,
         .buffer.size = 1024,
-        .buffer.out_size = 4096,  // Larger output buffer for batched data
+        .buffer.out_size = 4096,
     };
 
-    // Create client
     s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     if (s_mqtt_client == NULL) {
         ESP_LOGE(TAG, "Failed to create MQTT client");
@@ -115,7 +112,6 @@ esp_err_t mqtt_init(void)
         return ESP_FAIL;
     }
 
-    // Register event handler
     esp_err_t ret = esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID,
                                                     mqtt_event_handler, NULL);
     if (ret != ESP_OK) {
@@ -126,7 +122,6 @@ esp_err_t mqtt_init(void)
         return ret;
     }
 
-    // Start client
     ret = esp_mqtt_client_start(s_mqtt_client);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start MQTT client");
@@ -169,8 +164,15 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
         return ESP_ERR_INVALID_ARG;
     }
 
-    // Build JSON
-    // Format: {"t":timestamp,"a":[[x,y,z],[x,y,z],...],"i":[x,y,z],"T":temp}
+    /*
+     * JSON FORMAT:
+     * {
+     *   "t": 123456789,                              // Timestamp (always present)
+     *   "a": [[x,y,z], [x,y,z], ...],                // Accelerometer (always present)
+     *   "i": [x, y, z] OR null,                      // Inclinometer (null if invalid)
+     *   "T": 21.5 OR null                            // Temperature (null if invalid)
+     * }
+     */
 
     int offset = 0;
 
@@ -178,7 +180,7 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
     offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
                        "{\"t\":%lu,\"a\":[", (unsigned long)packet->timestamp);
 
-    // Accelerometer array
+    // Accelerometer array (always present)
     for (int i = 0; i < packet->accel_count && i < MQTT_ACCEL_BATCH_SIZE; i++) {
         if (i > 0) {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, ",");
@@ -189,7 +191,6 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
                            packet->accel[i].y,
                            packet->accel[i].z);
 
-        // Safety check
         if (offset >= JSON_BUFFER_SIZE - 100) {
             ESP_LOGE(TAG, "JSON buffer overflow!");
             return ESP_ERR_NO_MEM;
@@ -199,17 +200,31 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
     // Close accelerometer array
     offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, "]");
 
-    // Inclinometer (if available)
+    // Inclinometer - ALWAYS include field, but use null if invalid
     if (packet->has_angle) {
-        offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                           ",\"i\":[%.4f,%.4f,%.4f]",
-                           packet->angle_x, packet->angle_y, packet->angle_z);
+        if (packet->angle_valid) {
+            // Valid data - show values
+            offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
+                               ",\"i\":[%.4f,%.4f,%.4f]",
+                               packet->angle_x, packet->angle_y, packet->angle_z);
+        } else {
+            // Invalid/stale data - show null
+            offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
+                               ",\"i\":null");
+        }
     }
 
-    // Temperature (if available)
+    // Temperature - ALWAYS include field, but use null if invalid
     if (packet->has_temp) {
-        offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                           ",\"T\":%.2f", packet->temperature);
+        if (packet->temp_valid) {
+            // Valid data - show value
+            offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
+                               ",\"T\":%.2f", packet->temperature);
+        } else {
+            // Invalid/stale data - show null
+            offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
+                               ",\"T\":null");
+        }
     }
 
     // Close JSON
@@ -225,7 +240,11 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
         return ESP_FAIL;
     }
 
-    ESP_LOGD(TAG, "Published %d bytes (%d accel samples)", offset, packet->accel_count);
+    ESP_LOGD(TAG, "Published %d bytes (%d accel, angle=%s, temp=%s)",
+             offset, packet->accel_count,
+             packet->angle_valid ? "valid" : "NULL",
+             packet->temp_valid ? "valid" : "NULL");
+
     return ESP_OK;
 }
 

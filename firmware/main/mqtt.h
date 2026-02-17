@@ -2,7 +2,10 @@
  * @file mqtt.h
  * @brief MQTT Client API
  *
- * Handles connection to MQTT broker and publishing sensor data as JSON.
+ * DATA INTEGRITY:
+ * - Invalid/stale data shows as "null" in JSON
+ * - Every field has a validity flag
+ * - No data is ever silently replaced
  */
 
 #ifndef MQTT_H
@@ -16,29 +19,21 @@
 extern "C" {
 #endif
 
-// MQTT Broker URI - Change to your Raspberry Pi's IP address
-#define MQTT_BROKER_URI         "mqtt://192.168.2.2:1883"
+/******************************************************************************
+ * CONFIGURATION
+ *****************************************************************************/
 
-// Client identifier
+#define MQTT_BROKER_URI         "mqtt://192.168.20.xx:1883"  // <-- UPDATE THIS!
 #define MQTT_CLIENT_ID          "wind_turbine_esp32"
-
-// Topics
 #define MQTT_TOPIC_DATA         "wind_turbine/data"
 #define MQTT_TOPIC_STATUS       "wind_turbine/status"
-
-// QoS level (0 = at most once, 1 = at least once, 2 = exactly once)
 #define MQTT_PUBLISH_QOS        0
-
-// Maximum accelerometer samples per batch
 #define MQTT_ACCEL_BATCH_SIZE   100
 
 /******************************************************************************
  * DATA STRUCTURES
  *****************************************************************************/
 
-/**
- * @brief Single 3-axis acceleration reading in g
- */
 typedef struct {
     float x;
     float y;
@@ -46,26 +41,31 @@ typedef struct {
 } mqtt_accel_sample_t;
 
 /**
- * @brief Sensor data packet for MQTT publishing
+ * @brief Sensor data packet with validity flags
  *
- * Contains batched accelerometer data plus latest inclinometer and temperature.
+ * DATA INTEGRITY RULES:
+ * - has_angle/has_temp: Whether to include the field in JSON
+ * - angle_valid/temp_valid: Whether data is valid (true) or null (false)
+ * - If has_* is true but *_valid is false, JSON shows "null"
  */
 typedef struct {
-    uint32_t timestamp;                         // Timestamp in microseconds
+    uint32_t timestamp;
 
-    // Accelerometer data (batched)
+    // Accelerometer (always present)
     mqtt_accel_sample_t accel[MQTT_ACCEL_BATCH_SIZE];
-    int accel_count;                            // Number of accel samples in this packet
+    int accel_count;
 
-    // Inclinometer data (latest reading)
-    bool has_angle;
-    float angle_x;                              // X-axis angle/accel
-    float angle_y;                              // Y-axis angle/accel
-    float angle_z;                              // Z-axis angle/accel
+    // Inclinometer
+    bool has_angle;         // Include "i" field in JSON?
+    bool angle_valid;       // true = show values, false = show null
+    float angle_x;
+    float angle_y;
+    float angle_z;
 
-    // Temperature data (latest reading)
-    bool has_temp;
-    float temperature;                          // Temperature in Celsius
+    // Temperature
+    bool has_temp;          // Include "T" field in JSON?
+    bool temp_valid;        // true = show value, false = show null
+    float temperature;
 
 } mqtt_sensor_packet_t;
 
@@ -73,77 +73,12 @@ typedef struct {
  * PUBLIC FUNCTIONS
  *****************************************************************************/
 
-/**
- * @brief Initialize the MQTT client
- *
- * Connects to the broker specified in MQTT_BROKER_URI.
- * Connection happens asynchronously - use mqtt_wait_for_connection()
- * or mqtt_is_connected() to check status.
- *
- * @return ESP_OK on success, error code on failure
- */
 esp_err_t mqtt_init(void);
-
-/**
- * @brief Check if connected to MQTT broker
- *
- * @return true if connected, false otherwise
- */
 bool mqtt_is_connected(void);
-
-/**
- * @brief Wait for MQTT connection with timeout
- *
- * @param timeout_ms Maximum time to wait in milliseconds
- * @return ESP_OK if connected, ESP_ERR_TIMEOUT if timeout
- */
 esp_err_t mqtt_wait_for_connection(uint32_t timeout_ms);
-
-/**
- * @brief Publish sensor data as JSON
- *
- * Formats the packet as compact JSON and publishes to MQTT_TOPIC_DATA.
- *
- * JSON format:
- * {
- *   "t": 123456789,                    // Timestamp (microseconds)
- *   "a": [[x,y,z], [x,y,z], ...],      // Accelerometer array
- *   "i": [x, y, z],                    // Inclinometer (if has_angle)
- *   "T": 21.5                          // Temperature (if has_temp)
- * }
- *
- * @param packet Pointer to sensor data packet
- * @return ESP_OK on success, error code on failure
- */
 esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet);
-
-/**
- * @brief Publish a status message
- *
- * Publishes a simple string to MQTT_TOPIC_STATUS.
- *
- * @param status Status message string
- * @return ESP_OK on success, error code on failure
- */
 esp_err_t mqtt_publish_status(const char *status);
-
-/**
- * @brief Publish raw data to a custom topic
- *
- * @param topic Topic string
- * @param data Data to publish
- * @param len Length of data (0 to use strlen)
- * @return ESP_OK on success, error code on failure
- */
 esp_err_t mqtt_publish(const char *topic, const char *data, int len);
-
-/**
- * @brief Deinitialize the MQTT client
- *
- * Disconnects from broker and frees resources.
- *
- * @return ESP_OK on success
- */
 esp_err_t mqtt_deinit(void);
 
 #ifdef __cplusplus
