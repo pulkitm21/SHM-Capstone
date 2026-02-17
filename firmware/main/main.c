@@ -7,6 +7,11 @@
  *  - ISR-based sensor acquisition (from isr-daq branch)
  *  - Statistics monitor
  *
+ * Error Handling:
+ *  - Critical failures trigger automatic reboot after delay
+ *  - Maximum reboot attempts tracked in RTC memory
+ *  - Prevents infinite reboot loops
+ *
  * Data Flow:
  *  ISR (8000 Hz) → Ring Buffers → Data Processing Task → MQTT → Raspberry Pi
  */
@@ -44,10 +49,20 @@ static const char *TAG = "main";
 #define ETH_IP_TIMEOUT_MS       30000
 #define MQTT_CONNECT_TIMEOUT_MS 30000
 
+// Reboot configuration
+#define REBOOT_DELAY_MS         5000    // Wait 5 seconds before reboot
+#define MAX_REBOOT_ATTEMPTS     5       // Max reboots before halting permanently
+
 // Stats
 #define STATS_TASK_PRIORITY     1
 #define STATS_TASK_STACK_SIZE   4096
 #define STATS_INTERVAL_MS       10000
+
+// RTC memory survives reboots (not power cycles)
+RTC_NOINIT_ATTR static uint32_t s_reboot_count;
+RTC_NOINIT_ATTR static uint32_t s_reboot_magic;
+
+#define REBOOT_MAGIC_VALUE      0xDEADBEEF
 
 /* -------------------------------------------------------------------------- */
 /* Utility Functions                                                          */
@@ -68,11 +83,63 @@ static void force_spi_cs_high_early(void)
     vTaskDelay(pdMS_TO_TICKS(2));
 }
 
-static void halt_forever(void)
+/**
+ * @brief Initialize reboot counter from RTC memory
+ */
+static void init_reboot_counter(void)
 {
-    ESP_LOGE(TAG, "*** HALT: Critical initialization failed ***");
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    // Check if RTC memory is valid (survives soft reboot, not power cycle)
+    if (s_reboot_magic != REBOOT_MAGIC_VALUE) {
+        // First boot after power cycle - reset counter
+        s_reboot_count = 0;
+        s_reboot_magic = REBOOT_MAGIC_VALUE;
+        ESP_LOGI(TAG, "Fresh boot detected - reboot counter reset");
+    } else {
+        ESP_LOGW(TAG, "Reboot detected - attempt %lu of %d",
+                 (unsigned long)(s_reboot_count + 1), MAX_REBOOT_ATTEMPTS);
+    }
+}
+
+/**
+ * @brief Clear reboot counter (call after successful initialization)
+ */
+static void clear_reboot_counter(void)
+{
+    s_reboot_count = 0;
+    ESP_LOGI(TAG, "Initialization successful - reboot counter cleared");
+}
+
+/**
+ * @brief Handle critical failure - reboot or halt
+ *
+ * @param reason Description of what failed
+ */
+static void handle_critical_failure(const char *reason)
+{
+    ESP_LOGE(TAG, "*** CRITICAL FAILURE: %s ***", reason);
+
+    s_reboot_count++;
+
+    if (s_reboot_count >= MAX_REBOOT_ATTEMPTS) {
+        // Too many reboots - halt permanently
+        ESP_LOGE(TAG, "*** MAX REBOOT ATTEMPTS (%d) REACHED ***", MAX_REBOOT_ATTEMPTS);
+        ESP_LOGE(TAG, "*** SYSTEM HALTED - POWER CYCLE REQUIRED ***");
+        ESP_LOGE(TAG, "*** Check hardware connections and wiring ***");
+
+        while (1) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    } else {
+        // Attempt reboot
+        ESP_LOGW(TAG, "Rebooting in %d seconds... (attempt %lu of %d)",
+                 REBOOT_DELAY_MS / 1000,
+                 (unsigned long)s_reboot_count,
+                 MAX_REBOOT_ATTEMPTS);
+
+        vTaskDelay(pdMS_TO_TICKS(REBOOT_DELAY_MS));
+
+        ESP_LOGW(TAG, "Rebooting now...");
+        esp_restart();
     }
 }
 
@@ -342,6 +409,9 @@ void app_main(void)
 {
     bool temp_sensor_available = false;
 
+    // Initialize reboot counter (check if this is a retry)
+    init_reboot_counter();
+
     print_banner();
 
     // =========================================
@@ -349,7 +419,7 @@ void app_main(void)
     // =========================================
     if (init_network() != ESP_OK) {
         ESP_LOGE(TAG, "Network init failed - continuing anyway");
-        // Don't halt - network might come up later
+        // Don't reboot - network might come up later
     }
     ESP_LOGI(TAG, "");
 
@@ -358,7 +428,7 @@ void app_main(void)
     // =========================================
     if (init_mqtt() != ESP_OK) {
         ESP_LOGE(TAG, "MQTT init failed - continuing anyway");
-        // Don't halt - MQTT will reconnect
+        // Don't reboot - MQTT will reconnect
     }
     ESP_LOGI(TAG, "");
 
@@ -366,7 +436,7 @@ void app_main(void)
     // 3. Initialize Communication Buses
     // =========================================
     if (init_buses() != ESP_OK) {
-        halt_forever();
+        handle_critical_failure("Bus initialization failed (I2C or SPI)");
     }
     ESP_LOGI(TAG, "");
 
@@ -374,7 +444,7 @@ void app_main(void)
     // 4. Initialize Sensors
     // =========================================
     if (init_sensors(&temp_sensor_available) != ESP_OK) {
-        halt_forever();
+        handle_critical_failure("Critical sensor initialization failed (ADXL355 or SCL3300)");
     }
     ESP_LOGI(TAG, "");
 
@@ -382,7 +452,7 @@ void app_main(void)
     // 5. Initialize ISR Acquisition
     // =========================================
     if (init_acquisition(temp_sensor_available) != ESP_OK) {
-        halt_forever();
+        handle_critical_failure("ISR acquisition initialization failed");
     }
     ESP_LOGI(TAG, "");
 
@@ -390,9 +460,14 @@ void app_main(void)
     // 6. Initialize Data Processing + MQTT Task
     // =========================================
     if (init_data_processing() != ESP_OK) {
-        halt_forever();
+        handle_critical_failure("Data processing task initialization failed");
     }
     ESP_LOGI(TAG, "");
+
+    // =========================================
+    // Initialization Complete - Clear Reboot Counter
+    // =========================================
+    clear_reboot_counter();
 
     // =========================================
     // 7. Create Statistics Monitor Task

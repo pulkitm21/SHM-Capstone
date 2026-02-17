@@ -2,19 +2,14 @@
  * @file data_processing_and_mqtt_task.c
  * @brief MQTT Publishing Task - Reads from sensor_task ring buffers
  *
- * Reads raw samples from ring buffers, converts to engineering units,
- * packages as JSON, and publishes via MQTT.
- *
  * DATA INTEGRITY:
- * - Each sensor reading is validated
- * - Stale/missed data shows as "null" in JSON
- * - No data is ever "carried over" from previous readings
- * - Every packet reflects the TRUE state of sensors at that moment
+ * - If no data received this cycle → shows "null" in JSON
+ * - Fault logging enabled for debugging
  */
 
 #include "data_processing_and_mqtt_task.h"
-#include "sensor_task.h"  // Ring buffer access functions
-#include "adt7420.h"      // For direct temperature reading
+#include "sensor_task.h"
+#include "adt7420.h"
 #include "mqtt.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -33,11 +28,8 @@ static volatile uint32_t s_samples_published = 0;
 static volatile uint32_t s_packets_sent = 0;
 static volatile uint32_t s_samples_dropped = 0;
 
-// Error tracking statistics
-static volatile uint32_t s_incl_read_errors = 0;
+// Error counters
 static volatile uint32_t s_temp_read_errors = 0;
-static volatile uint32_t s_incl_stale_count = 0;
-static volatile uint32_t s_temp_stale_count = 0;
 
 // Buffers for batching accelerometer data
 static float s_accel_x[ACCEL_SAMPLES_PER_BATCH];
@@ -46,11 +38,7 @@ static float s_accel_z[ACCEL_SAMPLES_PER_BATCH];
 static uint32_t s_accel_ticks[ACCEL_SAMPLES_PER_BATCH];
 
 // Temperature reading interval
-#define TEMP_READ_INTERVAL_MS   1000    // Read temperature every 1 second
-
-// Staleness thresholds - data older than this is considered invalid
-#define INCL_STALE_THRESHOLD_MS     200     // Inclinometer: 20 Hz = 50ms, allow 4x margin
-#define TEMP_STALE_THRESHOLD_MS     2000    // Temperature: 1 Hz = 1000ms, allow 2x margin
+#define TEMP_READ_INTERVAL_MS   1000
 
 /******************************************************************************
  * UNIT CONVERSION FUNCTIONS
@@ -76,9 +64,6 @@ static void data_processing_task(void *pvParameters)
     ESP_LOGI(TAG, "  Batch size: %d accel samples", ACCEL_SAMPLES_PER_BATCH);
     ESP_LOGI(TAG, "  Processing interval: %d ms", PROCESSING_INTERVAL_MS);
     ESP_LOGI(TAG, "  Temperature read interval: %d ms", TEMP_READ_INTERVAL_MS);
-    ESP_LOGI(TAG, "  Data integrity: ENABLED (null for missing/stale data)");
-    ESP_LOGI(TAG, "  Staleness thresholds: Incl=%dms, Temp=%dms",
-             INCL_STALE_THRESHOLD_MS, TEMP_STALE_THRESHOLD_MS);
 
     adxl355_raw_sample_t adxl_sample;
     scl3300_raw_sample_t scl_sample;
@@ -90,14 +75,12 @@ static void data_processing_task(void *pvParameters)
     uint32_t last_temp_read_ms = 0;
     float current_temp = 0.0f;
     bool temp_valid = false;
-    uint32_t temp_read_time_ms = 0;
 
     // Inclinometer state
     float current_incl_x = 0.0f;
     float current_incl_y = 0.0f;
     float current_incl_z = 0.0f;
     bool incl_valid = false;
-    uint32_t incl_read_time_ms = 0;
 
     while (s_task_running) {
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
@@ -114,8 +97,6 @@ static void data_processing_task(void *pvParameters)
             if (err == ESP_OK) {
                 current_temp = temp_celsius;
                 temp_valid = true;
-                temp_read_time_ms = now_ms;
-                ESP_LOGD(TAG, "Temperature: %.2f C", current_temp);
             } else {
                 temp_valid = false;
                 s_temp_read_errors++;
@@ -126,9 +107,8 @@ static void data_processing_task(void *pvParameters)
 
         // =====================================================================
         // Read ALL available SCL3300 samples from ring buffer
-        // Reset validity for each batch - must have fresh data
         // =====================================================================
-        incl_valid = false;  // Assume no valid data until we read some
+        incl_valid = false;  // Reset each cycle - must have fresh data
 
         while (scl3300_data_available()) {
             if (scl3300_read_sample(&scl_sample)) {
@@ -136,26 +116,11 @@ static void data_processing_task(void *pvParameters)
                 current_incl_y = convert_scl3300_to_deg(scl_sample.raw_y);
                 current_incl_z = convert_scl3300_to_deg(scl_sample.raw_z);
                 incl_valid = true;
-                incl_read_time_ms = now_ms;
             }
         }
 
-        // Check for stale inclinometer data
-        if (incl_valid && (now_ms - incl_read_time_ms) > INCL_STALE_THRESHOLD_MS) {
-            incl_valid = false;
-            s_incl_stale_count++;
-            ESP_LOGW(TAG, "Inclinometer data STALE (age=%lu ms, stale #%lu)",
-                     (unsigned long)(now_ms - incl_read_time_ms),
-                     (unsigned long)s_incl_stale_count);
-        }
-
-        // Check for stale temperature data
-        bool temp_fresh = temp_valid && ((now_ms - temp_read_time_ms) <= TEMP_STALE_THRESHOLD_MS);
-        if (temp_valid && !temp_fresh) {
-            s_temp_stale_count++;
-            ESP_LOGW(TAG, "Temperature data STALE (age=%lu ms, stale #%lu)",
-                     (unsigned long)(now_ms - temp_read_time_ms),
-                     (unsigned long)s_temp_stale_count);
+        if (!incl_valid) {
+            ESP_LOGW(TAG, "No inclinometer data available this cycle");
         }
 
         // =====================================================================
@@ -188,26 +153,20 @@ static void data_processing_task(void *pvParameters)
                             packet.accel[i].z = s_accel_z[i];
                         }
 
-                        // Inclinometer - only include if FRESH and VALID
+                        // Inclinometer
+                        packet.has_angle = true;
+                        packet.angle_valid = incl_valid;
                         if (incl_valid) {
-                            packet.has_angle = true;
-                            packet.angle_valid = true;
                             packet.angle_x = current_incl_x;
                             packet.angle_y = current_incl_y;
                             packet.angle_z = current_incl_z;
-                        } else {
-                            packet.has_angle = true;      // Include the field
-                            packet.angle_valid = false;   // But mark as invalid (null)
                         }
 
-                        // Temperature - only include if FRESH and VALID
-                        if (temp_fresh) {
-                            packet.has_temp = true;
-                            packet.temp_valid = true;
+                        // Temperature
+                        packet.has_temp = true;
+                        packet.temp_valid = temp_valid;
+                        if (temp_valid) {
                             packet.temperature = current_temp;
-                        } else {
-                            packet.has_temp = true;       // Include the field
-                            packet.temp_valid = false;    // But mark as invalid (null)
                         }
 
                         // Publish
@@ -216,9 +175,11 @@ static void data_processing_task(void *pvParameters)
                             s_packets_sent++;
                         } else {
                             s_samples_dropped += accel_batch_count;
+                            ESP_LOGW(TAG, "MQTT publish failed, dropped %d samples", accel_batch_count);
                         }
                     } else {
                         s_samples_dropped += accel_batch_count;
+                        ESP_LOGW(TAG, "MQTT disconnected, dropped %d samples", accel_batch_count);
                     }
 
                     accel_batch_count = 0;
@@ -244,10 +205,7 @@ esp_err_t data_processing_and_mqtt_task_init(void)
     s_samples_published = 0;
     s_packets_sent = 0;
     s_samples_dropped = 0;
-    s_incl_read_errors = 0;
     s_temp_read_errors = 0;
-    s_incl_stale_count = 0;
-    s_temp_stale_count = 0;
 
     s_task_running = true;
 
@@ -289,15 +247,4 @@ void data_processing_and_mqtt_task_get_stats(uint32_t *samples_published,
     if (samples_published) *samples_published = s_samples_published;
     if (packets_sent) *packets_sent = s_packets_sent;
     if (samples_dropped) *samples_dropped = s_samples_dropped;
-}
-
-void data_processing_and_mqtt_task_get_error_stats(uint32_t *incl_errors,
-                                                    uint32_t *temp_errors,
-                                                    uint32_t *incl_stale,
-                                                    uint32_t *temp_stale)
-{
-    if (incl_errors) *incl_errors = s_incl_read_errors;
-    if (temp_errors) *temp_errors = s_temp_read_errors;
-    if (incl_stale) *incl_stale = s_incl_stale_count;
-    if (temp_stale) *temp_stale = s_temp_stale_count;
-}
+}s
