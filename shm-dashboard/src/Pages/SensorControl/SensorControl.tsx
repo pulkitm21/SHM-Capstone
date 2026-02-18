@@ -1,3 +1,4 @@
+// src/pages/SensorControl/SensorControl.tsx
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
@@ -13,16 +14,26 @@ import type { SensorPoint } from "../../components/SensorPlot/SensorPlot";
 
 import "./SensorControl.css";
 
+const API_BASE = import.meta.env.VITE_API_BASE_URL;
+
+type ApiResponse = {
+  sensor: string;
+  unit: string;
+  points: SensorPoint[];
+};
+
 const SENSOR_OPTIONS = [
   { label: "Accelerometer", value: "accelerometer" },
   { label: "Inclinometer", value: "inclinometer" },
   { label: "Temperature", value: "temperature" },
 ] as const;
 
+
 const TIMEFRAME_OPTIONS = [
+  { label: "1 hour", minutes: 60 },
+  { label: "6 hours", minutes: 360 },
+  { label: "12 hours", minutes: 720 },
   { label: "1 day", minutes: 1440 },
-  { label: "7 days", minutes: 10080 },
-  { label: "30 days", minutes: 43200 },
 ] as const;
 
 const CHANNELS_BY_SENSOR: Record<string, { label: string; value: string }[]> = {
@@ -70,38 +81,19 @@ const SENSOR_META: Record<SensorValue, SensorMeta & { unit: string; plotKey: str
   },
 };
 
-function isoMinutesAgo(minAgo: number) {
-  const d = new Date(Date.now() - minAgo * 60_000);
-  return d.toISOString();
-}
+const ENDPOINT_BY_SENSOR: Record<SensorValue, string> = {
+  accelerometer: "/api/accel",
+  inclinometer: "/api/inclinometer",
+  temperature: "/api/temperature",
+};
 
-function generateDummySeries(sensor: SensorValue, channel: string, minutes: number): SensorPoint[] {
-  const stepMin = minutes <= 1440 ? 5 : minutes <= 10080 ? 30 : 60;
-  const n = Math.floor(minutes / stepMin);
-
-  const base =
-    sensor === "temperature" ? 22 :
-    sensor === "inclinometer" ? 2 :
-    0.2;
-
-  const channelOffset =
-    channel === "x" ? 0.02 :
-    channel === "y" ? -0.01 :
-    channel === "z" ? 0.01 :
-    channel === "pitch" ? 0.15 :
-    channel === "roll" ? -0.12 :
-    0;
-
-  const pts: SensorPoint[] = [];
-  for (let i = 0; i <= n; i++) {
-    const minAgo = minutes - i * stepMin;
-    const trend = (i / Math.max(1, n)) * (sensor === "temperature" ? 1.5 : 0.2);
-    const wave = Math.sin(i / 6) * (sensor === "inclinometer" ? 0.4 : 0.08);
-    const noise = (Math.random() - 0.5) * (sensor === "temperature" ? 0.6 : 0.12);
-
-    pts.push({ ts: isoMinutesAgo(minAgo), value: base + channelOffset + trend + wave + noise });
-  }
-  return pts;
+function buildQuery(params: Record<string, string | number | undefined>) {
+  const qs = new URLSearchParams();
+  Object.entries(params).forEach(([k, v]) => {
+    if (v === undefined) return;
+    qs.set(k, String(v));
+  });
+  return qs.toString();
 }
 
 export default function SensorControl() {
@@ -111,9 +103,14 @@ export default function SensorControl() {
   const isOnline = true;
 
   const [sensor, setSensor] = useState<SensorValue>("accelerometer");
-  const [timeframeMin, setTimeframeMin] = useState<number>(1440);
 
-  const channelOptions = useMemo(() => CHANNELS_BY_SENSOR[sensor] ?? [{ label: "All", value: "all" }], [sensor]);
+  // default timeframe = 1 hour
+  const [timeframeMin, setTimeframeMin] = useState<number>(60);
+
+  const channelOptions = useMemo(
+    () => CHANNELS_BY_SENSOR[sensor] ?? [{ label: "All", value: "all" }],
+    [sensor]
+  );
   const [channel, setChannel] = useState<string>("all");
 
   // reset channel safely when sensor changes
@@ -123,9 +120,39 @@ export default function SensorControl() {
 
   const meta = SENSOR_META[sensor];
 
-  const [points, setPoints] = useState<SensorPoint[]>([]);
+  // API-backed plot data (refetch when sensor/channel/timeframe changes)
+  const [apiData, setApiData] = useState<ApiResponse | null>(null);
+  const [plotStatus, setPlotStatus] = useState("Loading…");
+
   useEffect(() => {
-    setPoints(generateDummySeries(sensor, channel, timeframeMin));
+    async function load() {
+      try {
+        setPlotStatus("Loading…");
+        setApiData(null);
+
+        const endpoint = ENDPOINT_BY_SENSOR[sensor];
+
+        const query = buildQuery({
+          minutes: timeframeMin,
+          channel,
+        });
+
+        const url = `${API_BASE}${endpoint}?${query}`;
+        const res = await fetch(url);
+
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = (await res.json()) as ApiResponse;
+
+        setApiData(json);
+        setPlotStatus("Loaded");
+      } catch (err: any) {
+        console.error(err);
+        setApiData(null);
+        setPlotStatus(`Error: ${err?.message ?? "Unknown error"}`);
+      }
+    }
+
+    load();
   }, [sensor, channel, timeframeMin]);
 
   return (
@@ -157,13 +184,17 @@ export default function SensorControl() {
       />
 
       <div className="sc-plot-card">
-        <SensorLineChart
-          title={SENSOR_OPTIONS.find((s) => s.value === sensor)?.label ?? "Sensor"}
-          sensorKey={meta.plotKey}
-          unit={meta.unit}
-          points={points}
-          height={420}
-        />
+        <p style={{ margin: 0 }}>{plotStatus}</p>
+
+        {apiData && (
+          <SensorLineChart
+            title={SENSOR_OPTIONS.find((s) => s.value === sensor)?.label ?? "Sensor"}
+            sensorKey={apiData.sensor}
+            unit={apiData.unit}
+            points={apiData.points}
+            height={420}
+          />
+        )}
       </div>
     </div>
   );
