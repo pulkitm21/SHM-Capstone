@@ -247,4 +247,4 @@ void data_processing_and_mqtt_task_get_stats(uint32_t *samples_published,
     if (samples_published) *samples_published = s_samples_published;
     if (packets_sent) *packets_sent = s_packets_sent;
     if (samples_dropped) *samples_dropped = s_samples_dropped;
-}s
+}
