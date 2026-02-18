@@ -32,7 +32,8 @@
 static const char *TAG = "SCL3300";
 
 // SPI device handle
-static spi_device_handle_t s_scl3300 = NULL;
+spi_device_handle_t scl3300_spi_handle = NULL;  // Exposed for ISR
+static spi_device_handle_t s_scl3300 = NULL; // Internal handle for non-ISR use
 
 // Acceleration scale factors for each mode (LSB/g)
 static const float ACCEL_SCALE_MODE1 = 6000.0f;
@@ -175,6 +176,8 @@ esp_err_t scl3300_init(void)
             ESP_LOGE(TAG, "spi_bus_add_device failed: %s", esp_err_to_name(ret));
             return ret;
         }
+
+        scl3300_spi_handle = s_scl3300;  // Expose handle for ISR access
     }
 
     // === Datasheet Table 11: Start-up Sequence ===

@@ -1,0 +1,51 @@
+# Build folder
+
+/build/
+ 
+# ESP-IDF configuration
+
+sdkconfig
+
+sdkconfig.old
+ 
+# CMake files
+
+CMakeFiles/
+
+CMakeCache.txt
+
+cmake_install.cmake
+
+compile_commands.json
+ 
+# Ninja build files
+
+build.ninja
+
+.ninja_log
+
+.ninja_deps
+ 
+# IDE files
+
+.vscode/
+
+.idea/
+
+*.swp
+
+*.swo
+
+*.DS_Store
+ 
+# Python virtual environments
+
+venv/
+
+.env/
+ 
+# Logs
+
+*.log
+
+ 

@@ -9,6 +9,8 @@ idf_component_register(
          adt7420.c
          adxl355.c
          scl3300.c
+         mqtt.c
+         data_processing_and_mqtt_task.c
          sensor_task.c
     INCLUDE_DIRS "."
     PRIV_INCLUDE_DIRS
@@ -19,8 +21,9 @@ idf_component_register(
     			   esp_timer 
     			   freertos
     			   esp_eth
-                  esp_netif
-                  esp_event
-                  ethernet_init
-                  nvs_flash
+                   esp_netif
+                   esp_event
+                   ethernet_init
+                   nvs_flash
+                   mqtt
 )
