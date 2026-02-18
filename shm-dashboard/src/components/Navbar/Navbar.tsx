@@ -12,7 +12,6 @@ const navItems: NavItem[] = [
   { id: "home", label: "Home", icon: "📈", to: "/" },
   { id: "sensor-control", label: "Sensor Control", icon: "📈", to: "/sensorcontrol" },
   { id: "export", label: "Export", icon: "📈", to: "/export" },
-  { id: "users", label: "User Management", icon: "📈", to: "/users" },
 ];
 
 const Navbar = () => {
