@@ -4,7 +4,7 @@ from collections import deque
 
 BROKER_IP = "localhost"
 PORT = 1883
-TOPIC = "shm/windturbine/+/accel"
+TOPIC = "wind_turbine/data"
 
 BUFFER_SIZE = 2000
 buffer = deque(maxlen=BUFFER_SIZE)
@@ -24,6 +24,7 @@ def on_message(client, userdata, msg):
 client = mqtt.Client()
 client.on_connect = on_connect
 client.on_message = on_message
+
 
 client.connect(BROKER_IP, PORT, keepalive=60)
 client.loop_forever()
