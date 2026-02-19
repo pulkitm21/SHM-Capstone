@@ -1,10 +1,10 @@
 // src/pages/SensorControl/SensorControl.tsx
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 import SystemStatus from "../../components/SystemStatus/SystemStatus";
 import SensorInfoCard, { type SensorMeta } from "../../components/SensorInfo/SensorInfo";
-import SensorConfigCard from "../../components/SensorConfig/SensorConfig";
+import SensorConfigCard, { type SensorConfig } from "../../components/SensorConfig/SensorConfig";
 import FaultLog from "../../components/FaultLog/Log";
 
 import SensorFilters, { type SensorValue } from "../../components/SensorFilter/SensorFilter";
@@ -28,7 +28,6 @@ const SENSOR_OPTIONS = [
   { label: "Temperature", value: "temperature" },
 ] as const;
 
-
 const TIMEFRAME_OPTIONS = [
   { label: "1 hour", minutes: 60 },
   { label: "6 hours", minutes: 360 },
@@ -51,7 +50,14 @@ const CHANNELS_BY_SENSOR: Record<string, { label: string; value: string }[]> = {
   temperature: [{ label: "All", value: "all" }],
 };
 
-const SENSOR_META: Record<SensorValue, SensorMeta & { unit: string; plotKey: string }> = {
+const ENDPOINT_BY_SENSOR: Record<SensorValue, string> = {
+  accelerometer: "/api/accel",
+  inclinometer: "/api/inclinometer",
+  temperature: "/api/temperature",
+};
+
+// ---- Default meta (fallback if nothing in localStorage) ----
+const DEFAULT_META: Record<SensorValue, SensorMeta & { unit: string; plotKey: string }> = {
   accelerometer: {
     model: "ADXL355",
     serial: "SN00023",
@@ -81,11 +87,44 @@ const SENSOR_META: Record<SensorValue, SensorMeta & { unit: string; plotKey: str
   },
 };
 
-const ENDPOINT_BY_SENSOR: Record<SensorValue, string> = {
-  accelerometer: "/api/accel",
-  inclinometer: "/api/inclinometer",
-  temperature: "/api/temperature",
+// ---- Default config (fallback if nothing in localStorage) ----
+const DEFAULT_CONFIG: Record<SensorValue, SensorConfig> = {
+  accelerometer: {
+    samplingRate: "400",
+    measurementRange: "2g",
+    lowPassFilter: "100",
+    highPassFilter: "none",
+  },
+  inclinometer: {
+    samplingRate: "200",
+    measurementRange: "2g",
+    lowPassFilter: "50",
+    highPassFilter: "none",
+  },
+  temperature: {
+    samplingRate: "100",
+    measurementRange: "2g",
+    lowPassFilter: "none",
+    highPassFilter: "none",
+  },
 };
+
+// localStorage helpers
+function lsKey(kind: "meta" | "config", sensor: SensorValue) {
+  return `shm:${kind}:${sensor}`;
+}
+function loadFromLS<T>(key: string): T | null {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+function saveToLS<T>(key: string, value: T) {
+  localStorage.setItem(key, JSON.stringify(value));
+}
 
 function buildQuery(params: Record<string, string | number | undefined>) {
   const qs = new URLSearchParams();
@@ -107,10 +146,6 @@ export default function SensorControl() {
   // default timeframe = 1 hour
   const [timeframeMin, setTimeframeMin] = useState<number>(60);
 
-  const channelOptions = useMemo(
-    () => CHANNELS_BY_SENSOR[sensor] ?? [{ label: "All", value: "all" }],
-    [sensor]
-  );
   const [channel, setChannel] = useState<string>("all");
 
   // reset channel safely when sensor changes
@@ -118,7 +153,44 @@ export default function SensorControl() {
     setChannel("all");
   }, [sensor]);
 
-  const meta = SENSOR_META[sensor];
+  // persisted meta per sensor
+  const [metaBySensor, setMetaBySensor] = useState(() => {
+    const init: typeof DEFAULT_META = { ...DEFAULT_META };
+    (Object.keys(DEFAULT_META) as SensorValue[]).forEach((s) => {
+      const saved = loadFromLS<typeof DEFAULT_META[SensorValue]>(lsKey("meta", s));
+      if (saved) init[s] = { ...init[s], ...saved };
+    });
+    return init;
+  });
+
+  // persisted config per sensor
+  const [configBySensor, setConfigBySensor] = useState(() => {
+    const init: typeof DEFAULT_CONFIG = { ...DEFAULT_CONFIG };
+    (Object.keys(DEFAULT_CONFIG) as SensorValue[]).forEach((s) => {
+      const saved = loadFromLS<SensorConfig>(lsKey("config", s));
+      if (saved) init[s] = { ...init[s], ...saved };
+    });
+    return init;
+  });
+
+  const meta = metaBySensor[sensor];
+  const config = configBySensor[sensor];
+
+  function handleSaveMeta(updated: SensorMeta) {
+    setMetaBySensor((prev) => {
+      const next = { ...prev, [sensor]: { ...prev[sensor], ...updated } };
+      saveToLS(lsKey("meta", sensor), next[sensor]);
+      return next;
+    });
+  }
+
+  function handleSaveConfig(updated: SensorConfig) {
+    setConfigBySensor((prev) => {
+      const next = { ...prev, [sensor]: { ...prev[sensor], ...updated } };
+      saveToLS(lsKey("config", sensor), next[sensor]);
+      return next;
+    });
+  }
 
   // API-backed plot data (refetch when sensor/channel/timeframe changes)
   const [apiData, setApiData] = useState<ApiResponse | null>(null);
@@ -131,11 +203,7 @@ export default function SensorControl() {
         setApiData(null);
 
         const endpoint = ENDPOINT_BY_SENSOR[sensor];
-
-        const query = buildQuery({
-          minutes: timeframeMin,
-          channel,
-        });
+        const query = buildQuery({ minutes: timeframeMin, channel });
 
         const url = `${API_BASE}${endpoint}?${query}`;
         const res = await fetch(url);
@@ -160,8 +228,8 @@ export default function SensorControl() {
       <SystemStatus isOnline={isOnline} />
 
       <div className="sc-top-cards">
-        <SensorInfoCard meta={meta} />
-        <SensorConfigCard />
+        <SensorInfoCard meta={meta} onSave={handleSaveMeta} />
+        <SensorConfigCard config={config} onSave={handleSaveConfig} />
         <div className="sc-card">
           <div className="sc-card-title">Fault Log</div>
           <div className="sc-card-body">

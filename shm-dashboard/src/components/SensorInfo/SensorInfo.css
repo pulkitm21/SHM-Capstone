@@ -25,3 +25,76 @@
   gap: 14px;
   padding: 6px 0;
 }
+
+/* Title row layout (title + buttons) */
+.sc-card-title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.sc-btn-row {
+  display: flex;
+  gap: 8px;
+}
+
+/* Small light-grey buttons */
+.sc-btn {
+  padding: 5px 9px;
+  border-radius: 10px;
+  border: 1px solid #d5d5d5;
+  background: #f2f2f2;
+  color: #444;
+  font-weight: 700;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.sc-btn:hover {
+  background: #e9e9e9;
+}
+
+.sc-btn-ghost {
+  background: #f2f2f2;
+  border-color: #d5d5d5;
+  color: #444;
+}
+
+/* Cancel = red */
+.sc-btn-danger {
+  background: #ffe6e6;
+  border-color: #ffb3b3;
+  color: #b10000;
+}
+
+.sc-btn-danger:hover {
+  background: #ffd6d6;
+}
+
+/* Save = green */
+.sc-btn-success {
+  background: #e8fff0;
+  border-color: #a8f0c2;
+  color: #0b7a31;
+}
+
+.sc-btn-success:hover {
+  background: #d9ffe7;
+}
+
+/* Editable input styling (light background like config) */
+.sc-input {
+  width: 100%;
+  max-width: 220px;
+  padding: 7px 9px;
+  border-radius: 10px;
+  border: 1px solid #d0d0d0;
+  background: #f3f3f3;
+  outline: none;
+}
+
+.sc-input:focus {
+  border-color: #4a86ff;
+  box-shadow: 0 0 0 3px rgba(74, 134, 255, 0.18);
+}
