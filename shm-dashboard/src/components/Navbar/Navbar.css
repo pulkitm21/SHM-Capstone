@@ -1,5 +1,5 @@
 .navbar {
-  width: 275px;
+  width: 250px;
   height: 100vh; /* full height of viewport */
   position: fixed;
   left: 0;
@@ -30,7 +30,7 @@
 .navbar-item {
   display: flex;
   align-items: center;
-  padding: 20px 20px;
+  padding: 15px 15px;
   cursor: pointer;
   transition: all 0.3s ease;
   color: #ffffff;

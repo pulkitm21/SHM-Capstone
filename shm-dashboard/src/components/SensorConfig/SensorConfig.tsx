@@ -1,51 +1,167 @@
+import { useEffect, useState } from "react";
 import "./SensorConfig.css";
 
-export default function SensorConfig() {
+export type SensorConfig = {
+  samplingRate: "100" | "200" | "400";
+  measurementRange: "2g" | "4g" | "8g";
+  lowPassFilter: "none" | "50" | "100";
+  highPassFilter: "none" | "1" | "5";
+};
+
+const DEFAULT_CONFIG: SensorConfig = {
+  samplingRate: "400",
+  measurementRange: "2g",
+  lowPassFilter: "100",
+  highPassFilter: "none",
+};
+
+function withDefaults(cfg: Partial<SensorConfig> | undefined | null): SensorConfig {
+  return {
+    samplingRate: cfg?.samplingRate ?? DEFAULT_CONFIG.samplingRate,
+    measurementRange: cfg?.measurementRange ?? DEFAULT_CONFIG.measurementRange,
+    lowPassFilter: cfg?.lowPassFilter ?? DEFAULT_CONFIG.lowPassFilter,
+    highPassFilter: cfg?.highPassFilter ?? DEFAULT_CONFIG.highPassFilter,
+  };
+}
+
+export default function SensorConfigCard({
+  config,
+  onSave,
+}: {
+  config: SensorConfig;
+  onSave: (updated: SensorConfig) => void;
+}) {
+  const [isEditing, setIsEditing] = useState(false);
+  const [draft, setDraft] = useState<SensorConfig>(() => withDefaults(config));
+
+  useEffect(() => {
+    setDraft(withDefaults(config));
+    setIsEditing(false);
+  }, [config]);
+
+  function handleCancel() {
+    setDraft(withDefaults(config));
+    setIsEditing(false);
+  }
+
+  function handleSave() {
+    onSave(withDefaults(draft));
+    setIsEditing(false);
+  }
+
+  const safeConfig = withDefaults(config);
+
   return (
     <div className="sc-card">
-      <div className="sc-card-title">Sensor Configuration</div>
+      <div className="sc-card-title sc-card-title-row">
+        <span>Sensor Configuration</span>
+
+        {!isEditing ? (
+          <button className="sc-btn sc-btn-ghost" onClick={() => setIsEditing(true)}>
+            Edit
+          </button>
+        ) : (
+          <div className="sc-btn-row">
+            <button className="sc-btn sc-btn-danger" onClick={handleCancel}>
+              Cancel
+            </button>
+            <button className="sc-btn sc-btn-success" onClick={handleSave}>
+              Save
+            </button>
+          </div>
+        )}
+      </div>
 
       <div className="sc-card-body sc-config-grid">
         <div className="sc-config-row">
           <span className="sc-muted">Sampling rate:</span>
-          <select className="sc-mini-select" defaultValue="400">
-            <option value="100">100 Hz</option>
-            <option value="200">200 Hz</option>
-            <option value="400">400 Hz</option>
-          </select>
+
+          {isEditing ? (
+            <div className="sc-pill-group">
+              {(["100", "200", "400"] as const).map((v) => (
+                <button
+                  key={v}
+                  type="button"
+                  className={`sc-pill ${draft.samplingRate === v ? "active" : ""}`}
+                  onClick={() => setDraft((d) => ({ ...d, samplingRate: v }))}
+                >
+                  {v} Hz
+                </button>
+              ))}
+            </div>
+          ) : (
+            <span className="sc-pill">{safeConfig.samplingRate} Hz</span>
+          )}
         </div>
 
         <div className="sc-config-row">
           <span className="sc-muted">Measurement range:</span>
-          <select className="sc-mini-select" defaultValue="2g">
-            <option value="2g">±2 g</option>
-            <option value="4g">±4 g</option>
-            <option value="8g">±8 g</option>
-          </select>
+
+          {isEditing ? (
+            <div className="sc-pill-group">
+              {(["2g", "4g", "8g"] as const).map((v) => (
+                <button
+                  key={v}
+                  type="button"
+                  className={`sc-pill ${draft.measurementRange === v ? "active" : ""}`}
+                  onClick={() => setDraft((d) => ({ ...d, measurementRange: v }))}
+                >
+                  ±{v.replace("g", "")} g
+                </button>
+              ))}
+            </div>
+          ) : (
+            <span className="sc-pill">±{safeConfig.measurementRange.replace("g", "")} g</span>
+          )}
         </div>
 
         <div className="sc-config-row">
           <span className="sc-muted">Low-pass filter:</span>
-          <select className="sc-mini-select" defaultValue="100">
-            <option value="none">None</option>
-            <option value="50">50 Hz</option>
-            <option value="100">100 Hz</option>
-          </select>
+
+          {isEditing ? (
+            <div className="sc-pill-group">
+              {(["none", "50", "100"] as const).map((v) => (
+                <button
+                  key={v}
+                  type="button"
+                  className={`sc-pill ${draft.lowPassFilter === v ? "active" : ""}`}
+                  onClick={() => setDraft((d) => ({ ...d, lowPassFilter: v }))}
+                >
+                  {v === "none" ? "None" : `${v} Hz`}
+                </button>
+              ))}
+            </div>
+          ) : (
+            <span className="sc-pill">
+              {safeConfig.lowPassFilter === "none" ? "None" : `${safeConfig.lowPassFilter} Hz`}
+            </span>
+          )}
         </div>
 
         <div className="sc-config-row">
           <span className="sc-muted">High-pass filter:</span>
-          <select className="sc-mini-select" defaultValue="none">
-            <option value="none">None</option>
-            <option value="1">1 Hz</option>
-            <option value="5">5 Hz</option>
-          </select>
+
+          {isEditing ? (
+            <div className="sc-pill-group">
+              {(["none", "1", "5"] as const).map((v) => (
+                <button
+                  key={v}
+                  type="button"
+                  className={`sc-pill ${draft.highPassFilter === v ? "active" : ""}`}
+                  onClick={() => setDraft((d) => ({ ...d, highPassFilter: v }))}
+                >
+                  {v === "none" ? "None" : `${v} Hz`}
+                </button>
+              ))}
+            </div>
+          ) : (
+            <span className="sc-pill">
+              {safeConfig.highPassFilter === "none" ? "None" : `${safeConfig.highPassFilter} Hz`}
+            </span>
+          )}
         </div>
 
-        <div className="sc-config-row">
-          <span className="sc-muted">RMS warning threshold:</span>
-          <span className="sc-pill">0.2 g</span>
-        </div>
+        {/* RMS warning threshold removed */}
       </div>
     </div>
   );

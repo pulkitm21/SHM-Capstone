@@ -1,7 +1,4 @@
 .system-status {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
   margin-bottom: 18px;
 }
 
@@ -21,32 +18,4 @@
 .status-offline {
   font-weight: 800;
   color: #d9534f;
-}
-
-.system-status-legend {
-  display: flex;
-  gap: 18px;
-  align-items: center;
-}
-
-.legend-item {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  font-weight: 600;
-}
-
-.dot {
-  width: 12px;
-  height: 12px;
-  border-radius: 999px;
-  border: 2px solid #000;
-}
-
-.dot-online {
-  background: #1ea45a;
-}
-
-.dot-offline {
-  background: #d9534f;
 }
