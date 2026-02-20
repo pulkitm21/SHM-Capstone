@@ -13,7 +13,7 @@ PI_IPS = [
 ]
 HOST = "192.168.2.2"
 PORT = 1883
-TOPIC = "shm/windturbine/node01/accel"
+TOPIC = "wind_turbine/data"
 
 client = mqtt.Client()
 client.connect(HOST, PORT, keepalive=60)
@@ -38,7 +38,7 @@ def generate_sample(t):
 
 def main():
     try:
-        print("timestamp,node_id,ax,ay,az")
+        print("timestamp,ax,ay,az")
 
         start_time = time.time()
         next_sample_time = start_time
@@ -50,11 +50,10 @@ def main():
 
             ax, ay, az = generate_sample(t)
 
-            timestamp = datetime.utcnow().isoformat()
-            print(f"{timestamp},{NODE_ID},{ax:.5f},{ay:.5f},{az:.5f}")
+            timestamp = 1763899900
+            print(f"{timestamp},{ax:.5f},{ay:.5f},{az:.5f}")
             data = {
                 "timestamp": timestamp,
-                "node id": NODE_ID,
                 "ax": ax,
                 "ay": ay,
                 "az": az

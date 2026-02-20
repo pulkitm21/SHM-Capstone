@@ -5,6 +5,7 @@ from collections import deque
 BROKER_IP = "localhost"
 PORT = 1883
 TOPIC = "wind_turbine/data"
+DATA_PATH = "/home/pi/Data/accel_data.csv"
 
 BUFFER_SIZE = 2000
 buffer = deque(maxlen=BUFFER_SIZE)
@@ -18,7 +19,7 @@ def on_message(client, userdata, msg):
     buffer.append(data)
 
     # Simple file write (microSD)
-    with open("/home/pi/accel_data.csv", "a") as f:
+    with open(DATA_PATH, "a") as f:
         f.write(f"{data['timestamp']},{data['ax']},{data['ay']},{data['az']}\n")
 
 client = mqtt.Client()
