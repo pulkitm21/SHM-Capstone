@@ -54,10 +54,10 @@ def on_message(client, userdata, msg):
         current_date_str = today_str
         print(f"Switched to new daily files for {current_date_str}")
 
-    timestamp = float(data["timestamp"])
+    timestamp = float(data["t"])
 
     # --- Acceleration ---
-    if "ax" in data:
+    if "a" in data:
         packet = struct.pack(
             ACCEL_FORMAT,
             timestamp,
@@ -69,7 +69,7 @@ def on_message(client, userdata, msg):
             f.write(packet)
 
     # --- Inclinometer ---
-    if "ix" in data:
+    if "i" in data:
         packet = struct.pack(
             INCLIN_FORMAT,
             timestamp,
@@ -81,7 +81,7 @@ def on_message(client, userdata, msg):
             f.write(packet)
 
     # --- Temperature ---
-    if "temperature" in data:
+    if "T" in data:
         packet = struct.pack(
             TEMP_FORMAT,
             timestamp,

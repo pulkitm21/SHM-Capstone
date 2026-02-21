@@ -54,7 +54,7 @@ def main():
             print(f"{timestamp},{ax:.5f},{ay:.5f},{az:.5f}")
             data = {
                 "timestamp": timestamp,
-                "ax": ax,
+                "a": [ax,ay,az],
                 "ay": ay,
                 "az": az
             }

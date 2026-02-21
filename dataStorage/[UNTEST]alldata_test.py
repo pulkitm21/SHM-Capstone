@@ -50,38 +50,38 @@ def on_message(client, userdata, msg):
         current_date_str = today_str
         print(f"Switched to new daily files for {current_date_str}")
 
-    timestamp = float(data["timestamp"])
+    timestamp = float(data["t"])
 
     # --- Acceleration ---
-    if "ax" in data:
+    if "a" in data:
         accel_packet = struct.pack(
             ACCEL_FORMAT,
             timestamp,
-            float(data["ax"]),
-            float(data["ay"]),
-            float(data["az"]),
+            float(data["a"][0]),
+            float(data["a"][1]),
+            float(data["a"][2]),
         )
         with open(accel_path, "ab") as f:
             f.write(accel_packet)
 
     # --- Inclinometer ---
-    if "ix" in data:
+    if "i" in data:
         inclin_packet = struct.pack(
             INCLIN_FORMAT,
             timestamp,
-            float(data["ix"]),
-            float(data["iy"]),
-            float(data["iz"]),
+            float(data["i"][0]),
+            float(data["i"][0]),
+            float(data["i"][0]),
         )
         with open(inclin_path, "ab") as f:
             f.write(inclin_packet)
 
     # --- Temperature ---
-    if "temperature" in data:
+    if "T" in data:
         temp_packet = struct.pack(
             TEMP_FORMAT,
             timestamp,
-            float(data["temperature"]),
+            float(data["T"]),
         )
         with open(temp_path, "ab") as f:
             f.write(temp_packet)
