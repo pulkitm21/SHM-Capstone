@@ -13,7 +13,7 @@
  *
  * Sensor Configuration:
  * =====================
- * - ADXL355: 2000 Hz (samples every 4 ticks at 8000 Hz base)
+ * - ADXL355: 1000 Hz (samples every 8 ticks at 8000 Hz base)
  * - SCL3300: 20 Hz   (samples every 400 ticks)
  * - ADT7420: 1 Hz    (samples every 8000 ticks)
  *
@@ -21,7 +21,7 @@
  * ================
  * - Base timer: 8000 Hz (125 microsecond period)
  * - Sensors staggered by 1 tick (125us) to avoid simultaneous access
- * - ADXL355 offset: 0 ticks (samples at tick 0, 4, 8, 12...)
+ * - ADXL355 offset: 0 ticks (samples at tick 0, 8, 16, 24...)
  * - SCL3300 offset: 1 tick  (samples at tick 1, 401, 801...)
  * - ADT7420 offset: 2 ticks (samples at tick 2, 8002, 16002...)
  *
@@ -64,12 +64,12 @@ static const char *TAG = "sensor_task";
 #define TIMER_PERIOD_US         125
 
 // Sensor sample rates
-#define ADXL355_RATE_HZ         2000
+#define ADXL355_RATE_HZ         1000
 #define SCL3300_RATE_HZ         20
 #define ADT7420_RATE_HZ         1
 
 // Calculate tick divisors (how many ticks between samples)
-#define ADXL355_TICK_DIVISOR    (BASE_TIMER_FREQ_HZ / ADXL355_RATE_HZ)  // 4
+#define ADXL355_TICK_DIVISOR    (BASE_TIMER_FREQ_HZ / ADXL355_RATE_HZ)  // 8
 #define SCL3300_TICK_DIVISOR    (BASE_TIMER_FREQ_HZ / SCL3300_RATE_HZ)  // 400
 #define ADT7420_TICK_DIVISOR    (BASE_TIMER_FREQ_HZ / ADT7420_RATE_HZ)  // 8000
 
@@ -337,7 +337,7 @@ static bool IRAM_ATTR timer_isr_handler(gptimer_handle_t timer,
     //--------------------------------------------------------------------------
     // ADXL355 Sampling (2000 Hz - every 4 ticks)
     //--------------------------------------------------------------------------
-    if ((tick_counter - ADXL355_OFFSET) % ADXL355_TICK_DIVISOR == 0)
+    if (((tick_counter - ADXL355_OFFSET) & (ADXL355_TICK_DIVISOR - 1)) == 0)
     {
         // Calculate next write position
         next_write_index = (adxl355_ring_buffer.write_index + 1) & (ADXL355_BUFFER_SIZE - 1);

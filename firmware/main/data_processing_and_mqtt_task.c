@@ -71,6 +71,13 @@ static void data_processing_task(void *pvParameters)
     int accel_batch_count = 0;
     uint32_t first_tick = 0;
 
+    // Decimation accumulators (average ACCEL_DECIM_FACTOR raw samples to 1 output sample)
+    int decim_count = 0;
+    int64_t sum_x = 0;
+    int64_t sum_y = 0;
+    int64_t sum_z = 0;
+    uint32_t decim_first_tick = 0;
+
     // Temperature state
     uint32_t last_temp_read_ms = 0;
     float current_temp = 0.0f;
@@ -124,65 +131,122 @@ static void data_processing_task(void *pvParameters)
         }
 
         // =====================================================================
-        // Read ALL available ADXL355 samples from ring buffer
+        // Read ALL available ADXL355 samples from ring buffer (with decimation)
         // =====================================================================
         while (adxl355_data_available() && s_task_running) {
             if (adxl355_read_sample(&adxl_sample)) {
-                if (accel_batch_count == 0) {
+                // Track the first tick for the entire packet
+                
+                //Use to debug reading from buffer. Issue reading 0's in MQTT packet, but not sure if it's from sensor_task.c or data_processing_and_mqtt_task.c
+                /*
+                static int dbg_count = 0;
+                if (dbg_count < 20) {
+                    ESP_LOGI("DBG_RAW", "raw_x=%ld raw_y=%ld raw_z=%ld",
+                        (long)adxl_sample.raw_x,
+                        (long)adxl_sample.raw_y,
+                        (long)adxl_sample.raw_z);
+                    dbg_count++;
+                }   
+                */            
+
+                if (accel_batch_count == 0 && decim_count == 0) {
                     first_tick = adxl_sample.tick;
                 }
 
-                s_accel_x[accel_batch_count] = convert_adxl355_to_g(adxl_sample.raw_x);
-                s_accel_y[accel_batch_count] = convert_adxl355_to_g(adxl_sample.raw_y);
-                s_accel_z[accel_batch_count] = convert_adxl355_to_g(adxl_sample.raw_z);
-                s_accel_ticks[accel_batch_count] = adxl_sample.tick;
+                // Track the first tick for this decimation window
+                if (decim_count == 0) {
+                    decim_first_tick = adxl_sample.tick;
+                }
 
-                accel_batch_count++;
+                // Accumulate raw samples
+                sum_x += (int64_t)adxl_sample.raw_x;
+                sum_y += (int64_t)adxl_sample.raw_y;
+                sum_z += (int64_t)adxl_sample.raw_z;
+                decim_count++;
 
-                // If batch is full, publish it
-                if (accel_batch_count >= ACCEL_SAMPLES_PER_BATCH) {
-                    if (mqtt_is_connected()) {
-                        mqtt_sensor_packet_t packet = {0};
-                        packet.timestamp = TICKS_TO_US(first_tick);
-                        packet.accel_count = accel_batch_count;
+                // When we have ACCEL_DECIM_FACTOR raw samples -> emit 1 averaged output
+                if (decim_count >= ACCEL_DECIM_FACTOR) {
+                    int32_t avg_raw_x = (int32_t)(sum_x / ACCEL_DECIM_FACTOR);
+                    int32_t avg_raw_y = (int32_t)(sum_y / ACCEL_DECIM_FACTOR);
+                    int32_t avg_raw_z = (int32_t)(sum_z / ACCEL_DECIM_FACTOR);
 
-                        // Copy accelerometer data
-                        for (int i = 0; i < accel_batch_count; i++) {
-                            packet.accel[i].x = s_accel_x[i];
-                            packet.accel[i].y = s_accel_y[i];
-                            packet.accel[i].z = s_accel_z[i];
-                        }
+                    s_accel_x[accel_batch_count] = convert_adxl355_to_g(avg_raw_x);
 
-                        // Inclinometer
-                        packet.has_angle = true;
-                        packet.angle_valid = incl_valid;
-                        if (incl_valid) {
-                            packet.angle_x = current_incl_x;
-                            packet.angle_y = current_incl_y;
-                            packet.angle_z = current_incl_z;
-                        }
+                    // Debugging conversion from raw to g's. Issue with values showing 0.000000 in MQTT packet, but not sure if it's from sensor_task.c or data_processing_and_mqtt_task.c
+                    /*static int dbg_conv = 0;
+                    if (dbg_conv < 20) {
+                        ESP_LOGI("DBG_G", "g_x=%.6f g_y=%.6f g_z=%.6f",
+                            s_accel_x[accel_batch_count],
+                            s_accel_y[accel_batch_count],
+                            s_accel_z[accel_batch_count]);
+                        dbg_conv++;
+                    }   
+                    */
 
-                        // Temperature
-                        packet.has_temp = true;
-                        packet.temp_valid = temp_valid;
-                        if (temp_valid) {
-                            packet.temperature = current_temp;
-                        }
+                    s_accel_y[accel_batch_count] = convert_adxl355_to_g(avg_raw_y);
+                    s_accel_z[accel_batch_count] = convert_adxl355_to_g(avg_raw_z);
+                    s_accel_ticks[accel_batch_count] = decim_first_tick;
+                    accel_batch_count++;
 
-                        // Publish
-                        if (mqtt_publish_sensor_data(&packet) == ESP_OK) {
-                            s_samples_published += accel_batch_count;
-                            s_packets_sent++;
+                    // Reset decimation window
+                    decim_count = 0;
+                    sum_x = 0;
+                    sum_y = 0;
+                    sum_z = 0;
+
+                    // If batch is full, publish it
+                    if (accel_batch_count >= ACCEL_SAMPLES_PER_BATCH) {
+                        if (mqtt_is_connected()) {
+                            mqtt_sensor_packet_t packet = {0};
+                            packet.timestamp = TICKS_TO_US(first_tick);
+                            packet.accel_count = accel_batch_count;
+
+                            // Copy accelerometer data
+                            for (int i = 0; i < accel_batch_count; i++) {
+                                packet.accel[i].x = s_accel_x[i];
+                                packet.accel[i].y = s_accel_y[i];
+                                packet.accel[i].z = s_accel_z[i];
+                            }
+
+                            // Inclinometer
+                            packet.has_angle = true;
+                            packet.angle_valid = incl_valid;
+                            if (incl_valid) {
+                                packet.angle_x = current_incl_x;
+                                packet.angle_y = current_incl_y;
+                                packet.angle_z = current_incl_z;
+                            }
+
+                            // Temperature
+                            packet.has_temp = true;
+                            packet.temp_valid = temp_valid;
+                            if (temp_valid) {
+                                packet.temperature = current_temp;
+                            }
+
+                            // Debugging final packet before publish. Issue with values showing 0.000000 in MQTT packet, but not sure if it's from sensor_task.c or data_processing_and_mqtt_task.c
+                            /*ESP_LOGI("DBG_PKT", "first sample: %.6f %.6f %.6f  count=%d",
+                                packet.accel[0].x,
+                                packet.accel[0].y,
+                                packet.accel[0].z,
+                                packet.accel_count);
+                            */
+
+                            // Publish
+                            if (mqtt_publish_sensor_data(&packet) == ESP_OK) {
+                                s_samples_published += accel_batch_count;
+                                s_packets_sent++;
+                            } else {
+                                s_samples_dropped += accel_batch_count;
+                                ESP_LOGW(TAG, "MQTT publish failed, dropped %d samples", accel_batch_count);
+                            }
                         } else {
                             s_samples_dropped += accel_batch_count;
-                            ESP_LOGW(TAG, "MQTT publish failed, dropped %d samples", accel_batch_count);
+                            ESP_LOGW(TAG, "MQTT disconnected, dropped %d samples", accel_batch_count);
                         }
-                    } else {
-                        s_samples_dropped += accel_batch_count;
-                        ESP_LOGW(TAG, "MQTT disconnected, dropped %d samples", accel_batch_count);
-                    }
 
-                    accel_batch_count = 0;
+                        accel_batch_count = 0;
+                    }
                 }
             }
         }

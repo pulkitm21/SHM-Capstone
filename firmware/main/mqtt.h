@@ -23,7 +23,7 @@ extern "C" {
  * CONFIGURATION
  *****************************************************************************/
 
-#define MQTT_BROKER_URI         "mqtt://192.168.20.xx:1883"  // <-- UPDATE THIS!
+#define MQTT_BROKER_URI         "mqtt://192.168.0.112:1883"  // <-- UPDATE THIS!
 #define MQTT_CLIENT_ID          "wind_turbine_esp32"
 #define MQTT_TOPIC_DATA         "wind_turbine/data"
 #define MQTT_TOPIC_STATUS       "wind_turbine/status"
