@@ -40,6 +40,15 @@ esp_err_t ethernet_get_ip_info(esp_netif_ip_info_t *ip_info);
 
 /**
  * @brief Access the underlying esp_netif (useful for advanced netif ops).
+ *
+ * Pass the returned handle to mqtt_mdns_init() to bind mDNS to this interface.
+ * This enables broker hostname resolution ("raspberrypi.local") without a
+ * hardcoded IP address. Call order must be:
+ *
+ *   ethernet_init();
+ *   ethernet_wait_for_ip(timeout_ms);   // link must be up before mDNS
+ *   mqtt_mdns_init(ethernet_get_netif());
+ *   mqtt_init();
  */
 esp_netif_t *ethernet_get_netif(void);
 

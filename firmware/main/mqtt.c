@@ -2,6 +2,20 @@
  * @file mqtt.c
  * @brief MQTT Client Implementation
  *
+ * DEVICE IDENTIFICATION:
+ * - At init time, the ESP32 Ethernet MAC address is read via esp_read_mac().
+ * - A unique client ID and per-node topics are built from those 6 MAC bytes:
+ *     Client ID:    wind_turbine_AABBCCDDEEFF
+ *     Data topic:   wind_turbine/AABBCCDDEEFF/data
+ *     Status topic: wind_turbine/AABBCCDDEEFF/status
+ * - No manual configuration is needed; every node is automatically distinguishable.
+ *
+ * BROKER DISCOVERY:
+ * - The broker URI uses an mDNS hostname ("raspberrypi.local") instead of a
+ *   hardcoded IP. Call mqtt_mdns_init(ethernet_get_netif()) AFTER
+ *   ethernet_wait_for_ip() and BEFORE mqtt_init() so the mDNS stack is bound
+ *   to the correct Ethernet netif before any hostname resolution is attempted.
+ *
  * DATA INTEGRITY:
  * - Invalid/stale sensor data shows as "null" in JSON
  * - Every reading is 100% accurate or marked as missing
@@ -10,6 +24,8 @@
 #include "mqtt.h"
 #include "mqtt_client.h"
 #include "esp_log.h"
+#include "esp_mac.h"          // esp_read_mac(), ESP_MAC_ETH
+#include "mdns.h"             // mDNS hostname resolution over Ethernet
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include <stdio.h>
@@ -26,6 +42,60 @@ static bool s_is_connected = false;
 
 #define JSON_BUFFER_SIZE    4096
 static char *s_json_buffer = NULL;
+
+/*
+ * Runtime-generated identity strings built from the MAC address.
+ * Sizes:
+ *   client_id  = "wind_turbine_" (13) + "AABBCCDDEEFF" (12) + '\0' = 26
+ *   topic      = "wind_turbine/" (13) + "AABBCCDDEEFF" (12) + "/data" (5) + '\0' = 31
+ */
+#define MAC_STR_LEN         12          // 6 bytes * 2 hex chars, no separators
+#define CLIENT_ID_MAX_LEN   32
+#define TOPIC_MAX_LEN       64
+
+static char s_client_id[CLIENT_ID_MAX_LEN];
+static char s_topic_data[TOPIC_MAX_LEN];
+static char s_topic_status[TOPIC_MAX_LEN];
+
+/******************************************************************************
+ * INTERNAL HELPERS
+ *****************************************************************************/
+
+/**
+ * @brief Read the Ethernet MAC and build the three identity strings.
+ *
+ * The Ethernet MAC is used (not Wi-Fi) because this device connects via
+ * the Olimex ESP32-POE-ISO board's Ethernet port.
+ *   - Burned into ESP32 eFuse at manufacture is globally unique, never changes.
+ *   - Available immediately, before DHCP assigns an IP.
+ *   - Matches the MAC visible on the network switch,
+ *     which makes it easy to cross-reference during debugging.
+ *
+ * If esp_read_mac() fails for any reason, we fall back to a fixed placeholder
+ * so the rest of the init can still proceed (and the error is logged clearly).
+ */
+static void build_identity_strings(void)
+{
+    uint8_t mac[6] = {0};
+    esp_err_t ret = esp_read_mac(mac, ESP_MAC_ETH);  // Ethernet MAC, not Wi-Fi
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read Ethernet MAC (err=0x%x), using fallback ID", ret);
+        snprintf(s_client_id,    sizeof(s_client_id),    "%s_UNKNOWN", MQTT_TOPIC_PREFIX);
+        snprintf(s_topic_data,   sizeof(s_topic_data),   "%s/UNKNOWN/data",   MQTT_TOPIC_PREFIX);
+        snprintf(s_topic_status, sizeof(s_topic_status), "%s/UNKNOWN/status", MQTT_TOPIC_PREFIX);
+        return;
+    }
+
+    /* Format MAC bytes as uppercase hex without separators: AABBCCDDEEFF */
+    char mac_str[MAC_STR_LEN + 1];
+    snprintf(mac_str, sizeof(mac_str), "%02X%02X%02X%02X%02X%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    snprintf(s_client_id,    sizeof(s_client_id),    "%s_%s",         MQTT_TOPIC_PREFIX, mac_str);
+    snprintf(s_topic_data,   sizeof(s_topic_data),   "%s/%s/data",    MQTT_TOPIC_PREFIX, mac_str);
+    snprintf(s_topic_status, sizeof(s_topic_status), "%s/%s/status",  MQTT_TOPIC_PREFIX, mac_str);
+}
 
 /******************************************************************************
  * EVENT HANDLER
@@ -75,11 +145,79 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
  * PUBLIC FUNCTIONS
  *****************************************************************************/
 
+esp_err_t mqtt_mdns_init(esp_netif_t *netif)
+{
+   if (netif == NULL) {
+        ESP_LOGE(TAG, "mqtt_mdns_init: netif is NULL — pass ethernet_get_netif()");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    build_identity_strings();
+
+    /*
+     * Initialize the mDNS service and bind it to the provided netif.
+     *
+     * This MUST be called after ethernet_wait_for_ip() succeeds, because mDNS
+     * sends and receives multicast packets over the network interface — it needs
+     * the link to be up and an IP assigned before it can function correctly.
+     *
+     *  call order in main.c:
+     *
+     *   ethernet_init();
+     *   ethernet_wait_for_ip(10000);
+     *   mqtt_mdns_init(ethernet_get_netif());   // <-- here
+     *   mqtt_init();
+     *   mqtt_wait_for_connection(10000);
+     */
+    esp_err_t ret = mdns_init();
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "mdns_init failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    /*
+     * Give this node a hostname so it also appears on the network as an mDNS
+     * responder (useful for debugging — you can ping it by name from the Pi).
+     * The hostname is derived from the client ID built earlier, e.g.
+     * "wind-turbine-AABBCCDDEEFF". Hyphens are used because mDNS hostnames
+     * must not contain underscores per RFC 6762.
+     *
+     * Note: build_identity_strings() uses underscores in the MQTT client ID
+     * (required by the MQTT spec), but mDNS hostnames use hyphens instead.
+     */
+    char mdns_hostname[CLIENT_ID_MAX_LEN];
+    // Replace underscores with hyphens for the mDNS hostname
+    strncpy(mdns_hostname, s_client_id, sizeof(mdns_hostname) - 1);
+    mdns_hostname[sizeof(mdns_hostname) - 1] = '\0';
+    for (char *p = mdns_hostname; *p; p++) {
+        if (*p == '_') *p = '-';
+    }
+
+    ret = mdns_hostname_set(mdns_hostname);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "mdns_hostname_set failed (non-fatal): %s", esp_err_to_name(ret));
+        // Non-fatal. we still need mDNS for resolving the broker, not for advertising
+    } else {
+        ESP_LOGI(TAG, "mDNS hostname set: %s.local", mdns_hostname);
+    }
+
+    ESP_LOGI(TAG, "mDNS initialized — broker '%s' will be resolved at connect time",
+             MQTT_BROKER_HOSTNAME);
+    return ESP_OK;
+}
+
 esp_err_t mqtt_init(void)
 {
     ESP_LOGI(TAG, "Initializing MQTT client...");
-    ESP_LOGI(TAG, "  Broker: %s", MQTT_BROKER_URI);
-    ESP_LOGI(TAG, "  Client ID: %s", MQTT_CLIENT_ID);
+
+    /* Build unique client ID and topics from the hardware MAC address */
+    build_identity_strings();
+
+    ESP_LOGI(TAG, "  Broker:    %s (resolved via mDNS)", MQTT_BROKER_URI);
+    ESP_LOGI(TAG, "  Client ID: %s", s_client_id);
+    ESP_LOGI(TAG, "  Data topic:   %s", s_topic_data);
+    ESP_LOGI(TAG, "  Status topic: %s", s_topic_status);
     ESP_LOGI(TAG, "  Data integrity: null for invalid/stale data");
 
     s_mqtt_event_group = xEventGroupCreate();
@@ -96,12 +234,12 @@ esp_err_t mqtt_init(void)
     }
 
     esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = MQTT_BROKER_URI,
-        .credentials.client_id = MQTT_CLIENT_ID,
-        .session.keepalive = 60,
-        .network.reconnect_timeout_ms = 5000,
-        .buffer.size = 1024,
-        .buffer.out_size = 4096,
+        .broker.address.uri             = MQTT_BROKER_URI,
+        .credentials.client_id          = s_client_id,   // MAC-derived, unique per device
+        .session.keepalive               = 60,
+        .network.reconnect_timeout_ms   = 5000,
+        .buffer.size                    = 1024,
+        .buffer.out_size                = 4096,
     };
 
     s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
@@ -203,12 +341,10 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
     // Inclinometer - ALWAYS include field, but use null if invalid
     if (packet->has_angle) {
         if (packet->angle_valid) {
-            // Valid data - show values
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
                                ",\"i\":[%.4f,%.4f,%.4f]",
                                packet->angle_x, packet->angle_y, packet->angle_z);
         } else {
-            // Invalid/stale data - show null
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
                                ",\"i\":null");
         }
@@ -217,11 +353,9 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
     // Temperature - ALWAYS include field, but use null if invalid
     if (packet->has_temp) {
         if (packet->temp_valid) {
-            // Valid data - show value
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
                                ",\"T\":%.2f", packet->temperature);
         } else {
-            // Invalid/stale data - show null
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
                                ",\"T\":null");
         }
@@ -230,8 +364,8 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
     // Close JSON
     offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, "}");
 
-    // Publish
-    int msg_id = esp_mqtt_client_publish(s_mqtt_client, MQTT_TOPIC_DATA,
+    // Publish to the MAC-derived data topic
+    int msg_id = esp_mqtt_client_publish(s_mqtt_client, s_topic_data,
                                           s_json_buffer, offset,
                                           MQTT_PUBLISH_QOS, 0);
 
@@ -240,8 +374,8 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
         return ESP_FAIL;
     }
 
-    ESP_LOGD(TAG, "Published %d bytes (%d accel, angle=%s, temp=%s)",
-             offset, packet->accel_count,
+    ESP_LOGD(TAG, "Published %d bytes to %s (%d accel, angle=%s, temp=%s)",
+             offset, s_topic_data, packet->accel_count,
              packet->angle_valid ? "valid" : "NULL",
              packet->temp_valid ? "valid" : "NULL");
 
@@ -254,7 +388,7 @@ esp_err_t mqtt_publish_status(const char *status)
         return ESP_ERR_INVALID_STATE;
     }
 
-    int msg_id = esp_mqtt_client_publish(s_mqtt_client, MQTT_TOPIC_STATUS,
+    int msg_id = esp_mqtt_client_publish(s_mqtt_client, s_topic_status,
                                           status, strlen(status),
                                           MQTT_PUBLISH_QOS, 0);
 
@@ -263,7 +397,7 @@ esp_err_t mqtt_publish_status(const char *status)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Published status: %s", status);
+    ESP_LOGI(TAG, "Published status to %s: %s", s_topic_status, status);
     return ESP_OK;
 }
 
@@ -304,4 +438,23 @@ esp_err_t mqtt_deinit(void)
     s_is_connected = false;
     ESP_LOGI(TAG, "MQTT client deinitialized");
     return ESP_OK;
+}
+
+/******************************************************************************
+ * IDENTITY ACCESSORS
+ *****************************************************************************/
+
+const char *mqtt_get_client_id(void)
+{
+    return s_client_id;
+}
+
+const char *mqtt_get_topic_data(void)
+{
+    return s_topic_data;
+}
+
+const char *mqtt_get_topic_status(void)
+{
+    return s_topic_status;
 }

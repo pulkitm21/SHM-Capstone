@@ -26,4 +26,5 @@ idf_component_register(
                    ethernet_init
                    nvs_flash
                    mqtt
+                   mdns
 )

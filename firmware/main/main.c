@@ -295,6 +295,14 @@ static esp_err_t init_mqtt(void)
 {
     ESP_LOGI(TAG, "--- Initializing MQTT ---");
 
+    // REQUIRED for MQTT_BROKER_URI = "raspberrypi.local"
+    // Non-fatal: if it fails, MQTT will likely fail to resolve anyway, but we keep running.
+    esp_err_t mdns_ret = mqtt_mdns_init(ethernet_get_netif());
+    if (mdns_ret != ESP_OK) {
+        ESP_LOGW(TAG, "mDNS init failed (broker hostname resolution may fail): %s",
+                 esp_err_to_name(mdns_ret));
+    }
+
     if (mqtt_init() != ESP_OK) {
         ESP_LOGE(TAG, "MQTT init failed");
         return ESP_FAIL;
