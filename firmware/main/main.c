@@ -241,7 +241,7 @@ static void print_banner(void)
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "Architecture:");
     ESP_LOGI(TAG, "  - ISR at 8000 Hz (sensor acquisition)");
-    ESP_LOGI(TAG, "  - ADXL355: 2000 Hz accelerometer");
+    ESP_LOGI(TAG, "  - ADXL355: 1000 Hz accelerometer");
     ESP_LOGI(TAG, "  - SCL3300: 20 Hz inclinometer");
     ESP_LOGI(TAG, "  - ADT7420: 1 Hz temperature");
     ESP_LOGI(TAG, "  - Ring buffers for lock-free data transfer");

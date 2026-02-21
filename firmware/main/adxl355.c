@@ -169,8 +169,8 @@ esp_err_t adxl355_init(void)
     if (err != ESP_OK) return err;
     vTaskDelay(pdMS_TO_TICKS(2));
 
-    /* FILTER: default to ODR=2000 Hz, HPF off */
-    err = adxl355_write_reg(ADXL355_REG_FILTER, ADXL355_FILTER_ODR_2000);
+    /* FILTER: ODR=1000 Hz, HPF off */
+    err = adxl355_write_reg(ADXL355_REG_FILTER, ADXL355_FILTER_ODR_1000);
     if (err != ESP_OK) return err;
 
     /* Optional: route DATA_RDY to INT1 via INT_MAP (does not affect DRDY pin) */
@@ -219,30 +219,31 @@ esp_err_t adxl355_set_range(uint8_t range)
     return ESP_OK;
 }
 
-esp_err_t adxl355_read_acceleration(adxl355_accel_t *accel)
-{
-    if (!accel) return ESP_ERR_INVALID_ARG;
+// Reading function is left here for debugging purposes. data_processing_and_mqtt_task.c converts raw values to g's.
+// esp_err_t adxl355_read_acceleration(adxl355_accel_t *accel)
+// {
+//     if (!accel) return ESP_ERR_INVALID_ARG;
 
-    uint8_t b[9] = {0};
-    esp_err_t err = adxl355_read_reg(ADXL355_REG_XDATA3, b, sizeof(b));
-    if (err != ESP_OK) return err;
+//     uint8_t b[9] = {0};
+//     esp_err_t err = adxl355_read_reg(ADXL355_REG_XDATA3, b, sizeof(b));
+//     if (err != ESP_OK) return err;
 
-    uint32_t x_u = ((uint32_t)b[0] << 12) | ((uint32_t)b[1] << 4) | ((uint32_t)b[2] >> 4);
-    uint32_t y_u = ((uint32_t)b[3] << 12) | ((uint32_t)b[4] << 4) | ((uint32_t)b[5] >> 4);
-    uint32_t z_u = ((uint32_t)b[6] << 12) | ((uint32_t)b[7] << 4) | ((uint32_t)b[8] >> 4);
+//     uint32_t x_u = ((uint32_t)b[0] << 12) | ((uint32_t)b[1] << 4) | ((uint32_t)b[2] >> 4);
+//     uint32_t y_u = ((uint32_t)b[3] << 12) | ((uint32_t)b[4] << 4) | ((uint32_t)b[5] >> 4);
+//     uint32_t z_u = ((uint32_t)b[6] << 12) | ((uint32_t)b[7] << 4) | ((uint32_t)b[8] >> 4);
 
-    int32_t x = sign_extend_20b(x_u);
-    int32_t y = sign_extend_20b(y_u);
-    int32_t z = sign_extend_20b(z_u);
+//     int32_t x = sign_extend_20b(x_u);
+//     int32_t y = sign_extend_20b(y_u);
+//     int32_t z = sign_extend_20b(z_u);
 
-    float lsb_per_g = adxl355_lsb_per_g(s_range_code);
+//     float lsb_per_g = adxl355_lsb_per_g(s_range_code);
 
-    accel->x = (float)x / lsb_per_g;
-    accel->y = (float)y / lsb_per_g;
-    accel->z = (float)z / lsb_per_g;
+//     accel->x = (float)x / lsb_per_g;
+//     accel->y = (float)y / lsb_per_g;
+//     accel->z = (float)z / lsb_per_g;
 
-    return ESP_OK;
-}
+//     return ESP_OK;
+// }
 
 esp_err_t adxl355_read_temperature(float *temperature_c)
 {

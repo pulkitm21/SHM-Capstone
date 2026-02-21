@@ -25,8 +25,11 @@ extern "C" {
 #define DATA_PROCESSING_TASK_PRIORITY      5
 #define DATA_PROCESSING_TASK_CORE          0
 
-#define ACCEL_SAMPLES_PER_BATCH     100
-#define PROCESSING_INTERVAL_MS      50
+#define PROCESSING_INTERVAL_MS             50     // Process data every 50 ms
+#define ACCEL_RAW_RATE_HZ                 1000   // Must match ADXL355 ODR
+#define ACCEL_DECIM_FACTOR                 5    // Decimation factor to reduce 1000 Hz raw to 200 Hz published
+#define ACCEL_RAW_SAMPLES_PER_INTERVAL  ((ACCEL_RAW_RATE_HZ * PROCESSING_INTERVAL_MS) / 1000)   // 50
+#define ACCEL_SAMPLES_PER_BATCH         (ACCEL_RAW_SAMPLES_PER_INTERVAL / ACCEL_DECIM_FACTOR)   // 10
 
 /******************************************************************************
  * PUBLIC FUNCTIONS
