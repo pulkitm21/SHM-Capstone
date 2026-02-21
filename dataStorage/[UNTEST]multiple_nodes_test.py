@@ -85,7 +85,7 @@ def on_message(client, userdata, msg):
         packet = struct.pack(
             TEMP_FORMAT,
             timestamp,
-            float(data["t"]),
+            float(data["T"]),
         )
         with open(temp_path, "ab") as f:
             f.write(packet)

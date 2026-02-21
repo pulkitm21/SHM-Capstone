@@ -70,8 +70,8 @@ def on_message(client, userdata, msg):
             INCLIN_FORMAT,
             timestamp,
             float(data["i"][0]),
-            float(data["i"][0]),
-            float(data["i"][0]),
+            float(data["i"][1]),
+            float(data["i"][2]),
         )
         with open(inclin_path, "ab") as f:
             f.write(inclin_packet)
