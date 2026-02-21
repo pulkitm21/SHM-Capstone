@@ -61,9 +61,9 @@ def on_message(client, userdata, msg):
         packet = struct.pack(
             ACCEL_FORMAT,
             timestamp,
-            float(data["ax"]),
-            float(data["ay"]),
-            float(data["az"]),
+            float(data["a"][0]),
+            float(data["a"][1]),
+            float(data["a"][2]),
         )
         with open(accel_path, "ab") as f:
             f.write(packet)
@@ -73,9 +73,9 @@ def on_message(client, userdata, msg):
         packet = struct.pack(
             INCLIN_FORMAT,
             timestamp,
-            float(data["ix"]),
-            float(data["iy"]),
-            float(data["iz"]),
+            float(data["i"][0]),
+            float(data["i"][1]),
+            float(data["i"][2]),
         )
         with open(inclin_path, "ab") as f:
             f.write(packet)
@@ -85,7 +85,7 @@ def on_message(client, userdata, msg):
         packet = struct.pack(
             TEMP_FORMAT,
             timestamp,
-            float(data["temperature"]),
+            float(data["t"]),
         )
         with open(temp_path, "ab") as f:
             f.write(packet)
