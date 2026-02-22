@@ -1,13 +1,15 @@
 .navbar {
   width: 250px;
-  height: 100vh; /* full height of viewport */
+  height: 100vh;
   position: fixed;
   left: 0;
   top: 0;
   background: #1689ba;
   box-shadow: 2px 0 10px rgba(0, 0, 0, 0.1);
   padding: 20px 0;
-  border-radius: 5px;
+
+  display: flex;
+  flex-direction: column;
 }
 
 .navbar-title-block {
@@ -25,6 +27,10 @@
 .navbar-menu {
   list-style: none;
   padding: 0;
+  margin: 0;
+
+  /* flex: 1 pushes footer to bottom */
+  flex: 1;
 }
 
 .navbar-item {
@@ -56,4 +62,25 @@
 .navbar-label {
   font-size: 20px;
   font-weight: 300;
+}
+
+.navbar-footer {
+  padding: 16px 20px;
+  border-top: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.logout-button {
+  width: 100%;
+  padding: 10px;
+  border-radius: 8px;
+  border: none;
+  background: #1281b1;
+  color: white;
+  font-weight: 600;
+  cursor: pointer;
+  transition: 0.2s ease;
+}
+
+.logout-button:hover {
+  filter: brightness(0.95);
 }
