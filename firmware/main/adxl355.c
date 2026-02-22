@@ -10,10 +10,6 @@
  *      bit7 = R/W   (1 = read, 0 = write)
  *      bit6 = MB    (1 = multibyte, 0 = single byte)
  *      bit5..0 = register address
- *
- * Startup notes:
- *  - Program configuration registers while in standby (POWER_CTL.STANDBY = 1)
- *  - Then clear STANDBY to enter measurement mode
  */
 
 #include "adxl355.h"
@@ -33,10 +29,10 @@ spi_device_handle_t adxl355_spi_handle = NULL; //exposed for ISR use
 static spi_device_handle_t s_dev = NULL; //internal handle for non-ISR use
 static uint8_t s_range_code = ADXL355_RANGE_2G;
 
-/* Small transfers only (IDs, config, burst accel/temp reads) */
+/* Small transfers only (IDs, config, accel/temp reads) */
 #define ADXL355_MAX_XFER_BYTES  16
 
-/* Soft reset code (RESET register, addr 0x2F) */
+/* Soft reset code*/
 #define ADXL355_RESET_CODE      0x52
 
 /* ----- SPI helpers ----- */
@@ -169,15 +165,15 @@ esp_err_t adxl355_init(void)
     if (err != ESP_OK) return err;
     vTaskDelay(pdMS_TO_TICKS(2));
 
-    /* FILTER: ODR=1000 Hz, HPF off */
+    /* FILTER: ODR=1000 Hz*/
     err = adxl355_write_reg(ADXL355_REG_FILTER, ADXL355_FILTER_ODR_1000);
     if (err != ESP_OK) return err;
 
-    /* Optional: route DATA_RDY to INT1 via INT_MAP (does not affect DRDY pin) */
+    /* Optional: route DATA_RDY to INT1 via INT_MAP */
     err = adxl355_write_reg(ADXL355_REG_INT_MAP, ADXL355_INT_RDY_EN1);
     if (err != ESP_OK) return err;
 
-    /* RANGE: default ±2 g (preserve upper bits like I2C_HS / INT_POL) */
+    /* RANGE: default ±2 g */
     err = adxl355_set_range(ADXL355_RANGE_2G);
     if (err != ESP_OK) return err;
 
@@ -185,7 +181,7 @@ esp_err_t adxl355_init(void)
     err = adxl355_write_reg(ADXL355_REG_POWER_CTL, 0x00);
     if (err != ESP_OK) return err;
 
-    /* Cache range (read back for certainty) */
+    /* Cache ranges */
     uint8_t range_reg = 0;
     err = adxl355_read_reg(ADXL355_REG_RANGE, &range_reg, 1);
     if (err == ESP_OK) {

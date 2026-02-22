@@ -51,7 +51,7 @@ static esp_eth_handle_t s_eth_handle = NULL;
 static esp_eth_netif_glue_handle_t s_eth_glue = NULL;
 static bool s_initialized = false;
 
-// ethernet_init_all() allocates an array of handles; keep it so we can free/uninstall.
+// ethernet_init_all() allocates an array of handles
 static esp_eth_handle_t *s_eth_handles = NULL;
 static uint8_t s_eth_port_cnt = 0;
 
@@ -165,7 +165,7 @@ esp_err_t ethernet_init(void)
         return ESP_FAIL;
     }
 
-    // Create netif + default loop (safe if already created elsewhere)
+    // Create netif + default loop 
     ret = esp_netif_init();
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "esp_netif_init failed: %s", esp_err_to_name(ret));
@@ -283,7 +283,7 @@ esp_err_t ethernet_set_static_ip(uint8_t a, uint8_t b, uint8_t c, uint8_t d)
         return ret;
     }
 
-    // Mark got-ip bit so ethernet_wait_for_ip() can succeed even without DHCP
+    // ethernet_wait_for_ip() can succeed even without DHCP
     if (s_eth_event_group) {
         xEventGroupSetBits(s_eth_event_group, ETH_GOT_IP_BIT);
     }

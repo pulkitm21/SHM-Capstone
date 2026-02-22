@@ -2,13 +2,13 @@
  * @file sensor_task.c
  * @brief ISR-Based Sensor Data Acquisition with Ring Buffers
  *
- * Design Philosophy (per advisor recommendation):
+ * Design Philosophy (based on recommendation):
  * ================================================
- * 1. SINGLE ISR driven by GPTimer at high frequency (8000 Hz)
- * 2. Staggered sensor sampling to prevent bus conflicts
- * 3. Raw data collection ONLY in ISR - NO function calls, NO processing
- * 4. Lock-free ring buffers for each sensor
- * 5. Minimal ISR overhead for deterministic timing
+ * 1. SINGLE ISR driven by GPTimer frequency (8000 Hz)
+ * 2. Staggered sensor sampling to prevent conflicts
+ * 3. Raw data collection ONLY in ISR. NO function calls, NO processing
+ * 4. Chose ring buffering because it allows lock-free communication between ISR and processing task. 
+ * 5. Hopefully smaller ISR overhead
  * 6. Processing happens OUTSIDE the ISR in separate tasks
  *
  * Sensor Configuration:
@@ -31,7 +31,7 @@
  * - NO data processing or conversion
  * - NO MQTT, no logging, no printf
  * - Only raw data collection and ring buffer writes
- * - Keep execution time minimal and deterministic
+ * - Keep execution time minimal
  */
 
 #include "sensor_task.h"
@@ -132,16 +132,16 @@ static volatile uint32_t adt7420_sample_count = 0;
 // Sensor availability
 static bool s_temp_available = false;
 
-// External device handles (these are from your sensor drivers)
+// External device handles
 // We'll need these for direct SPI/I2C access in the ISR
 extern spi_device_handle_t adxl355_spi_handle;  // You'll need to expose this from adxl355.c
 extern spi_device_handle_t scl3300_spi_handle;  // You'll need to expose this from scl3300.c
 extern i2c_master_dev_handle_t adt7420_i2c_handle; // You'll need to expose this from adt7420.c
 
 /******************************************************************************
- * DIRECT HARDWARE ACCESS FUNCTIONS FOR ISR
+ * ACCESS FUNCTIONS FOR ISR
  * 
- * These functions perform RAW register reads WITHOUT any function call overhead.
+ * These functions perform RAW register reads 
  * They are intentionally NOT factored out to separate functions to minimize ISR time.
  *****************************************************************************/
 
@@ -175,16 +175,16 @@ static inline void IRAM_ATTR read_adxl355_raw(int32_t *raw_x, int32_t *raw_y, in
     // Direct SPI transfer (blocking, but very fast ~10-20 microseconds)
     spi_device_polling_transmit(adxl355_spi_handle, &t);
     
-    // Extract 20-bit values from bytes (big-endian)
+    // Extract 20-bit values
     // Byte layout from ADXL355 datasheet:
     // rx[1] = XDATA3 (bits 19-12)
     // rx[2] = XDATA2 (bits 11-4)
-    // rx[3] = XDATA1 (bits 3-0 in upper nibble)
+    // rx[3] = XDATA1 (bits 3-0)
     uint32_t x_u = ((uint32_t)rx[1] << 12) | ((uint32_t)rx[2] << 4) | ((uint32_t)rx[3] >> 4);
     uint32_t y_u = ((uint32_t)rx[4] << 12) | ((uint32_t)rx[5] << 4) | ((uint32_t)rx[6] >> 4);
     uint32_t z_u = ((uint32_t)rx[7] << 12) | ((uint32_t)rx[8] << 4) | ((uint32_t)rx[9] >> 4);
     
-    // Sign extend 20-bit to 32-bit (handle negative values)
+    // Sign extend 20-bit to 32-bit 
     // If bit 19 is set, it's negative in two's complement
     *raw_x = (x_u & 0x80000) ? (int32_t)(x_u | 0xFFF00000) : (int32_t)x_u;
     *raw_y = (y_u & 0x80000) ? (int32_t)(y_u | 0xFFF00000) : (int32_t)y_u;
@@ -196,7 +196,7 @@ static inline void IRAM_ATTR read_adxl355_raw(int32_t *raw_x, int32_t *raw_y, in
  * 
  * SCL3300 uses off-frame protocol:
  * - Send command, get previous command's response
- * - For ISR efficiency, we'll do simplified reads
+ * - For ISR efficiency simplify reads 
  * - Commands from scl3300.h
  * 
  * @param raw_x Output for X-axis raw value
@@ -216,7 +216,7 @@ static inline void IRAM_ATTR read_scl3300_raw(int16_t *raw_x, int16_t *raw_y, in
     //--------------------------------------------------------------------------
     cmd = 0x040000F7u;  // SCL3300_CMD_READ_ACC_X
     
-    // Prime: Send command
+    // Send command
     memset(&t, 0, sizeof(t));
     t.flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
     t.length = 32;
@@ -228,7 +228,7 @@ static inline void IRAM_ATTR read_scl3300_raw(int16_t *raw_x, int16_t *raw_y, in
     
     spi_device_polling_transmit(scl3300_spi_handle, &t);
     
-    // Fetch: Send same command again to get response
+    // Send same command again to get response
     spi_device_polling_transmit(scl3300_spi_handle, &t);
     
     resp = ((uint32_t)t.rx_data[0] << 24) |
@@ -244,7 +244,6 @@ static inline void IRAM_ATTR read_scl3300_raw(int16_t *raw_x, int16_t *raw_y, in
     //--------------------------------------------------------------------------
     cmd = 0x080000FDu;  // SCL3300_CMD_READ_ACC_Y
     
-    // Prime
     memset(&t, 0, sizeof(t));
     t.flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
     t.length = 32;
@@ -256,7 +255,6 @@ static inline void IRAM_ATTR read_scl3300_raw(int16_t *raw_x, int16_t *raw_y, in
     
     spi_device_polling_transmit(scl3300_spi_handle, &t);
     
-    // Fetch
     spi_device_polling_transmit(scl3300_spi_handle, &t);
     
     resp = ((uint32_t)t.rx_data[0] << 24) |
@@ -271,7 +269,6 @@ static inline void IRAM_ATTR read_scl3300_raw(int16_t *raw_x, int16_t *raw_y, in
     //--------------------------------------------------------------------------
     cmd = 0x0C0000FBu;  // SCL3300_CMD_READ_ACC_Z
     
-    // Prime
     memset(&t, 0, sizeof(t));
     t.flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
     t.length = 32;
@@ -283,7 +280,6 @@ static inline void IRAM_ATTR read_scl3300_raw(int16_t *raw_x, int16_t *raw_y, in
     
     spi_device_polling_transmit(scl3300_spi_handle, &t);
     
-    // Fetch
     spi_device_polling_transmit(scl3300_spi_handle, &t);
     
     resp = ((uint32_t)t.rx_data[0] << 24) |
@@ -314,13 +310,7 @@ static inline void IRAM_ATTR read_adt7420_raw(uint16_t *raw_temp)
  * 
  * This is the ONLY place where sensor data is collected.
  * Called every 125 microseconds (8000 Hz)
- * 
- * CRITICAL RULES:
- * - NO function calls (except inline hardware access above)
- * - NO data processing or conversion
- * - NO MQTT, no logging, no printf
- * - Only raw data collection and ring buffer writes
- * - IRAM_ATTR ensures this runs from internal RAM (no flash cache delays)
+
  *****************************************************************************/
 
 static bool IRAM_ATTR timer_isr_handler(gptimer_handle_t timer,
@@ -335,7 +325,7 @@ static bool IRAM_ATTR timer_isr_handler(gptimer_handle_t timer,
     uint32_t current_read_index;
     
     //--------------------------------------------------------------------------
-    // ADXL355 Sampling (2000 Hz - every 4 ticks)
+    // ADXL355 Sampling (1000 Hz - every 8 ticks)
     //--------------------------------------------------------------------------
     if (((tick_counter - ADXL355_OFFSET) & (ADXL355_TICK_DIVISOR - 1)) == 0)
     {
@@ -370,7 +360,7 @@ static bool IRAM_ATTR timer_isr_handler(gptimer_handle_t timer,
     }
     
     //--------------------------------------------------------------------------
-    // SCL3300 Sampling (20 Hz - every 400 ticks)
+    // SCL3300 Sampling (20 Hz: every 400 ticks)
     //--------------------------------------------------------------------------
     if ((tick_counter - SCL3300_OFFSET) % SCL3300_TICK_DIVISOR == 0)
     {
@@ -403,6 +393,7 @@ static bool IRAM_ATTR timer_isr_handler(gptimer_handle_t timer,
         }
     }
     
+    //Commented out since temperature reads were not working well within ISR. Will read temperature from processing task instead at 1 Hz rate.
     //--------------------------------------------------------------------------
     // ADT7420 Sampling (1 Hz - every 8000 ticks)
     //--------------------------------------------------------------------------
@@ -437,7 +428,7 @@ static bool IRAM_ATTR timer_isr_handler(gptimer_handle_t timer,
     }
     */
     
-    // ISR complete - no context switch needed for pure data collection
+    // ISR complete: no context switch needed for pure data collection
     return false;
 }
 
@@ -510,7 +501,7 @@ esp_err_t sensor_acquisition_init(bool temp_sensor_available)
         return ret;
     }
     
-    // Enable timer (but don't start yet)
+    // Enable timer 
     ret = gptimer_enable(s_timer);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to enable timer: %s", esp_err_to_name(ret));
@@ -565,7 +556,7 @@ esp_err_t sensor_acquisition_stop(void)
 
 /******************************************************************************
  * RING BUFFER ACCESS FUNCTIONS
- * (Called by separate processing tasks - NOT in ISR)
+ * (Called by separate processing tasks)
  *****************************************************************************/
 
 // Check if data is available in ADXL355 buffer
@@ -682,7 +673,7 @@ uint32_t adt7420_samples_available(void)
 
 /******************************************************************************
  * DIAGNOSTIC FUNCTIONS
- * (For debugging/monitoring - called outside ISR)
+ * (For debugging/monitoring)
  *****************************************************************************/
 
 void sensor_acquisition_get_stats(uint32_t *samples_acquired,
@@ -714,7 +705,7 @@ void sensor_acquisition_reset_stats(void)
     tick_counter = 0;
 }
 
-// Get overflow counts (indicates buffer overruns)
+// Get overflow counts (buffer overruns)
 uint32_t adxl355_get_overflow_count(void)
 {
     return adxl355_ring_buffer.overflow_count;

@@ -2,12 +2,12 @@
  * @file scl3300.c
  * @brief SCL3300-D01 Inclinometer Driver (SPI) - Corrected Version
  *
- * This version implements the datasheet startup sequence correctly with:
+ * This version implements the datasheet startup sequence with:
  *  - Correct SPI command frames from Table 15
  *  - Proper off-frame protocol handling
  *  - Complete startup sequence from Table 11
- *  - Angle output enablement
- *  - Enhanced error checking and logging
+ *  - Angle output
+ *  - error checking and logging
  *
  * Performance constraints:
  *  - No heap allocation in the read path
@@ -83,7 +83,7 @@ static esp_err_t scl3300_transfer(uint32_t cmd, uint32_t *response)
     t.length = 32;
     t.rxlength = 32;
 
-    // Pack command as big-endian
+    // Pack command
     t.tx_data[0] = (uint8_t)((cmd >> 24) & 0xFF);
     t.tx_data[1] = (uint8_t)((cmd >> 16) & 0xFF);
     t.tx_data[2] = (uint8_t)((cmd >> 8) & 0xFF);
@@ -107,8 +107,8 @@ static esp_err_t scl3300_transfer(uint32_t cmd, uint32_t *response)
 /**
  * @brief Read 16-bit data using the off-frame protocol
  *
- * The device returns the response to the *previous* command.
- * Pattern: send cmd (prime), then send cmd again (fetch).
+ * The device returns the response to the previous command.
+ * Pattern: send cmd, then send cmd again.
  * 
  * @param cmd 32-bit read command
  * @param out Pointer to store 16-bit result
@@ -239,7 +239,7 @@ esp_err_t scl3300_init(void)
         return ret;
     }
 
-    // Third read (retrieves response to second read - should be cleared)
+    // Third read (retrieves response to second read. should be cleared)
     ret = scl3300_transfer(SCL3300_CMD_READ_STATUS, &resp);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "STATUS read 3 failed: %s", esp_err_to_name(ret));
@@ -293,7 +293,7 @@ esp_err_t scl3300_init(void)
 /**
  * @brief Read angle measurements from all three axes
  * 
- * Angles are calculated by the sensor when ANG_CTRL is enabled.
+ * Angles are calculated by the sensor when ANG CTRL is enabled.
  * Conversion: degrees = (raw_value * 90) / 2^14
  */
 esp_err_t scl3300_read_angle(scl3300_angle_t *angle)

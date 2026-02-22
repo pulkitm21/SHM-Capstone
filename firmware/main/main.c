@@ -9,7 +9,7 @@
  *
  * Error Handling:
  *  - Critical failures trigger automatic reboot after delay
- *  - Maximum reboot attempts tracked in RTC memory
+ *  - Maximum reboot attempts tracked in memory
  *  - Prevents infinite reboot loops
  *
  * Data Flow:
@@ -101,7 +101,7 @@ static void init_reboot_counter(void)
 }
 
 /**
- * @brief Clear reboot counter (call after successful initialization)
+ * @brief Clear reboot counter (after successful initialization)
  */
 static void clear_reboot_counter(void)
 {
@@ -110,7 +110,7 @@ static void clear_reboot_counter(void)
 }
 
 /**
- * @brief Handle critical failure - reboot or halt
+ * @brief Handle critical failure: reboot or halt
  *
  * @param reason Description of what failed
  */
@@ -121,7 +121,7 @@ static void handle_critical_failure(const char *reason)
     s_reboot_count++;
 
     if (s_reboot_count >= MAX_REBOOT_ATTEMPTS) {
-        // Too many reboots - halt permanently
+        // Too many reboots: halt permanently
         ESP_LOGE(TAG, "*** MAX REBOOT ATTEMPTS (%d) REACHED ***", MAX_REBOOT_ATTEMPTS);
         ESP_LOGE(TAG, "*** SYSTEM HALTED - POWER CYCLE REQUIRED ***");
         ESP_LOGE(TAG, "*** Check hardware connections and wiring ***");
@@ -296,7 +296,7 @@ static esp_err_t init_mqtt(void)
     ESP_LOGI(TAG, "--- Initializing MQTT ---");
 
     // REQUIRED for MQTT_BROKER_URI = "raspberrypi.local"
-    // Non-fatal: if it fails, MQTT will likely fail to resolve anyway, but we keep running.
+    // Non fatal if it fails.
     esp_err_t mdns_ret = mqtt_mdns_init(ethernet_get_netif());
     if (mdns_ret != ESP_OK) {
         ESP_LOGW(TAG, "mDNS init failed (broker hostname resolution may fail): %s",
@@ -327,10 +327,10 @@ static esp_err_t init_sensors(bool *temp_available)
 
     ESP_LOGI(TAG, "--- Initializing Sensors ---");
 
-    // Force CS pins high before any SPI communication
+    // Force CS pins high before SPI communication
     force_spi_cs_high_early();
 
-    // ADT7420 Temperature Sensor (non-critical - can fail)
+    // ADT7420 Temperature Sensor 
     ESP_LOGI(TAG, "Initializing ADT7420 temperature sensor...");
     ret = adt7420_init();
     if (ret == ESP_OK) {
@@ -346,7 +346,7 @@ static esp_err_t init_sensors(bool *temp_available)
     vTaskDelay(pdMS_TO_TICKS(1));
 #endif
 
-    // ADXL355 Accelerometer (critical - must succeed)
+    // ADXL355 Accelerometer (critical)
     ESP_LOGI(TAG, "Initializing ADXL355 accelerometer...");
     ret = adxl355_init();
     if (ret != ESP_OK) {
@@ -361,7 +361,7 @@ static esp_err_t init_sensors(bool *temp_available)
     vTaskDelay(pdMS_TO_TICKS(1));
 #endif
 
-    // SCL3300 Inclinometer (critical - must succeed)
+    // SCL3300 Inclinometer (critical)
     ESP_LOGI(TAG, "Initializing SCL3300 inclinometer...");
     ret = scl3300_init();
     if (ret != ESP_OK) {

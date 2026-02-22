@@ -6,9 +6,9 @@
  * ================================================
  * 1. SINGLE ISR driven by GPTimer at high frequency (8000 Hz)
  * 2. Staggered sensor sampling to prevent bus conflicts
- * 3. Raw data collection ONLY in ISR - NO function calls, NO processing
+ * 3. Raw data collection ONLY in ISR
  * 4. Lock-free ring buffers for each sensor
- * 5. Minimal ISR overhead for deterministic timing
+ * 5. Minimal ISR overhead
  * 6. Processing happens OUTSIDE the ISR in separate tasks
  *
  * Usage Pattern:
@@ -82,7 +82,7 @@ typedef struct {
  * - ISR for data collection
  *
  * Must be called AFTER all sensors are initialized with their init functions.
- * Does NOT start acquisition - call sensor_acquisition_start() for that.
+ * Does NOT start acquisition: call sensor_acquisition_start() for that.
  *
  * @param[in] temp_sensor_available Set true if ADT7420 initialized successfully
  *
@@ -118,7 +118,7 @@ esp_err_t sensor_acquisition_stop(void);
 /******************************************************************************
  * ADXL355 RING BUFFER ACCESS
  * 
- * Sample rate: 2000 Hz
+ * Sample rate: 1000 Hz
  * Buffer size: 4096 samples (~2 seconds)
  *****************************************************************************/
 
@@ -162,7 +162,7 @@ uint32_t adxl355_get_sample_count(void);
  * SCL3300 RING BUFFER ACCESS
  * 
  * Sample rate: 20 Hz
- * Buffer size: 128 samples (~6 seconds)
+ * Buffer size: 128 samples (6 seconds)
  *****************************************************************************/
 
 /**
@@ -201,7 +201,7 @@ uint32_t scl3300_get_sample_count(void);
  * ADT7420 RING BUFFER ACCESS
  * 
  * Sample rate: 1 Hz
- * Buffer size: 16 samples (~16 seconds)
+ * Buffer size: 16 samples (16 seconds)
  *****************************************************************************/
 
 /**
@@ -269,7 +269,7 @@ uint32_t get_tick_count(void);
  * CONVERSION HELPER MACROS
  * 
  * Use these in your processing task to convert raw values to real units.
- * The actual conversion logic should use the functions from the sensor drivers.
+ * The actual conversion logic should use the functions from  sensor drivers.
  *****************************************************************************/
 
 /**

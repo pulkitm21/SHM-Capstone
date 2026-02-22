@@ -117,14 +117,14 @@ typedef struct {
  * 7. Verify RS bits = '01'
  * 8. WHOAMI verification
  * 
- * Hardware connections (from your spi_bus.h):
+ * Hardware connections (from spi_bus.h):
  * - CS:   GPIO4  (SPI_CS_SCL3300_IO)
- * - MOSI: GPIO2  (SPI_MOSI_IO - shared)
- * - MISO: GPIO15 (SPI_MISO_IO - shared)
- * - SCLK: GPIO14 (SPI_SCLK_IO - shared)
+ * - MOSI: GPIO2  (SPI_MOSI_IO  shared)
+ * - MISO: GPIO15 (SPI_MISO_IO  shared)
+ * - SCLK: GPIO14 (SPI_SCLK_IO  shared)
  * - VDD:  3.0-3.6V
- * - A_EXTC: 100nF capacitor to GND (required)
- * - D_EXTC: 100nF capacitor to GND (required)
+ * - A_EXTC: 100nF capacitor to GND 
+ * - D_EXTC: 100nF capacitor to GND 
  * 
  * @return ESP_OK on success, error code otherwise
  */

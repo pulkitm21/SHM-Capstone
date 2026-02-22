@@ -75,7 +75,7 @@ esp_err_t adt7420_read_temperature(float *temperature)
         return ret;
     }
     
-    // Convert to temperature (13-bit default resolution)
+    // Convert to temperature
     int16_t raw_temp = (data[0] << 8) | data[1];
     raw_temp >>= 3;  // 13-bit resolution, shift out unused bits
     

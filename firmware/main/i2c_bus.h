@@ -21,7 +21,7 @@
 esp_err_t i2c_bus_init(void);
 
 /**
- * @brief Get the I2C bus handle (for adding devices)
+ * @brief Get the I2C bus handle for adding devices
  * @return The I2C bus handle
  */
 i2c_master_bus_handle_t i2c_bus_get_handle(void);

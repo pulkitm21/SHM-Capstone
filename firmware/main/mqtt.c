@@ -8,7 +8,7 @@
  *     Client ID:    wind_turbine_AABBCCDDEEFF
  *     Data topic:   wind_turbine/AABBCCDDEEFF/data
  *     Status topic: wind_turbine/AABBCCDDEEFF/status
- * - No manual configuration is needed; every node is automatically distinguishable.
+ * - No manual configuration is needed.vevery node should be automatically set.
  *
  * BROKER DISCOVERY:
  * - The broker URI uses an mDNS hostname ("raspberrypi.local") instead of a
@@ -64,15 +64,14 @@ static char s_topic_status[TOPIC_MAX_LEN];
 /**
  * @brief Read the Ethernet MAC and build the three identity strings.
  *
- * The Ethernet MAC is used (not Wi-Fi) because this device connects via
- * the Olimex ESP32-POE-ISO board's Ethernet port.
- *   - Burned into ESP32 eFuse at manufacture is globally unique, never changes.
+ *   - Ethernet MAC is used.
+ *   - Burnt into ESP32, is globally unique, and never changes.
  *   - Available immediately, before DHCP assigns an IP.
  *   - Matches the MAC visible on the network switch,
- *     which makes it easy to cross-reference during debugging.
+ *     makes it easy to reference during debugging.
  *
- * If esp_read_mac() fails for any reason, we fall back to a fixed placeholder
- * so the rest of the init can still proceed (and the error is logged clearly).
+ * If esp_read_mac() fails for any reason, fall back to a fixed placeholder
+ * so the rest of the init can still proceed.
  */
 static void build_identity_strings(void)
 {
@@ -155,19 +154,7 @@ esp_err_t mqtt_mdns_init(esp_netif_t *netif)
     build_identity_strings();
 
     /*
-     * Initialize the mDNS service and bind it to the provided netif.
-     *
-     * This MUST be called after ethernet_wait_for_ip() succeeds, because mDNS
-     * sends and receives multicast packets over the network interface — it needs
-     * the link to be up and an IP assigned before it can function correctly.
-     *
-     *  call order in main.c:
-     *
-     *   ethernet_init();
-     *   ethernet_wait_for_ip(10000);
-     *   mqtt_mdns_init(ethernet_get_netif());   // <-- here
-     *   mqtt_init();
-     *   mqtt_wait_for_connection(10000);
+     * Initialize the mDNS service. binds it to the provided netif.
      */
     esp_err_t ret = mdns_init();
 
@@ -177,14 +164,8 @@ esp_err_t mqtt_mdns_init(esp_netif_t *netif)
     }
 
     /*
-     * Give this node a hostname so it also appears on the network as an mDNS
-     * responder (useful for debugging — you can ping it by name from the Pi).
-     * The hostname is derived from the client ID built earlier, e.g.
-     * "wind-turbine-AABBCCDDEEFF". Hyphens are used because mDNS hostnames
-     * must not contain underscores per RFC 6762.
-     *
-     * Note: build_identity_strings() uses underscores in the MQTT client ID
-     * (required by the MQTT spec), but mDNS hostnames use hyphens instead.
+     * Give this node a hostname based on the client ID (which includes the MAC address).
+     * This allows the MQTT broker to resolve "raspberrypi.local" at connect time
      */
     char mdns_hostname[CLIENT_ID_MAX_LEN];
     // Replace underscores with hyphens for the mDNS hostname
@@ -338,7 +319,7 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
     // Close accelerometer array
     offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, "]");
 
-    // Inclinometer - ALWAYS include field, but use null if invalid
+    // Inclinometer: ALWAYS include field, use null if invalid
     if (packet->has_angle) {
         if (packet->angle_valid) {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
@@ -350,7 +331,7 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
         }
     }
 
-    // Temperature - ALWAYS include field, but use null if invalid
+    // Temperature ALWAYS include field, use null if invalid
     if (packet->has_temp) {
         if (packet->temp_valid) {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,

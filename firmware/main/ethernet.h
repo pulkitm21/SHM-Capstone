@@ -39,7 +39,7 @@ bool ethernet_is_connected(void);
 esp_err_t ethernet_get_ip_info(esp_netif_ip_info_t *ip_info);
 
 /**
- * @brief Access the underlying esp_netif (useful for advanced netif ops).
+ * @brief Access the underlying esp_netif.
  *
  * Pass the returned handle to mqtt_mdns_init() to bind mDNS to this interface.
  * This enables broker hostname resolution ("raspberrypi.local") without a
