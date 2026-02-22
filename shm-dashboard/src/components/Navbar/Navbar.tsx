@@ -1,4 +1,4 @@
-import { NavLink } from "react-router-dom";
+import { NavLink, useNavigate } from "react-router-dom";
 import "./Navbar.css";
 
 interface NavItem {
@@ -9,11 +9,18 @@ interface NavItem {
 }
 
 const navItems: NavItem[] = [
-  { id: "home", label: "Home", icon: "📈", to: "/" },
-  { id: "export", label: "Export", icon: "📈", to: "/export" },
+  { id: "home", label: "Home", icon: "🏠︎", to: "/" },
+  { id: "export", label: "Export", icon: "💾", to: "/export" },
 ];
 
 const Navbar = () => {
+  const navigate = useNavigate();
+
+  function handleLogout() {
+    sessionStorage.removeItem("isAuth");
+    navigate("/login", { replace: true });
+  }
+
   return (
     <nav className="navbar">
       <div className="navbar-title-block">
@@ -25,7 +32,7 @@ const Navbar = () => {
           <li key={item.id}>
             <NavLink
               to={item.to}
-              end={item.to === "/"}
+              end={item.to === "/"} 
               className={({ isActive }) =>
                 `navbar-item ${isActive ? "active" : ""}`
               }
@@ -36,6 +43,12 @@ const Navbar = () => {
           </li>
         ))}
       </ul>
+
+      <div className="navbar-footer">
+        <button className="logout-button" onClick={handleLogout}>
+          Logout
+        </button>
+      </div>
     </nav>
   );
 };
