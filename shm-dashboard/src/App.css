@@ -13,7 +13,7 @@ body {
 
 
 .main {
-  margin-left: 275px;               /* navbar width */
-  width: calc(100% - 275px);
+  margin-left: 250px;               /* navbar width */
+  width: calc(100% - margin-left); 
   min-height: 100vh;
 }

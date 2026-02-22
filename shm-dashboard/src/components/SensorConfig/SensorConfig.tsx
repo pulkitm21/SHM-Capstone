@@ -3,15 +3,15 @@ import "./SensorConfig.css";
 
 export type SensorConfig = {
   samplingRate: "100" | "200" | "400";
-  measurementRange: "2g" | "4g" | "8g";
-  lowPassFilter: "none" | "50" | "100";
-  highPassFilter: "none" | "1" | "5";
+  measurementRange: "2g" | "4g" | "6g";
+  lowPassFilter: "none" | "on";
+  highPassFilter: "none" | "on";
 };
 
 const DEFAULT_CONFIG: SensorConfig = {
-  samplingRate: "400",
+  samplingRate: "200",
   measurementRange: "2g",
-  lowPassFilter: "100",
+  lowPassFilter: "none",
   highPassFilter: "none",
 };
 
@@ -99,7 +99,7 @@ export default function SensorConfigCard({
 
           {isEditing ? (
             <div className="sc-pill-group">
-              {(["2g", "4g", "8g"] as const).map((v) => (
+              {(["2g", "4g", "6g"] as const).map((v) => (
                 <button
                   key={v}
                   type="button"
@@ -120,21 +120,19 @@ export default function SensorConfigCard({
 
           {isEditing ? (
             <div className="sc-pill-group">
-              {(["none", "50", "100"] as const).map((v) => (
+              {(["none", "on"] as const).map((v) => (
                 <button
                   key={v}
                   type="button"
                   className={`sc-pill ${draft.lowPassFilter === v ? "active" : ""}`}
                   onClick={() => setDraft((d) => ({ ...d, lowPassFilter: v }))}
                 >
-                  {v === "none" ? "None" : `${v} Hz`}
+                  {v === "none" ? "None" : "On"}
                 </button>
               ))}
             </div>
           ) : (
-            <span className="sc-pill">
-              {safeConfig.lowPassFilter === "none" ? "None" : `${safeConfig.lowPassFilter} Hz`}
-            </span>
+            <span className="sc-pill">{safeConfig.lowPassFilter === "none" ? "None" : "On"}</span>
           )}
         </div>
 
@@ -143,25 +141,21 @@ export default function SensorConfigCard({
 
           {isEditing ? (
             <div className="sc-pill-group">
-              {(["none", "1", "5"] as const).map((v) => (
+              {(["none", "on"] as const).map((v) => (
                 <button
                   key={v}
                   type="button"
                   className={`sc-pill ${draft.highPassFilter === v ? "active" : ""}`}
                   onClick={() => setDraft((d) => ({ ...d, highPassFilter: v }))}
                 >
-                  {v === "none" ? "None" : `${v} Hz`}
+                  {v === "none" ? "None" : "On"}
                 </button>
               ))}
             </div>
           ) : (
-            <span className="sc-pill">
-              {safeConfig.highPassFilter === "none" ? "None" : `${safeConfig.highPassFilter} Hz`}
-            </span>
+            <span className="sc-pill">{safeConfig.highPassFilter === "none" ? "None" : "On"}</span>
           )}
         </div>
-
-        {/* RMS warning threshold removed */}
       </div>
     </div>
   );

@@ -4,7 +4,7 @@ import "./Login.css";
 
 function Login() {
 
-  const [Id, setId] = useState("");
+  const [userId, setUserId] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
 
@@ -15,13 +15,13 @@ function Login() {
     e.preventDefault();
     setError("");
 
-    // Entry Validation
-    if (!Id.trim() || !password.trim()) {
+    // Entry Validation - Currently just checks for empty fields
+    if (!userId.trim() || !password.trim()) {
       setError("Please enter both UserID and password.");
       return;
     }
 
-    // Add Backend Authentication Here
+    // Add Backend Authentication Here, currently sets isAuth to true for any non-empty credentials
     sessionStorage.setItem("isAuth", "true");
 
     navigate("/", { replace: true });
@@ -39,8 +39,8 @@ return (
                 <input
                     className="loginInput"
                     type="text"
-                    value={Id}
-                    onChange={(e) => setId(e.target.value)}
+                    value={userId}
+                    onChange={(e) => setUserId(e.target.value)}
                     placeholder="UserID"
                 />
                 </label>

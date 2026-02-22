@@ -1,5 +1,6 @@
-import { useMemo } from "react";
 import "./SensorFilter.css";
+
+// This component does NOT perform any data filtering.
 
 export type SensorValue = "accelerometer" | "inclinometer" | "temperature";
 
@@ -34,15 +35,18 @@ export default function SensorFilters({
   onChannelChange,
   onExport,
 }: Props) {
-  const channelOptions = useMemo(() => {
-    return channelOptionsBySensor[sensor] ?? [{ label: "All", value: "all" }];
-  }, [channelOptionsBySensor, sensor]);
+  const channelOptions =
+    channelOptionsBySensor[sensor] ?? [{ label: "All", value: "all" }];
 
   return (
     <div className="filters-row">
       <div className="control-box">
         <label className="control-label">Sensor</label>
-        <select className="control-select" value={sensor} onChange={(e) => onSensorChange(e.target.value as SensorValue)}>
+        <select
+          className="control-select"
+          value={sensor}
+          onChange={(e) => onSensorChange(e.target.value as SensorValue)}
+        >
           {sensorOptions.map((opt) => (
             <option key={opt.value} value={opt.value}>
               {opt.label}
@@ -53,7 +57,11 @@ export default function SensorFilters({
 
       <div className="control-box">
         <label className="control-label">Timeframe</label>
-        <select className="control-select" value={timeframeMin} onChange={(e) => onTimeframeChange(Number(e.target.value))}>
+        <select
+          className="control-select"
+          value={timeframeMin}
+          onChange={(e) => onTimeframeChange(Number(e.target.value))}
+        >
           {timeframeOptions.map((opt) => (
             <option key={opt.minutes} value={opt.minutes}>
               {opt.label}
@@ -64,7 +72,11 @@ export default function SensorFilters({
 
       <div className="control-box">
         <label className="control-label">Channel</label>
-        <select className="control-select" value={channel} onChange={(e) => onChannelChange(e.target.value)}>
+        <select
+          className="control-select"
+          value={channel}
+          onChange={(e) => onChannelChange(e.target.value)}
+        >
           {channelOptions.map((opt) => (
             <option key={opt.value} value={opt.value}>
               {opt.label}
