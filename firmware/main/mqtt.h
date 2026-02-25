@@ -61,17 +61,32 @@ extern "C" {
  * DATA STRUCTURES
  *****************************************************************************/
 
+/**
+ * @brief Single accelerometer sample with per-sample validity flag.
+ *
+ * valid = false means this sample was flagged as garbage by the processing
+ * task (floating MISO, rail value, or physically impossible magnitude) and
+ * will be serialized as JSON null instead of [x, y, z].
+ */
 typedef struct {
     float x;
     float y;
     float z;
+    bool valid;     /**< false → serialize as null in JSON "a" array */
 } mqtt_accel_sample_t;
 
-/*Sensor data packet with validity flags*/
+/**
+ * @brief Sensor data packet with validity flags.
+ *
+ * DATA INTEGRITY RULES:
+ * - has_angle / has_temp:     whether to include the field in JSON at all
+ * - angle_valid / temp_valid: true = show values, false = show null
+ * - accel[i].valid:           per-sample flag; false = publish that sample as null
+ */
 typedef struct {
     uint32_t timestamp;
 
-    // Accelerometer (always present)
+    // Accelerometer (always present, but individual samples may be null)
     mqtt_accel_sample_t accel[MQTT_ACCEL_BATCH_SIZE];
     int accel_count;
 
@@ -105,7 +120,7 @@ typedef struct {
  *   mqtt_init();
  *   mqtt_wait_for_connection(10000);
  *
- * @param netif  The Ethernet netif handle (from ethernet_get_netif()s).
+ * @param netif  The Ethernet netif handle (from ethernet_get_netif()).
  * @return ESP_OK on success, or an error code.
  */
 esp_err_t mqtt_mdns_init(esp_netif_t *netif);

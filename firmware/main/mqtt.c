@@ -8,7 +8,7 @@
  *     Client ID:    wind_turbine_AABBCCDDEEFF
  *     Data topic:   wind_turbine/AABBCCDDEEFF/data
  *     Status topic: wind_turbine/AABBCCDDEEFF/status
- * - No manual configuration is needed.vevery node should be automatically set.
+ * - No manual configuration is needed. every node should be automatically set.
  *
  * BROKER DISCOVERY:
  * - The broker URI uses an mDNS hostname ("raspberrypi.local") instead of a
@@ -18,7 +18,8 @@
  *
  * DATA INTEGRITY:
  * - Invalid/stale sensor data shows as "null" in JSON
- * - Every reading is 100% accurate or marked as missing
+ * - Individual accelerometer samples flagged as garbage also publish as null
+ * - Every reading is accurate or marked as missing
  */
 
 #include "mqtt.h"
@@ -199,7 +200,7 @@ esp_err_t mqtt_init(void)
     ESP_LOGI(TAG, "  Client ID: %s", s_client_id);
     ESP_LOGI(TAG, "  Data topic:   %s", s_topic_data);
     ESP_LOGI(TAG, "  Status topic: %s", s_topic_status);
-    ESP_LOGI(TAG, "  Data integrity: null for invalid/stale data");
+    ESP_LOGI(TAG, "  Data integrity: null for invalid/stale/garbage data");
 
     s_mqtt_event_group = xEventGroupCreate();
     if (s_mqtt_event_group == NULL) {
@@ -286,10 +287,10 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
     /*
      * JSON FORMAT:
      * {
-     *   "t": 123456789,                              // Timestamp (always present)
-     *   "a": [[x,y,z], [x,y,z], ...],                // Accelerometer (always present)
-     *   "i": [x, y, z] OR null,                      // Inclinometer (null if invalid)
-     *   "T": 21.5 OR null                            // Temperature (null if invalid)
+     *   "t": 123456789,                        // Timestamp (microseconds since boot)
+     *   "a": [[x,y,z], null, [x,y,z], ...],    // Accel — null if sample was garbage
+     *   "i": [x, y, z] OR null,                // Inclinometer — null if invalid/garbage
+     *   "T": 21.5 OR null                      // Temperature — null if invalid
      * }
      */
 
@@ -299,16 +300,21 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
     offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
                        "{\"t\":%lu,\"a\":[", (unsigned long)packet->timestamp);
 
-    // Accelerometer array (always present)
+    // Accelerometer array — valid samples serialize as [x,y,z], garbage samples as null
     for (int i = 0; i < packet->accel_count && i < MQTT_ACCEL_BATCH_SIZE; i++) {
         if (i > 0) {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, ",");
         }
-        offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                           "[%.4f,%.4f,%.4f]",
-                           packet->accel[i].x,
-                           packet->accel[i].y,
-                           packet->accel[i].z);
+
+        if (packet->accel[i].valid) {
+            offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
+                               "[%.4f,%.4f,%.4f]",
+                               packet->accel[i].x,
+                               packet->accel[i].y,
+                               packet->accel[i].z);
+        } else {
+            offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, "null");
+        }
 
         if (offset >= JSON_BUFFER_SIZE - 100) {
             ESP_LOGE(TAG, "JSON buffer overflow!");
@@ -319,7 +325,7 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
     // Close accelerometer array
     offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, "]");
 
-    // Inclinometer: ALWAYS include field, use null if invalid
+    // Inclinometer: always include field, use null if invalid
     if (packet->has_angle) {
         if (packet->angle_valid) {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
@@ -331,7 +337,7 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
         }
     }
 
-    // Temperature ALWAYS include field, use null if invalid
+    // Temperature: always include field, use null if invalid
     if (packet->has_temp) {
         if (packet->temp_valid) {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
@@ -358,7 +364,7 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
     ESP_LOGD(TAG, "Published %d bytes to %s (%d accel, angle=%s, temp=%s)",
              offset, s_topic_data, packet->accel_count,
              packet->angle_valid ? "valid" : "NULL",
-             packet->temp_valid ? "valid" : "NULL");
+             packet->temp_valid  ? "valid" : "NULL");
 
     return ESP_OK;
 }
