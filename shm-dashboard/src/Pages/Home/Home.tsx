@@ -8,22 +8,10 @@ import FaultLog from "../../components/FaultLog/Log";
 import SensorFilters, { type SensorValue } from "../../components/SensorFilter/SensorFilter";
 
 import SensorLineChart from "../../components/SensorPlot/SensorPlot";
-import type { SensorPoint } from "../../components/SensorPlot/SensorPlot";
+
+import { getSettings, putSettings, getSensorData, type ApiResponse } from "../../services/api";
 
 import "./Home.css";
-
-const API_BASE = import.meta.env.VITE_API_BASE_URL;
-
-type ApiResponse = {
-  sensor: string;
-  unit: string;
-  points: SensorPoint[];
-};
-
-type SettingsResponse = {
-  meta: Record<string, SensorMeta>;
-  config: Record<string, SensorConfig>;
-};
 
 const SENSOR_OPTIONS = [
   { label: "Accelerometer", value: "accelerometer" },
@@ -88,13 +76,13 @@ const FALLBACK_CONFIG: Record<SensorValue, SensorConfig> = {
   accelerometer: {
     samplingRate: "400",
     measurementRange: "2g",
-    lowPassFilter: "100",
+    lowPassFilter: "none",
     highPassFilter: "none",
   },
   inclinometer: {
     samplingRate: "200",
     measurementRange: "2g",
-    lowPassFilter: "50",
+    lowPassFilter: "none",
     highPassFilter: "none",
   },
   temperature: {
@@ -105,14 +93,6 @@ const FALLBACK_CONFIG: Record<SensorValue, SensorConfig> = {
   },
 };
 
-function buildQuery(params: Record<string, string | number | undefined>) {
-  const qs = new URLSearchParams();
-  Object.entries(params).forEach(([k, v]) => {
-    if (v === undefined) return;
-    qs.set(k, String(v));
-  });
-  return qs.toString();
-}
 
 export default function Home() {
   const navigate = useNavigate();
@@ -129,23 +109,21 @@ export default function Home() {
   const [configBySensor, setConfigBySensor] = useState<Record<SensorValue, SensorConfig>>(FALLBACK_CONFIG);
   const [settingsStatus, setSettingsStatus] = useState<string>("");
 
-  // Load settings from backend once
+  // Load settings from backend once on mount
   useEffect(() => {
     async function loadSettings() {
       try {
         setSettingsStatus("Loading settings…");
-        const res = await fetch(`${API_BASE}/api/settings`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const json = (await res.json()) as SettingsResponse;
+        const json = await getSettings();
 
-        // merge into fallbacks in case backend missing keys
         setMetaBySensor((prev) => ({
           ...prev,
-          ...(json.meta as any),
+          ...(json.meta as Record<string, SensorMeta>),
         }));
+
         setConfigBySensor((prev) => ({
           ...prev,
-          ...(json.config as any),
+          ...(json.config as Record<string, SensorConfig>),
         }));
 
         setSettingsStatus("");
@@ -158,19 +136,13 @@ export default function Home() {
     loadSettings();
   }, []);
 
-  async function saveSettings(nextMeta: Record<SensorValue, SensorMeta>, nextConfig: Record<SensorValue, SensorConfig>) {
+  async function saveSettings(
+    nextMeta: Record<SensorValue, SensorMeta>,
+    nextConfig: Record<SensorValue, SensorConfig>
+  ) {
     try {
       setSettingsStatus("Saving…");
-      const res = await fetch(`${API_BASE}/api/settings`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          meta: nextMeta,
-          config: nextConfig,
-        }),
-      });
-
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      await putSettings({ meta: nextMeta, config: nextConfig });
       setSettingsStatus("");
     } catch (e: any) {
       console.error(e);
@@ -204,13 +176,8 @@ export default function Home() {
         setApiData(null);
 
         const endpoint = ENDPOINT_BY_SENSOR[sensor];
-        const query = buildQuery({ minutes: timeframeMin, channel });
-        const url = `${API_BASE}${endpoint}?${query}`;
+        const json = await getSensorData(endpoint, { minutes: timeframeMin, channel });
 
-        const res = await fetch(url);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-        const json = (await res.json()) as ApiResponse;
         setApiData(json);
         setPlotStatus("Loaded");
       } catch (err: any) {
@@ -255,14 +222,14 @@ export default function Home() {
       <div className="sc-plot-card">
         <p style={{ margin: 0 }}>{plotStatus}</p>
         {apiData && (
-          <SensorLineChart
-            title={SENSOR_OPTIONS.find((s) => s.value === sensor)?.label ?? "Sensor"}
-            sensorKey={apiData.sensor}
-            unit={apiData.unit}
-            points={apiData.points}
-            height={420}
-          />
-        )}
+        <SensorLineChart
+          title={SENSOR_OPTIONS.find((s) => s.value === sensor)?.label ?? "Sensor"}
+          sensorKey={apiData.sensor ?? sensor}
+          unit={apiData.unit ?? ""}
+          points={apiData.points.map((p) => ({ ts: p.t, value: p.v }))}
+          height={420}
+        />
+      )}
       </div>
     </div>
   );
