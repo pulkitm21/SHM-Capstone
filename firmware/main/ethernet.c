@@ -6,9 +6,15 @@
  *  - Router/DHCP networks (wait_for_ip uses IP_EVENT_ETH_GOT_IP)
  *  - Direct PC <-> switch <-> ESP32 networks (no DHCP):
  *        call ethernet_set_static_ip(...)
+ *
+ * FAULT LOGGING:
+ *  - FAULT_ETH_LINK_DOWN (1)      logged on ETHERNET_EVENT_DISCONNECTED
+ *  - FAULT_ETH_LINK_RECOVERED (2) logged on ETHERNET_EVENT_CONNECTED
+ *  - FAULT_ETH_NO_IP (3)          logged on ethernet_wait_for_ip() timeout
  */
 
 #include "ethernet.h"
+#include "fault_log.h"
 
 #include <stdlib.h>
 
@@ -24,10 +30,8 @@
 
 #include "driver/gpio.h"
 
-// Needed for IP4_ADDR macro
 #include "lwip/inet.h"
 
-// From the ESP-IDF "ethernet_init" helper component (managed component)
 #include "ethernet_init.h"
 
 static const char *TAG = "ethernet";
@@ -35,7 +39,7 @@ static const char *TAG = "ethernet";
 /*******************************************************************************
  * GPIO Configuration for ESP32-POE-ISO
  ******************************************************************************/
-#define PHY_RESET_GPIO      GPIO_NUM_12     // PHY reset pin (active low)
+#define PHY_RESET_GPIO      GPIO_NUM_12
 #define PHY_RESET_HOLD_MS   300
 #define PHY_STABILIZE_MS    50
 
@@ -51,7 +55,6 @@ static esp_eth_handle_t s_eth_handle = NULL;
 static esp_eth_netif_glue_handle_t s_eth_glue = NULL;
 static bool s_initialized = false;
 
-// ethernet_init_all() allocates an array of handles
 static esp_eth_handle_t *s_eth_handles = NULL;
 static uint8_t s_eth_port_cnt = 0;
 
@@ -77,6 +80,8 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
         if (s_eth_event_group) {
             xEventGroupSetBits(s_eth_event_group, ETH_CONNECTED_BIT);
         }
+        /* FAULT 2: Ethernet link came back up */
+        fault_log_record(FAULT_ETH_LINK_RECOVERED);
         break;
 
     case ETHERNET_EVENT_DISCONNECTED:
@@ -84,6 +89,8 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
         if (s_eth_event_group) {
             xEventGroupClearBits(s_eth_event_group, ETH_CONNECTED_BIT | ETH_GOT_IP_BIT);
         }
+        /* FAULT 1: Ethernet link lost */
+        fault_log_record(FAULT_ETH_LINK_DOWN);
         break;
 
     case ETHERNET_EVENT_START:
@@ -165,7 +172,6 @@ esp_err_t ethernet_init(void)
         return ESP_FAIL;
     }
 
-    // Create netif + default loop 
     ret = esp_netif_init();
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "esp_netif_init failed: %s", esp_err_to_name(ret));
@@ -265,7 +271,6 @@ esp_err_t ethernet_set_static_ip(uint8_t a, uint8_t b, uint8_t c, uint8_t d)
         return ESP_FAIL;
     }
 
-    // Stop DHCP client (no router/DHCP case)
     esp_err_t ret = esp_netif_dhcpc_stop(s_eth_netif);
     if (ret != ESP_OK && ret != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
         ESP_LOGE(TAG, "dhcpc_stop failed: %s", esp_err_to_name(ret));
@@ -275,7 +280,7 @@ esp_err_t ethernet_set_static_ip(uint8_t a, uint8_t b, uint8_t c, uint8_t d)
     esp_netif_ip_info_t ip_info = {0};
     IP4_ADDR(&ip_info.ip, a, b, c, d);
     IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
-    IP4_ADDR(&ip_info.gw, 0, 0, 0, 0); // no gateway for direct switch
+    IP4_ADDR(&ip_info.gw, 0, 0, 0, 0);
 
     ret = esp_netif_set_ip_info(s_eth_netif, &ip_info);
     if (ret != ESP_OK) {
@@ -283,7 +288,6 @@ esp_err_t ethernet_set_static_ip(uint8_t a, uint8_t b, uint8_t c, uint8_t d)
         return ret;
     }
 
-    // ethernet_wait_for_ip() can succeed even without DHCP
     if (s_eth_event_group) {
         xEventGroupSetBits(s_eth_event_group, ETH_GOT_IP_BIT);
     }
@@ -312,7 +316,10 @@ esp_err_t ethernet_wait_for_ip(uint32_t timeout_ms)
     if (bits & ETH_GOT_IP_BIT) {
         return ESP_OK;
     }
+
     ESP_LOGW(TAG, "Timeout waiting for IP address");
+    /* FAULT 3: Failed to obtain IP within the timeout */
+    fault_log_record(FAULT_ETH_NO_IP);
     return ESP_ERR_TIMEOUT;
 }
 

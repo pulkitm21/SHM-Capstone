@@ -6,7 +6,6 @@
  * - If no data received this cycle → shows "null" in JSON
  * - Garbage accelerometer samples → that sample published as null in "a" array
  * - Garbage inclinometer reading → "i" field published as null
- * - Fault logging enabled for debugging
  *
  * GARBAGE DETECTION:
  * Accelerometer (ADXL355, ±2g range, 20-bit raw):
@@ -18,9 +17,19 @@
  *   - All three raw axes == 0 → stuck read / floating MISO low
  *   - Any axis near 16-bit rail (±32700) → floating MISO high
  *   - Any converted angle magnitude > 91° → physically impossible
+ *
+ * FAULT LOGGING:
+ * - FAULT_ADXL355_DROPPED (7): logged when adxl355 overflow counter increases
+ * - FAULT_SCL3300_DROPPED (8): logged when scl3300 overflow counter increases
+ * - FAULT_ADT7420_DROPPED (9): logged when adt7420 overflow counter increases
+ * - FAULT_SPI_ERROR (17):      logged on mid-run SPI read failure (inclinometer)
+ * - FAULT_I2C_ERROR (18):      logged on mid-run I2C read failure (temperature)
+ * Fault codes are batched into the next outgoing MQTT packet automatically
+ * via fault_log_append_to_json() called inside mqtt_publish_sensor_data().
  */
 
 #include "data_processing_and_mqtt_task.h"
+#include "fault_log.h"
 #include "sensor_task.h"
 #include "adt7420.h"
 #include "mqtt.h"
@@ -50,7 +59,7 @@ static volatile uint32_t s_incl_garbage_count = 0;
 static float     s_accel_x[ACCEL_SAMPLES_PER_BATCH];
 static float     s_accel_y[ACCEL_SAMPLES_PER_BATCH];
 static float     s_accel_z[ACCEL_SAMPLES_PER_BATCH];
-static bool      s_accel_valid[ACCEL_SAMPLES_PER_BATCH];  // per-sample garbage flag
+static bool      s_accel_valid[ACCEL_SAMPLES_PER_BATCH];
 static uint32_t  s_accel_ticks[ACCEL_SAMPLES_PER_BATCH];
 
 // Temperature reading interval
@@ -58,21 +67,6 @@ static uint32_t  s_accel_ticks[ACCEL_SAMPLES_PER_BATCH];
 
 /******************************************************************************
  * GARBAGE DETECTION THRESHOLDS
- *
- * ACCEL_GARBAGE_THRESHOLD_G:
- *   ADXL355 is configured for ±2g. We allow up to 3g before flagging to give
- *   headroom for real vibration peaks without false positives.
- *   Increase this if your application sees legitimate shock events above 3g.
- *
- * ACCEL_RAW_RAIL_THRESHOLD:
- *   20-bit max = 524287. Values within ~5% of the rail almost certainly mean
- *   a floating or disconnected MISO line rather than a real reading.
- *
- * INCL_GARBAGE_THRESHOLD_DEG:
- *   SCL3300 angle output range is ±90°. Anything beyond 91° is impossible.
- *
- * INCL_RAW_RAIL_THRESHOLD:
- *   16-bit max = 32767. Values near the rail indicate a bad read.
  *****************************************************************************/
 #define ACCEL_GARBAGE_THRESHOLD_G    3.0f
 #define ACCEL_RAW_RAIL_THRESHOLD     500000
@@ -97,29 +91,16 @@ static inline float convert_scl3300_to_deg(int16_t raw)
  * GARBAGE DETECTION
  *****************************************************************************/
 
-/**
- * @brief Returns true if the decimated ADXL355 raw sample looks like garbage.
- *
- * Called on the AVERAGED raw values after decimation. Three checks:
- *   1. All-zero: all axes == 0 simultaneously (stuck / MISO floating low)
- *   2. Rail:     any axis near 20-bit max/min (MISO floating high)
- *   3. Physical: converted g exceeds ±2g sensor limit + margin
- */
 static bool is_accel_garbage(int32_t raw_x, int32_t raw_y, int32_t raw_z)
 {
-    // Check 1: all axes exactly zero
-    if (raw_x == 0 && raw_y == 0 && raw_z == 0) {
-        return true;
-    }
+    if (raw_x == 0 && raw_y == 0 && raw_z == 0) return true;
 
-    // Check 2: any axis near 20-bit rail
     if (raw_x >  ACCEL_RAW_RAIL_THRESHOLD || raw_x < -ACCEL_RAW_RAIL_THRESHOLD ||
         raw_y >  ACCEL_RAW_RAIL_THRESHOLD || raw_y < -ACCEL_RAW_RAIL_THRESHOLD ||
         raw_z >  ACCEL_RAW_RAIL_THRESHOLD || raw_z < -ACCEL_RAW_RAIL_THRESHOLD) {
         return true;
     }
 
-    // Check 3: converted value exceeds physical limit
     if (fabsf(convert_adxl355_to_g(raw_x)) > ACCEL_GARBAGE_THRESHOLD_G ||
         fabsf(convert_adxl355_to_g(raw_y)) > ACCEL_GARBAGE_THRESHOLD_G ||
         fabsf(convert_adxl355_to_g(raw_z)) > ACCEL_GARBAGE_THRESHOLD_G) {
@@ -129,29 +110,16 @@ static bool is_accel_garbage(int32_t raw_x, int32_t raw_y, int32_t raw_z)
     return false;
 }
 
-/**
- * @brief Returns true if the SCL3300 raw angle sample looks like garbage.
- *
- * Three checks:
- *   1. All-zero: all axes == 0 simultaneously (stuck / MISO floating low)
- *   2. Rail:     any axis near 16-bit max/min (MISO floating high)
- *   3. Physical: converted angle exceeds ±90° (impossible for tilt sensor)
- */
 static bool is_incl_garbage(int16_t raw_x, int16_t raw_y, int16_t raw_z)
 {
-    // Check 1: all axes exactly zero
-    if (raw_x == 0 && raw_y == 0 && raw_z == 0) {
-        return true;
-    }
+    if (raw_x == 0 && raw_y == 0 && raw_z == 0) return true;
 
-    // Check 2: any axis near 16-bit rail
     if (raw_x >  INCL_RAW_RAIL_THRESHOLD || raw_x < -INCL_RAW_RAIL_THRESHOLD ||
         raw_y >  INCL_RAW_RAIL_THRESHOLD || raw_y < -INCL_RAW_RAIL_THRESHOLD ||
         raw_z >  INCL_RAW_RAIL_THRESHOLD || raw_z < -INCL_RAW_RAIL_THRESHOLD) {
         return true;
     }
 
-    // Check 3: converted angle exceeds physical range
     if (fabsf(convert_scl3300_to_deg(raw_x)) > INCL_GARBAGE_THRESHOLD_DEG ||
         fabsf(convert_scl3300_to_deg(raw_y)) > INCL_GARBAGE_THRESHOLD_DEG ||
         fabsf(convert_scl3300_to_deg(raw_z)) > INCL_GARBAGE_THRESHOLD_DEG) {
@@ -182,7 +150,6 @@ static void data_processing_task(void *pvParameters)
     int accel_batch_count = 0;
     uint32_t first_tick = 0;
 
-    // Decimation accumulators (average ACCEL_DECIM_FACTOR raw samples to 1 output sample)
     int decim_count = 0;
     int64_t sum_x = 0;
     int64_t sum_y = 0;
@@ -200,12 +167,49 @@ static void data_processing_task(void *pvParameters)
     float current_incl_z = 0.0f;
     bool incl_valid = false;
 
+    /* Overflow counters from previous cycle — used to detect new drops */
+    uint32_t prev_adxl355_overflow = 0;
+    uint32_t prev_scl3300_overflow = 0;
+    uint32_t prev_adt7420_overflow = 0;
+
     while (s_task_running) {
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
-        // =====================================================================
-        // Read Temperature directly via I2C (every 1 second)
-        // =====================================================================
+        /* =================================================================
+         * FAULT CHECK: ring buffer overflows (sample drops)
+         * Compare current overflow counters to previous cycle values.
+         * If any increased, record the appropriate fault code.
+         * This is the safe way to detect ISR-originated drops from task
+         * context without needing to call fault_log_record() from the ISR.
+         * ================================================================= */
+        uint32_t cur_adxl355_overflow = adxl355_get_overflow_count();
+        uint32_t cur_scl3300_overflow = scl3300_get_overflow_count();
+        uint32_t cur_adt7420_overflow = adt7420_get_overflow_count();
+
+        if (cur_adxl355_overflow != prev_adxl355_overflow) {
+            fault_log_record(FAULT_ADXL355_DROPPED);
+            ESP_LOGW(TAG, "ADXL355 samples dropped (overflow count: %lu)",
+                     (unsigned long)cur_adxl355_overflow);
+            prev_adxl355_overflow = cur_adxl355_overflow;
+        }
+
+        if (cur_scl3300_overflow != prev_scl3300_overflow) {
+            fault_log_record(FAULT_SCL3300_DROPPED);
+            ESP_LOGW(TAG, "SCL3300 samples dropped (overflow count: %lu)",
+                     (unsigned long)cur_scl3300_overflow);
+            prev_scl3300_overflow = cur_scl3300_overflow;
+        }
+
+        if (cur_adt7420_overflow != prev_adt7420_overflow) {
+            fault_log_record(FAULT_ADT7420_DROPPED);
+            ESP_LOGW(TAG, "ADT7420 samples dropped (overflow count: %lu)",
+                     (unsigned long)cur_adt7420_overflow);
+            prev_adt7420_overflow = cur_adt7420_overflow;
+        }
+
+        /* =================================================================
+         * Read Temperature directly via I2C (every 1 second)
+         * ================================================================= */
         if ((now_ms - last_temp_read_ms) >= TEMP_READ_INTERVAL_MS) {
             last_temp_read_ms = now_ms;
 
@@ -218,26 +222,28 @@ static void data_processing_task(void *pvParameters)
             } else {
                 temp_valid = false;
                 s_temp_read_errors++;
-                ESP_LOGW(TAG, "Temperature read FAILED: %s (error #%lu)",
+                /* FAULT 18: I2C bus error during mid-run temperature read */
+                fault_log_record(FAULT_I2C_ERROR);
+                ESP_LOGW(TAG, "Temperature read FAILED (I2C error): %s (error #%lu)",
                          esp_err_to_name(err), (unsigned long)s_temp_read_errors);
             }
         }
 
-        // =====================================================================
-        // Read ALL available SCL3300 samples from ring buffer
-        // =====================================================================
-        incl_valid = false;  // Reset each cycle - must have fresh data
+        /* =================================================================
+         * Read ALL available SCL3300 samples from ring buffer
+         * ================================================================= */
+        incl_valid = false;
 
         while (scl3300_data_available()) {
             if (scl3300_read_sample(&scl_sample)) {
 
-                // Garbage detection for inclinometer
                 if (is_incl_garbage(scl_sample.raw_x, scl_sample.raw_y, scl_sample.raw_z)) {
                     s_incl_garbage_count++;
+                    /* FAULT 17: treat garbage inclinometer read as an SPI bus error */
+                    fault_log_record(FAULT_SPI_ERROR);
                     ESP_LOGW(TAG, "Inclinometer garbage detected (raw: %d %d %d) → null (total: %lu)",
                              scl_sample.raw_x, scl_sample.raw_y, scl_sample.raw_z,
                              (unsigned long)s_incl_garbage_count);
-                    // incl_valid stays false — "i" will publish as null
                 } else {
                     current_incl_x = convert_scl3300_to_deg(scl_sample.raw_x);
                     current_incl_y = convert_scl3300_to_deg(scl_sample.raw_y);
@@ -251,53 +257,38 @@ static void data_processing_task(void *pvParameters)
             ESP_LOGW(TAG, "No valid inclinometer data this cycle");
         }
 
-        // =====================================================================
-        // Read ALL available ADXL355 samples from ring buffer (with decimation)
-        // =====================================================================
+        /* =================================================================
+         * Read ALL available ADXL355 samples (with decimation)
+         * ================================================================= */
         while (adxl355_data_available() && s_task_running) {
             if (adxl355_read_sample(&adxl_sample)) {
-
-                //Use to debug reading from buffer.
-                /*
-                static int dbg_count = 0;
-                if (dbg_count < 20) {
-                    ESP_LOGI("DBG_RAW", "raw_x=%ld raw_y=%ld raw_z=%ld",
-                        (long)adxl_sample.raw_x,
-                        (long)adxl_sample.raw_y,
-                        (long)adxl_sample.raw_z);
-                    dbg_count++;
-                }
-                */
 
                 if (accel_batch_count == 0 && decim_count == 0) {
                     first_tick = adxl_sample.tick;
                 }
 
-                // Track the first tick for this decimation window
                 if (decim_count == 0) {
                     decim_first_tick = adxl_sample.tick;
                 }
 
-                // Accumulate raw samples
                 sum_x += (int64_t)adxl_sample.raw_x;
                 sum_y += (int64_t)adxl_sample.raw_y;
                 sum_z += (int64_t)adxl_sample.raw_z;
                 decim_count++;
 
-                // When we have ACCEL_DECIM_FACTOR raw samples -> emit 1 averaged output
                 if (decim_count >= ACCEL_DECIM_FACTOR) {
                     int32_t avg_raw_x = (int32_t)(sum_x / ACCEL_DECIM_FACTOR);
                     int32_t avg_raw_y = (int32_t)(sum_y / ACCEL_DECIM_FACTOR);
                     int32_t avg_raw_z = (int32_t)(sum_z / ACCEL_DECIM_FACTOR);
 
-                    // Garbage detection on the averaged raw values
                     if (is_accel_garbage(avg_raw_x, avg_raw_y, avg_raw_z)) {
                         s_accel_garbage_count++;
-                        ESP_LOGW(TAG, "Accel garbage detected (raw: %ld %ld %ld) → sample null (total: %lu)",
+                        /* FAULT 17: garbage accel read treated as SPI error */
+                        fault_log_record(FAULT_SPI_ERROR);
+                        ESP_LOGW(TAG, "Accel garbage detected (raw: %ld %ld %ld) → null (total: %lu)",
                                  (long)avg_raw_x, (long)avg_raw_y, (long)avg_raw_z,
                                  (unsigned long)s_accel_garbage_count);
 
-                        // Store zeros and mark invalid — JSON will publish null for this sample
                         s_accel_x[accel_batch_count] = 0.0f;
                         s_accel_y[accel_batch_count] = 0.0f;
                         s_accel_z[accel_batch_count] = 0.0f;
@@ -309,35 +300,20 @@ static void data_processing_task(void *pvParameters)
                         s_accel_valid[accel_batch_count] = true;
                     }
 
-                    // Debugging conversion from raw to g's.
-                    /*static int dbg_conv = 0;
-                    if (dbg_conv < 20) {
-                        ESP_LOGI("DBG_G", "g_x=%.6f g_y=%.6f g_z=%.6f valid=%d",
-                            s_accel_x[accel_batch_count],
-                            s_accel_y[accel_batch_count],
-                            s_accel_z[accel_batch_count],
-                            s_accel_valid[accel_batch_count]);
-                        dbg_conv++;
-                    }
-                    */
-
                     s_accel_ticks[accel_batch_count] = decim_first_tick;
                     accel_batch_count++;
 
-                    // Reset decimation window
                     decim_count = 0;
                     sum_x = 0;
                     sum_y = 0;
                     sum_z = 0;
 
-                    // If batch is full, publish it
                     if (accel_batch_count >= ACCEL_SAMPLES_PER_BATCH) {
                         if (mqtt_is_connected()) {
                             mqtt_sensor_packet_t packet = {0};
                             packet.timestamp = TICKS_TO_US(first_tick);
                             packet.accel_count = accel_batch_count;
 
-                            // Copy accelerometer data with per-sample validity flag
                             for (int i = 0; i < accel_batch_count; i++) {
                                 packet.accel[i].x     = s_accel_x[i];
                                 packet.accel[i].y     = s_accel_y[i];
@@ -345,7 +321,6 @@ static void data_processing_task(void *pvParameters)
                                 packet.accel[i].valid = s_accel_valid[i];
                             }
 
-                            // Inclinometer
                             packet.has_angle   = true;
                             packet.angle_valid = incl_valid;
                             if (incl_valid) {
@@ -354,33 +329,27 @@ static void data_processing_task(void *pvParameters)
                                 packet.angle_z = current_incl_z;
                             }
 
-                            // Temperature
                             packet.has_temp   = true;
                             packet.temp_valid = temp_valid;
                             if (temp_valid) {
                                 packet.temperature = current_temp;
                             }
 
-                            // Debugging final packet before publish.
-                            /*ESP_LOGI("DBG_PKT", "first sample: %.6f %.6f %.6f valid=%d count=%d",
-                                packet.accel[0].x,
-                                packet.accel[0].y,
-                                packet.accel[0].z,
-                                packet.accel[0].valid,
-                                packet.accel_count);
-                            */
-
-                            // Publish
+                            /* Publish — fault codes are appended inside
+                             * mqtt_publish_sensor_data() via
+                             * fault_log_append_to_json() */
                             if (mqtt_publish_sensor_data(&packet) == ESP_OK) {
                                 s_samples_published += accel_batch_count;
                                 s_packets_sent++;
                             } else {
                                 s_samples_dropped += accel_batch_count;
-                                ESP_LOGW(TAG, "MQTT publish failed, dropped %d samples", accel_batch_count);
+                                ESP_LOGW(TAG, "MQTT publish failed, dropped %d samples",
+                                         accel_batch_count);
                             }
                         } else {
                             s_samples_dropped += accel_batch_count;
-                            ESP_LOGW(TAG, "MQTT disconnected, dropped %d samples", accel_batch_count);
+                            ESP_LOGW(TAG, "MQTT disconnected, dropped %d samples",
+                                     accel_batch_count);
                         }
 
                         accel_batch_count = 0;

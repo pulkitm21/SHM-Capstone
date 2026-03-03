@@ -12,6 +12,7 @@ idf_component_register(
          mqtt.c
          data_processing_and_mqtt_task.c
          sensor_task.c
+         fault_log.c
     INCLUDE_DIRS "."
     PRIV_INCLUDE_DIRS
     REQUIRES esp_driver_i2c
