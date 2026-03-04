@@ -53,7 +53,7 @@ def main():
             timestamp = 1763899900
             print(f"{timestamp},{ax:.5f},{ay:.5f},{az:.5f}")
             data = {
-                "timestamp": timestamp,
+                "t": timestamp,
                 "a": [ax,ay,az],
                 "ay": ay,
                 "az": az

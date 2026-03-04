@@ -25,8 +25,8 @@ def get_daily_filename():
     return date_str, os.path.join(DATA_DIR, filename)
 
 
-def on_connect(client, userdata, flags, rc):
-    print("Connected to broker")
+def on_connect(client, userdata, flags, reason_code, properties):
+    print("Connected with result code", reason_code)
     client.subscribe(TOPIC)
 
 
@@ -55,7 +55,7 @@ def on_message(client, userdata, msg):
         f.write(packet)
 
 
-client = mqtt.Client()
+client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 client.on_connect = on_connect
 client.on_message = on_message
 client.connect(BROKER_IP, PORT, 60)
