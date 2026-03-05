@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 import SystemStatus from "../../components/SystemStatus/SystemStatus";
@@ -6,7 +6,6 @@ import SensorInfoCard, { type SensorMeta } from "../../components/SensorInfo/Sen
 import SensorConfigCard, { type SensorConfig } from "../../components/SensorConfig/SensorConfig";
 import FaultLog from "../../components/FaultLog/Log";
 import SensorFilters, { type SensorValue } from "../../components/SensorFilter/SensorFilter";
-
 import SensorLineChart from "../../components/SensorPlot/SensorPlot";
 
 import { getSettings, putSettings, getSensorData, type ApiResponse } from "../../services/api";
@@ -47,7 +46,7 @@ const ENDPOINT_BY_SENSOR: Record<SensorValue, string> = {
   temperature: "/api/temperature",
 };
 
-// Frontend fallback defaults (used until backend loads)
+// Frontend fallback defaults
 const FALLBACK_META: Record<SensorValue, SensorMeta> = {
   accelerometer: {
     model: "ADXL355",
@@ -93,39 +92,73 @@ const FALLBACK_CONFIG: Record<SensorValue, SensorConfig> = {
   },
 };
 
+// Utility: normalize object keys like {"1": ...} into {1: ...}
+function normalizeNodeKeyedObject<T>(obj: any): Record<number, T> {
+  const out: Record<number, T> = {};
+  if (!obj || typeof obj !== "object") return out;
+
+  for (const [k, v] of Object.entries(obj)) {
+    const n = Number(k);
+    if (Number.isFinite(n)) out[n] = v as T;
+  }
+  return out;
+}
 
 export default function Home() {
   const navigate = useNavigate();
   const isOnline = true;
 
+  const [node, setNode] = useState<number>(1);
   const [sensor, setSensor] = useState<SensorValue>("accelerometer");
   const [timeframeMin, setTimeframeMin] = useState<number>(60);
   const [channel, setChannel] = useState<string>("all");
 
+  // Keep this behavior: sensor change resets channel to "all"
   useEffect(() => setChannel("all"), [sensor]);
 
-  // Settings state (now backend-driven)
-  const [metaBySensor, setMetaBySensor] = useState<Record<SensorValue, SensorMeta>>(FALLBACK_META);
-  const [configBySensor, setConfigBySensor] = useState<Record<SensorValue, SensorConfig>>(FALLBACK_CONFIG);
+  // Node options (1..10). You can increase later.
+  const NODE_OPTIONS = useMemo(() => Array.from({ length: 10 }, (_, i) => i + 1), []);
+
+  // Settings stored for ALL nodes in one settings file:
+  // metaByNode[nodeId][sensor], configByNode[nodeId][sensor]
+  const [metaByNode, setMetaByNode] = useState<Record<number, Record<SensorValue, SensorMeta>>>({
+    1: FALLBACK_META,
+  });
+  const [configByNode, setConfigByNode] = useState<Record<number, Record<SensorValue, SensorConfig>>>({
+    1: FALLBACK_CONFIG,
+  });
   const [settingsStatus, setSettingsStatus] = useState<string>("");
 
-  // Load settings from backend once on mount
+  // Load settings once (global)
   useEffect(() => {
     async function loadSettings() {
       try {
         setSettingsStatus("Loading settings…");
         const json = await getSettings();
 
-        setMetaBySensor((prev) => ({
-          ...prev,
-          ...(json.meta as Record<string, SensorMeta>),
-        }));
+        // Expecting:
+        // json.meta   = { "1": { accelerometer: {...}, ... }, "2": {...}, ... }
+        // json.config = { "1": { accelerometer: {...}, ... }, "2": {...}, ... }
+        const rawMetaByNode = normalizeNodeKeyedObject<Record<SensorValue, SensorMeta>>(json.meta);
+        const rawConfigByNode = normalizeNodeKeyedObject<Record<SensorValue, SensorConfig>>(json.config);
 
-        setConfigBySensor((prev) => ({
-          ...prev,
-          ...(json.config as Record<string, SensorConfig>),
-        }));
+        // Merge defaults per node/sensor so missing fields don't break UI
+        const nextMetaByNode: Record<number, Record<SensorValue, SensorMeta>> = {};
+        const nextConfigByNode: Record<number, Record<SensorValue, SensorConfig>> = {};
 
+        const nodeIds = new Set<number>([
+          ...Object.keys(rawMetaByNode).map(Number),
+          ...Object.keys(rawConfigByNode).map(Number),
+          1,
+        ]);
+
+        nodeIds.forEach((n) => {
+          nextMetaByNode[n] = { ...FALLBACK_META, ...(rawMetaByNode[n] ?? {}) };
+          nextConfigByNode[n] = { ...FALLBACK_CONFIG, ...(rawConfigByNode[n] ?? {}) };
+        });
+
+        setMetaByNode(nextMetaByNode);
+        setConfigByNode(nextConfigByNode);
         setSettingsStatus("");
       } catch (e: any) {
         console.error(e);
@@ -136,13 +169,14 @@ export default function Home() {
     loadSettings();
   }, []);
 
-  async function saveSettings(
-    nextMeta: Record<SensorValue, SensorMeta>,
-    nextConfig: Record<SensorValue, SensorConfig>
+  async function saveAllSettings(
+    nextMetaByNode: Record<number, Record<SensorValue, SensorMeta>>,
+    nextConfigByNode: Record<number, Record<SensorValue, SensorConfig>>
   ) {
     try {
       setSettingsStatus("Saving…");
-      await putSettings({ meta: nextMeta, config: nextConfig });
+      // Backend should persist as one settings file
+      await putSettings({ meta: nextMetaByNode, config: nextConfigByNode });
       setSettingsStatus("");
     } catch (e: any) {
       console.error(e);
@@ -150,33 +184,56 @@ export default function Home() {
     }
   }
 
+  function ensureNodeDefaults(n: number) {
+    setMetaByNode((prev) => (prev[n] ? prev : { ...prev, [n]: FALLBACK_META }));
+    setConfigByNode((prev) => (prev[n] ? prev : { ...prev, [n]: FALLBACK_CONFIG }));
+  }
+
+  // Ensure selected node always has defaults so UI updates cleanly
+  useEffect(() => {
+    ensureNodeDefaults(node);
+  }, [node]);
+
   function handleSaveMeta(updated: SensorMeta) {
-    const nextMeta = { ...metaBySensor, [sensor]: updated };
-    setMetaBySensor(nextMeta);
-    saveSettings(nextMeta, configBySensor);
+    const currentNodeMeta = metaByNode[node] ?? FALLBACK_META;
+    const nextNodeMeta = { ...currentNodeMeta, [sensor]: updated };
+
+    const nextMetaByNode = { ...metaByNode, [node]: nextNodeMeta };
+    setMetaByNode(nextMetaByNode);
+
+    const nextConfigByNode = configByNode;
+    saveAllSettings(nextMetaByNode, nextConfigByNode);
   }
 
   function handleSaveConfig(updated: SensorConfig) {
-    const nextConfig = { ...configBySensor, [sensor]: updated };
-    setConfigBySensor(nextConfig);
-    saveSettings(metaBySensor, nextConfig);
+    const currentNodeConfig = configByNode[node] ?? FALLBACK_CONFIG;
+    const nextNodeConfig = { ...currentNodeConfig, [sensor]: updated };
+
+    const nextConfigByNode = { ...configByNode, [node]: nextNodeConfig };
+    setConfigByNode(nextConfigByNode);
+
+    const nextMetaByNode = metaByNode;
+    saveAllSettings(nextMetaByNode, nextConfigByNode);
   }
 
-  const meta = metaBySensor[sensor];
-  const config = configBySensor[sensor];
+  const metaForNode = metaByNode[node] ?? FALLBACK_META;
+  const configForNode = configByNode[node] ?? FALLBACK_CONFIG;
 
-  // Plot
+  const meta = metaForNode[sensor];
+  const config = configForNode[sensor];
+
+  // Plot state
   const [apiData, setApiData] = useState<ApiResponse | null>(null);
   const [plotStatus, setPlotStatus] = useState("Loading…");
 
   useEffect(() => {
-    async function load() {
+    async function loadPlot() {
       try {
         setPlotStatus("Loading…");
         setApiData(null);
 
         const endpoint = ENDPOINT_BY_SENSOR[sensor];
-        const json = await getSensorData(endpoint, { minutes: timeframeMin, channel });
+        const json = await getSensorData(endpoint, { node, minutes: timeframeMin, channel });
 
         setApiData(json);
         setPlotStatus("Loaded");
@@ -187,17 +244,59 @@ export default function Home() {
       }
     }
 
-    load();
-  }, [sensor, channel, timeframeMin]);
+    loadPlot();
+  }, [node, sensor, channel, timeframeMin]);
 
   return (
     <div className="sc-page">
+      {/* Top selectors: Node first, then Sensor */}
+      <div className="top-selectors">
+        <div className="control-box">
+          <label className="control-label">Node</label>
+          <select
+            className="control-select"
+            value={node}
+            onChange={(e) => setNode(Number(e.target.value))}
+          >
+            {NODE_OPTIONS.map((n) => (
+              <option key={n} value={n}>
+                {n}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div className="control-box">
+          <label className="control-label">Sensor</label>
+          <select
+            className="control-select"
+            value={sensor}
+            onChange={(e) => setSensor(e.target.value as SensorValue)}
+          >
+            {SENSOR_OPTIONS.map((opt) => (
+              <option key={opt.value} value={opt.value}>
+                {opt.label}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+
       <SystemStatus isOnline={isOnline} />
-      {settingsStatus && <p style={{ marginTop: 0 }}>{settingsStatus}</p>}
 
       <div className="sc-top-cards">
-        <SensorInfoCard meta={meta} onSave={handleSaveMeta} />
+        {/* SensorInfo + settingsStatus under it (as you requested earlier) */}
+        <div>
+          <SensorInfoCard meta={meta} onSave={handleSaveMeta} />
+          {settingsStatus && (
+            <p style={{ marginTop: 8, marginBottom: 0 }}>
+              {settingsStatus}
+            </p>
+          )}
+        </div>
+
         <SensorConfigCard config={config} onSave={handleSaveConfig} />
+
         <div className="sc-card">
           <div className="sc-card-title">Fault Log</div>
           <div className="sc-card-body">
@@ -207,13 +306,11 @@ export default function Home() {
       </div>
 
       <SensorFilters
-        sensorOptions={[...SENSOR_OPTIONS]}
         timeframeOptions={[...TIMEFRAME_OPTIONS]}
         channelOptionsBySensor={CHANNELS_BY_SENSOR}
         sensor={sensor}
         timeframeMin={timeframeMin}
         channel={channel}
-        onSensorChange={setSensor}
         onTimeframeChange={setTimeframeMin}
         onChannelChange={setChannel}
         onExport={() => navigate("/export")}
@@ -222,14 +319,16 @@ export default function Home() {
       <div className="sc-plot-card">
         <p style={{ margin: 0 }}>{plotStatus}</p>
         {apiData && (
-        <SensorLineChart
-          title={SENSOR_OPTIONS.find((s) => s.value === sensor)?.label ?? "Sensor"}
-          sensorKey={apiData.sensor ?? sensor}
-          unit={apiData.unit ?? ""}
-          points={apiData.points.map((p) => ({ ts: p.t, value: p.v }))}
-          height={420}
-        />
-      )}
+          <SensorLineChart
+            title={
+              `${SENSOR_OPTIONS.find((s) => s.value === sensor)?.label ?? "Sensor"} (Node ${node})`
+            }
+            sensorKey={apiData.sensor ?? sensor}
+            unit={apiData.unit ?? ""}
+            points={apiData.points.map((p) => ({ ts: p.t, value: p.v }))}
+            height={420}
+          />
+        )}
       </div>
     </div>
   );
