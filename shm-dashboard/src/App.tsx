@@ -3,6 +3,7 @@ import Layout from "./Layout/Layout";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom"; // Used for routing between pages
 
 import Home from "./Pages/Home/Home";
+import SensorManagement from "./Pages/SensorManagement/SensorManagement";
 import Export from "./Pages/Export/Export";
 import FaultLog from "./Pages/FaultLog/FaultLog";
 
@@ -21,6 +22,7 @@ function App() {
         
           <Route path="/" element={<Layout />}>
             <Route index element={<Home />} />
+            <Route path='sensor-management' element={<SensorManagement />} />
             <Route path="/fault-log" element={<FaultLog />} />
             <Route path="/export" element={<Export />} />
             <Route path="*" element={<Navigate to="/" replace />} />
