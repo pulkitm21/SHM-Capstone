@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
-import SystemStatus from "../../components/SystemStatus/SystemStatus";
+import SensorStatus from "../../components/SensorStatus/SensorStatus";
 import SensorInfoCard, { type SensorMeta } from "../../components/SensorInfo/SensorInfo";
 import SensorConfigCard, { type SensorConfig } from "../../components/SensorConfig/SensorConfig";
 import FaultLog from "../../components/FaultLog/Log";
@@ -282,7 +282,7 @@ export default function Home() {
         </div>
       </div>
 
-      <SystemStatus isOnline={isOnline} />
+      <SensorStatus isOnline={isOnline} />
 
       <div className="sc-top-cards">
         {/* SensorInfo + settingsStatus under it (as you requested earlier) */}
