@@ -12,6 +12,75 @@ import { getSettings, putSettings, getSensorData, type ApiResponse } from "../..
 
 import "./Home.css";
 
+// ---- SETTINGS CACHE (stores last known backend settings locally)
+const SETTINGS_CACHE_KEY = "shm_settings_cache";
+
+function loadCachedSettings():
+  | { savedAt: string; meta: any; config: any }
+  | null {
+  try {
+    const raw = localStorage.getItem(SETTINGS_CACHE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function saveCachedSettings(metaByNode: any, configByNode: any) {
+  try {
+    localStorage.setItem(
+      SETTINGS_CACHE_KEY,
+      JSON.stringify({
+        savedAt: new Date().toISOString(),
+        meta: metaByNode,
+        config: configByNode,
+      })
+    );
+  } catch {
+    // ignore storage errors
+  }
+}
+
+// stores last known plot data per node/sensor/channel/timeframe
+const PLOT_CACHE_KEY = "shm_plot_cache";
+
+type PlotCacheRecord = {
+  savedAt: string;
+  data: ApiResponse;
+};
+
+function plotCacheKey(params: {
+  node: number;
+  sensor: SensorValue;
+  minutes: number;
+  channel: string;
+}) {
+  return `${params.node}|${params.sensor}|${params.minutes}|${params.channel}`;
+}
+
+function loadPlotCache(): Record<string, PlotCacheRecord> {
+  try {
+    const raw = localStorage.getItem(PLOT_CACHE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return {};
+    return parsed as Record<string, PlotCacheRecord>;
+  } catch {
+    return {};
+  }
+}
+
+function savePlotCacheEntry(key: string, data: ApiResponse) {
+  try {
+    const all = loadPlotCache();
+    all[key] = { savedAt: new Date().toISOString(), data };
+    localStorage.setItem(PLOT_CACHE_KEY, JSON.stringify(all));
+  } catch {
+    // ignore storage errors
+  }
+}
+
 const SENSOR_OPTIONS = [
   { label: "Accelerometer", value: "accelerometer" },
   { label: "Inclinometer", value: "inclinometer" },
@@ -46,7 +115,7 @@ const ENDPOINT_BY_SENSOR: Record<SensorValue, string> = {
   temperature: "/api/temperature",
 };
 
-// Frontend fallback defaults
+// Frontend fallback defaults. To be removed later when backend is fully implemented and stable.
 const FALLBACK_META: Record<SensorValue, SensorMeta> = {
   accelerometer: {
     model: "ADXL355",
@@ -116,17 +185,19 @@ export default function Home() {
   // Keep this behavior: sensor change resets channel to "all"
   useEffect(() => setChannel("all"), [sensor]);
 
-  // Node options (1..10). You can increase later.
-  const NODE_OPTIONS = useMemo(() => Array.from({ length: 10 }, (_, i) => i + 1), []);
+  const NODE_OPTIONS = useMemo(() => Array.from({ length: 5 }, (_, i) => i + 1), []);
 
-  // Settings stored for ALL nodes in one settings file:
-  // metaByNode[nodeId][sensor], configByNode[nodeId][sensor]
-  const [metaByNode, setMetaByNode] = useState<Record<number, Record<SensorValue, SensorMeta>>>({
-    1: FALLBACK_META,
+  // INITIALIZE SETTINGS STATE FROM CACHE (if available)
+  const [metaByNode, setMetaByNode] = useState<Record<number, Record<SensorValue, SensorMeta>>>(() => {
+    const cached = loadCachedSettings();
+    return cached?.meta ?? { 1: FALLBACK_META };
   });
-  const [configByNode, setConfigByNode] = useState<Record<number, Record<SensorValue, SensorConfig>>>({
-    1: FALLBACK_CONFIG,
+
+  const [configByNode, setConfigByNode] = useState<Record<number, Record<SensorValue, SensorConfig>>>(() => {
+    const cached = loadCachedSettings();
+    return cached?.config ?? { 1: FALLBACK_CONFIG };
   });
+
   const [settingsStatus, setSettingsStatus] = useState<string>("");
 
   // Load settings once (global)
@@ -157,12 +228,27 @@ export default function Home() {
           nextConfigByNode[n] = { ...FALLBACK_CONFIG, ...(rawConfigByNode[n] ?? {}) };
         });
 
+        //  UPDATE UI STATE + CACHE AFTER SUCCESSFUL BACKEND FETCH
         setMetaByNode(nextMetaByNode);
         setConfigByNode(nextConfigByNode);
+        saveCachedSettings(nextMetaByNode, nextConfigByNode);
+
         setSettingsStatus("");
       } catch (e: any) {
         console.error(e);
-        setSettingsStatus(`Settings load failed: ${e?.message ?? "Unknown error"}`);
+
+        // FALLBACK TO CACHED SETTINGS IF BACKEND UNAVAILABLE
+        const cached = loadCachedSettings();
+
+        if (cached?.savedAt) {
+          setSettingsStatus(
+            `Backend unreachable — using cached settings (last synced: ${new Date(
+              cached.savedAt
+            ).toLocaleString()})`
+          );
+        } else {
+          setSettingsStatus(`Settings load failed: ${e?.message ?? "Unknown error"}`);
+        }
       }
     }
 
@@ -175,8 +261,11 @@ export default function Home() {
   ) {
     try {
       setSettingsStatus("Saving…");
-      // Backend should persist as one settings file
       await putSettings({ meta: nextMetaByNode, config: nextConfigByNode });
+
+      // KEEP LOCAL CACHE IN SYNC AFTER SAVE
+      saveCachedSettings(nextMetaByNode, nextConfigByNode);
+
       setSettingsStatus("");
     } catch (e: any) {
       console.error(e);
@@ -201,8 +290,7 @@ export default function Home() {
     const nextMetaByNode = { ...metaByNode, [node]: nextNodeMeta };
     setMetaByNode(nextMetaByNode);
 
-    const nextConfigByNode = configByNode;
-    saveAllSettings(nextMetaByNode, nextConfigByNode);
+    saveAllSettings(nextMetaByNode, configByNode);
   }
 
   function handleSaveConfig(updated: SensorConfig) {
@@ -212,8 +300,7 @@ export default function Home() {
     const nextConfigByNode = { ...configByNode, [node]: nextNodeConfig };
     setConfigByNode(nextConfigByNode);
 
-    const nextMetaByNode = metaByNode;
-    saveAllSettings(nextMetaByNode, nextConfigByNode);
+    saveAllSettings(metaByNode, nextConfigByNode);
   }
 
   const metaForNode = metaByNode[node] ?? FALLBACK_META;
@@ -228,17 +315,53 @@ export default function Home() {
 
   useEffect(() => {
     async function loadPlot() {
-      try {
+      const cacheKey = plotCacheKey({
+        node,
+        sensor,
+        minutes: timeframeMin,
+        channel,
+      });
+
+      // SHOW CACHED PLOT IMMEDIATELY (if available), then refresh from backend
+      const cache = loadPlotCache();
+      const cachedEntry = cache[cacheKey];
+
+      if (cachedEntry?.data?.points?.length) {
+        setApiData(cachedEntry.data);
+        setPlotStatus(
+          `Using cached plot (last synced: ${new Date(cachedEntry.savedAt).toLocaleString()})`
+        );
+      } else {
         setPlotStatus("Loading…");
         setApiData(null);
+      }
 
+      try {
         const endpoint = ENDPOINT_BY_SENSOR[sensor];
-        const json = await getSensorData(endpoint, { node, minutes: timeframeMin, channel });
+        const json = await getSensorData(endpoint, {
+          node,
+          minutes: timeframeMin,
+          channel,
+        });
 
         setApiData(json);
         setPlotStatus("Loaded");
+
+        // SAVE FRESH PLOT TO CACHE
+        savePlotCacheEntry(cacheKey, json);
       } catch (err: any) {
         console.error(err);
+
+        // If we already showed cached data, keep it and just show an offline message
+        if (cachedEntry?.data?.points?.length) {
+          setPlotStatus(
+            `Backend unreachable — showing cached plot (last synced: ${new Date(
+              cachedEntry.savedAt
+            ).toLocaleString()})`
+          );
+          return;
+        }
+
         setApiData(null);
         setPlotStatus(`Error: ${err?.message ?? "Unknown error"}`);
       }
@@ -249,7 +372,6 @@ export default function Home() {
 
   return (
     <div className="sc-page">
-      {/* Top selectors: Node first, then Sensor */}
       <div className="top-selectors">
         <div className="control-box">
           <label className="control-label">Node</label>
@@ -285,14 +407,9 @@ export default function Home() {
       <SensorStatus isOnline={isOnline} />
 
       <div className="sc-top-cards">
-        {/* SensorInfo + settingsStatus under it (as you requested earlier) */}
         <div>
           <SensorInfoCard meta={meta} onSave={handleSaveMeta} />
-          {settingsStatus && (
-            <p style={{ marginTop: 8, marginBottom: 0 }}>
-              {settingsStatus}
-            </p>
-          )}
+          {settingsStatus && <p style={{ marginTop: 8, marginBottom: 0 }}>{settingsStatus}</p>}
         </div>
 
         <SensorConfigCard config={config} onSave={handleSaveConfig} />
@@ -320,9 +437,7 @@ export default function Home() {
         <p style={{ margin: 0 }}>{plotStatus}</p>
         {apiData && (
           <SensorLineChart
-            title={
-              `${SENSOR_OPTIONS.find((s) => s.value === sensor)?.label ?? "Sensor"} (Node ${node})`
-            }
+            title={`${SENSOR_OPTIONS.find((s) => s.value === sensor)?.label ?? "Sensor"} (Node ${node})`}
             sensorKey={apiData.sensor ?? sensor}
             unit={apiData.unit ?? ""}
             points={apiData.points.map((p) => ({ ts: p.t, value: p.v }))}
