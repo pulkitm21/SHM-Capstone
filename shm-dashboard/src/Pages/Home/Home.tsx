@@ -417,7 +417,7 @@ export default function Home() {
         <div className="sc-card">
           <div className="sc-card-title">Fault Log</div>
           <div className="sc-card-body">
-            <FaultLog />
+          <FaultLog node={node} limit={10} />
           </div>
         </div>
       </div>

@@ -4,6 +4,7 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom"; // Us
 
 import Home from "./Pages/Home/Home";
 import Export from "./Pages/Export/Export";
+import FaultLog from "./Pages/FaultLog/FaultLog";
 
 import Login from "./Pages/Login/Login";
 import ProtectedRoute from "./Auth/Route";
@@ -20,6 +21,7 @@ function App() {
         
           <Route path="/" element={<Layout />}>
             <Route index element={<Home />} />
+            <Route path="/fault-log" element={<FaultLog />} />
             <Route path="/export" element={<Export />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>

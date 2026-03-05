@@ -1,37 +1,57 @@
+import { useEffect, useState } from "react";
+import { getFaults } from "../../services/api";
 import "./Log.css";
 
+// ---- Fault structure returned by backend
 type FaultEntry = {
-  time: string;        // ISO or HH:MM:SS
-  status: "High" | "Warning" | "Info";
-  location: string;    // which sensor / node
-  description: string;
+  id: number;
+  ts: string;
+  severity: "High" | "Warning" | "Info";
+  node_id: number;
+  sensor_id: string;
+  fault_type: string;
 };
 
-// Static for now
-const FAULT_LOG: FaultEntry[] = [
-  {
-    time: "12:45:33",
-    status: "High",
-    location: "Nacelle – A1",
-    description: "High temperature alert",
-  },
-  {
-    time: "09:20:45",
-    status: "Warning",
-    location: "Tower mid – B2",
-    description: "Intermittent connection loss",
-  },
-  {
-    time: "09:18:07",
-    status: "High",
-    location: "Foundation – C1",
-    description: "Tilt angle out of range",
-  },
-];
+// ---- Component props
+type FaultLogProps = {
+  node?: number;   // optional node filter (used on Home page)
+  limit?: number;  // limit number of faults returned
+};
 
-export default function FaultLog() {
+export default function FaultLog({ node, limit = 200 }: FaultLogProps) {
+  const [faults, setFaults] = useState<FaultEntry[]>([]);
+  const [status, setStatus] = useState("Loading…");
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    async function loadFaults() {
+      try {
+        setStatus("Loading…");
+
+        const res = await getFaults(
+          { node, limit },
+          controller.signal
+        );
+
+        setFaults(res.faults ?? []);
+        setStatus("");
+      } catch (err: any) {
+        console.error(err);
+        setFaults([]);
+        setStatus(`Fault log load failed`);
+      }
+    }
+
+    loadFaults();
+
+    return () => controller.abort();
+  }, [node, limit]);
+
   return (
     <div className="fault-log">
+      {status && <p>{status}</p>}
+
       <table className="fault-table">
         <thead>
           <tr>
@@ -43,16 +63,27 @@ export default function FaultLog() {
         </thead>
 
         <tbody>
-          {FAULT_LOG.map((entry, idx) => (
-            <tr key={idx}>
-              <td className="mono">{entry.time}</td>
+          {faults.length === 0 && !status && (
+            <tr>
+              <td colSpan={4}>No faults recorded</td>
+            </tr>
+          )}
+
+          {faults.map((entry) => (
+            <tr key={entry.id}>
+              <td className="mono">{entry.ts}</td>
+
               <td>
-                <span className={`status-pill ${entry.status.toLowerCase()}`}>
-                  {entry.status}
+                <span className={`status-pill ${entry.severity.toLowerCase()}`}>
+                  {entry.severity}
                 </span>
               </td>
-              <td>{entry.location}</td>
-              <td>{entry.description}</td>
+
+              <td>
+                Node {entry.node_id} – {entry.sensor_id}
+              </td>
+
+              <td>{entry.fault_type}</td>
             </tr>
           ))}
         </tbody>
