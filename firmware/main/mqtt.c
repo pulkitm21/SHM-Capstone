@@ -14,6 +14,11 @@
  *   hardcoded IP. Call mqtt_mdns_init(ethernet_get_netif()) AFTER
  *   ethernet_wait_for_ip() and BEFORE mqtt_init().
  *
+ * TIMESTAMP FORMAT:
+ * - packet.timestamp is uint64_t microseconds since Unix epoch from
+ *   CLOCK_PTP_SYSTEM. Serialized in JSON as "t":<uint64> (no quotes).
+ * - On the Raspberry Pi: datetime.utcfromtimestamp(t / 1e6)
+ *
  * DATA INTEGRITY:
  * - Invalid/stale sensor data shows as "null" in JSON
  * - Individual accelerometer samples flagged as garbage also publish as null
@@ -264,9 +269,14 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
 
     int offset = 0;
 
-    // Timestamp
+    /* ------------------------------------------------------------------
+     * Timestamp: uint64_t microseconds since Unix epoch (PTP-synchronized).
+     *
+     * Uses %llu to correctly serialize a 64-bit unsigned integer.
+     * On the Raspberry Pi subscriber: datetime.utcfromtimestamp(t / 1e6)
+     * ------------------------------------------------------------------ */
     offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                       "{\"t\":%lu,\"a\":[", (unsigned long)packet->timestamp);
+                       "{\"t\":%llu,\"a\":[", (unsigned long long)packet->timestamp);
 
     // Accelerometer array
     for (int i = 0; i < packet->accel_count && i < MQTT_ACCEL_BATCH_SIZE; i++) {
@@ -318,7 +328,6 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
 
     /* -----------------------------------------------------------------------
      * FAULT LOG: append "f":[...] if any fault codes are pending.
-     * This is the only place fault codes leave the ESP32.
      * fault_log_append_to_json() clears the pending list after writing.
      * --------------------------------------------------------------------- */
     if (fault_log_has_pending()) {

@@ -1,4 +1,10 @@
 dependencies:
+  esp_eth_time:
+    dependencies: []
+    source:
+      path: /Users/suannesparrow/Desktop/Capstone/firmware/components/esp_eth_time
+      type: local
+    version: '*'
   espressif/ethernet_init:
     component_hash: 9f7d29acf5fe32315579ddb6247388291cda555aa529409108c0ada0aa7cd99d
     dependencies:
@@ -126,9 +132,10 @@ dependencies:
       type: idf
     version: 5.5.2
 direct_dependencies:
+- esp_eth_time
 - espressif/ethernet_init
 - espressif/mdns
 - idf
-manifest_hash: 3208de252da416b6f406d9022f71bb1a742dd75022cc0a37f5938598c01087b5
+manifest_hash: 3675866389a3f70b2130bc7e37dc20baa32d4b417062da4ad3f4f73671be8da7
 target: esp32
 version: 2.0.0

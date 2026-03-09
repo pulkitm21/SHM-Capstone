@@ -108,7 +108,7 @@ int fault_log_append_to_json(char *buf, int buf_size, int offset)
     offset += snprintf(buf + offset, buf_size - offset, "]");
 
     /* Clear the pending list now that they have been written into the packet */
-    s_pending_count = 0;
+    //s_pending_count = 0; // TODO: uncomment this when done testing
 
     xSemaphoreGive(m);
     return offset;

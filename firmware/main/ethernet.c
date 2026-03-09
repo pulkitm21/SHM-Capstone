@@ -11,6 +11,13 @@
  *  - FAULT_ETH_LINK_DOWN (1)      logged on ETHERNET_EVENT_DISCONNECTED
  *  - FAULT_ETH_LINK_RECOVERED (2) logged on ETHERNET_EVENT_CONNECTED
  *  - FAULT_ETH_NO_IP (3)          logged on ethernet_wait_for_ip() timeout
+ *
+ * PTP NOTE:
+ *  - esp_vfs_l2tap_intf_register(NULL) is called during init.
+ *    This is required by the ptpd component, which opens "/dev/net/tap"
+ *    inside ptpd_start(). If L2TAP is not registered first, ptpd_start()
+ *    will fail with a file-open error. L2TAP has no effect on normal
+ *    Ethernet/IP traffic.
  */
 
 #include "ethernet.h"
@@ -33,6 +40,7 @@
 #include "lwip/inet.h"
 
 #include "ethernet_init.h"
+#include "esp_vfs_l2tap.h"   // Required for PTP (ptpd opens /dev/net/tap)
 
 static const char *TAG = "ethernet";
 
@@ -183,6 +191,24 @@ esp_err_t ethernet_init(void)
         ESP_LOGE(TAG, "event loop create failed: %s", esp_err_to_name(ret));
         goto fail;
     }
+
+    /* -----------------------------------------------------------------
+     * Register L2TAP VFS interface.
+     *
+     * MUST be called before esp_eth_start() and before ptpd_start().
+     * The ptpd component opens "/dev/net/tap" inside ptp_initialize_state()
+     * to create a raw Ethernet socket for PTP frame exchange. Without this
+     * registration that open() call returns -1 (ENOENT) and PTP fails silently.
+     *
+     * Passing NULL uses the default VFS path ("/dev/net/tap").
+     * This has no effect on normal IP/MQTT traffic.
+     * ----------------------------------------------------------------- */
+    ret = esp_vfs_l2tap_intf_register(NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_vfs_l2tap_intf_register failed: %s", esp_err_to_name(ret));
+        goto fail;
+    }
+    ESP_LOGI(TAG, "L2TAP VFS registered (required for PTP)");
 
     phy_reset_sequence();
 

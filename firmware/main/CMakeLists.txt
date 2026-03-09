@@ -17,15 +17,18 @@ idf_component_register(
     PRIV_INCLUDE_DIRS
     REQUIRES esp_driver_i2c
     		 esp_driver_spi
-    PRIV_REQUIRES esp_driver_gpio
+    PRIV_REQUIRES  esp_driver_gpio
     			   esp_driver_gptimer 
     			   esp_timer 
     			   freertos
     			   esp_eth
                    esp_netif
                    esp_event
-                   ethernet_init
+                   espressif__ethernet_init
                    nvs_flash
                    mqtt
-                   mdns
+                   espressif__mdns
+                   ptpd
+                   esp_eth_time
+                   
 )

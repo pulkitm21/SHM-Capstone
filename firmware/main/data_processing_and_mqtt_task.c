@@ -18,14 +18,24 @@
  *   - Any axis near 16-bit rail (±32700) → floating MISO high
  *   - Any converted angle magnitude > 91° → physically impossible
  *
+ * TIMESTAMPING:
+ * - packet.timestamp is set from CLOCK_PTP_SYSTEM once per processing cycle.
+ * - It represents microseconds since Unix epoch, synchronized across all
+ *   nodes via PTP (Raspberry Pi is grandmaster).
+ * IMPORTANT: clock_gettime(CLOCK_REALTIME, ...) is used. On this ESP32
+ *   build, CLOCK_REALTIME is disciplined by the PTP daemon (ptpd.c) which
+ *   continuously adjusts it to track the Raspberry Pi grandmaster clock.
+ *   Do NOT substitute esp_timer_get_time() — that clock is not PTP-disciplined
+ *   and will not be synchronized across nodes.
+ * - If the PTP daemon has not yet set the clock (timestamp is before 2024),
+ *   the packet is dropped rather than published with a garbage timestamp.
+ *
  * FAULT LOGGING:
  * - FAULT_ADXL355_DROPPED (7): logged when adxl355 overflow counter increases
  * - FAULT_SCL3300_DROPPED (8): logged when scl3300 overflow counter increases
  * - FAULT_ADT7420_DROPPED (9): logged when adt7420 overflow counter increases
  * - FAULT_SPI_ERROR (17):      logged on mid-run SPI read failure (inclinometer)
  * - FAULT_I2C_ERROR (18):      logged on mid-run I2C read failure (temperature)
- * Fault codes are batched into the next outgoing MQTT packet automatically
- * via fault_log_append_to_json() called inside mqtt_publish_sensor_data().
  */
 
 #include "data_processing_and_mqtt_task.h"
@@ -34,11 +44,13 @@
 #include "adt7420.h"
 #include "mqtt.h"
 #include "esp_log.h"
+#include "esp_eth_time.h"       // esp_eth_clock_gettime(), CLOCK_PTP_SYSTEM
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
 #include <string.h>
 #include <math.h>
+#include <time.h>               // struct timespec
 
 static const char *TAG = "DATA_PROC";
 
@@ -85,6 +97,39 @@ static inline float convert_adxl355_to_g(int32_t raw)
 static inline float convert_scl3300_to_deg(int16_t raw)
 {
     return (float)raw * 0.0055f;
+}
+
+/******************************************************************************
+ * PTP TIMESTAMP HELPER
+ *
+ * Returns microseconds since Unix epoch from CLOCK_PTP_SYSTEM.
+ * Returns 0 if the PTP clock is not yet available.
+ *
+ * This is the ONLY correct clock to use for packet timestamps. Do not
+ * substitute esp_timer_get_time() or CLOCK_REALTIME — they are not
+ * disciplined by PTP and will not be synchronized across nodes.
+ *****************************************************************************/
+
+static uint64_t get_ptp_timestamp_us(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        ESP_LOGW(TAG, "clock_gettime failed — timestamp will be 0");
+        return 0ULL;
+    }
+
+    /* Sanity check: if time is before Jan 1 2024, PTP has not synced yet.
+     * CLOCK_REALTIME on ESP32 starts at 0 (Unix epoch) on boot and is
+     * only set to real wall-clock time once ptpd receives Sync packets
+     * from the Raspberry Pi grandmaster and calls clock_settime(). */
+    const time_t JAN_2024 = 1704067200;
+    if (ts.tv_sec < JAN_2024) {
+        ESP_LOGW(TAG, "PTP not yet synced (time=%llu s) — timestamp will be 0",
+                 (unsigned long long)ts.tv_sec);
+        return 0ULL;
+    }
+
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)(ts.tv_nsec / 1000);
 }
 
 /******************************************************************************
@@ -148,7 +193,6 @@ static void data_processing_task(void *pvParameters)
     scl3300_raw_sample_t scl_sample;
 
     int accel_batch_count = 0;
-    uint32_t first_tick = 0;
 
     int decim_count = 0;
     int64_t sum_x = 0;
@@ -176,11 +220,20 @@ static void data_processing_task(void *pvParameters)
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
         /* =================================================================
+         * Take one PTP timestamp at the START of this processing cycle.
+         *
+         * This is the wall-clock anchor for the entire batch. It is set
+         * here — once per 50ms cycle — so we are not calling
+         * esp_eth_clock_gettime() for every individual sample (which would
+         * be 1000 calls/sec and adds unnecessary overhead).
+         *
+         * This timestamp represents when we started processing this batch.
+         * On the Raspberry Pi: datetime.utcfromtimestamp(t / 1e6)
+         * ================================================================= */
+        uint64_t cycle_timestamp_us = get_ptp_timestamp_us();
+
+        /* =================================================================
          * FAULT CHECK: ring buffer overflows (sample drops)
-         * Compare current overflow counters to previous cycle values.
-         * If any increased, record the appropriate fault code.
-         * This is the safe way to detect ISR-originated drops from task
-         * context without needing to call fault_log_record() from the ISR.
          * ================================================================= */
         uint32_t cur_adxl355_overflow = adxl355_get_overflow_count();
         uint32_t cur_scl3300_overflow = scl3300_get_overflow_count();
@@ -263,10 +316,6 @@ static void data_processing_task(void *pvParameters)
         while (adxl355_data_available() && s_task_running) {
             if (adxl355_read_sample(&adxl_sample)) {
 
-                if (accel_batch_count == 0 && decim_count == 0) {
-                    first_tick = adxl_sample.tick;
-                }
-
                 if (decim_count == 0) {
                     decim_first_tick = adxl_sample.tick;
                 }
@@ -309,9 +358,36 @@ static void data_processing_task(void *pvParameters)
                     sum_z = 0;
 
                     if (accel_batch_count >= ACCEL_SAMPLES_PER_BATCH) {
+
+                        /* -----------------------------------------------------
+                         * Drop the packet if PTP timestamp is not yet available.
+                         *
+                         * A timestamp of 0 means esp_eth_clock_gettime() returned
+                         * -1 — the PTP clock has not yet synced. Publishing a
+                         * packet with timestamp=0 would be misleading on the Pi.
+                         * This should never happen in normal operation because
+                         * main.c blocks in ptp_init_and_sync() until the clock
+                         * is valid before starting sensor acquisition, but we
+                         * guard here defensively.
+                         * ----------------------------------------------------- */
+                        if (cycle_timestamp_us == 0ULL) {
+                            s_samples_dropped += accel_batch_count;
+                            ESP_LOGW(TAG, "PTP timestamp not available — dropped %d samples",
+                                     accel_batch_count);
+                            accel_batch_count = 0;
+                            continue;
+                        }
+
                         if (mqtt_is_connected()) {
                             mqtt_sensor_packet_t packet = {0};
-                            packet.timestamp = TICKS_TO_US(first_tick);
+
+                            /* --------------------------------------------------
+                             * Set PTP-synchronized wall-clock timestamp.
+                             * This is microseconds since Unix epoch from
+                             * CLOCK_PTP_SYSTEM, taken at the start of this cycle.
+                             * -------------------------------------------------- */
+                            packet.timestamp = cycle_timestamp_us;
+
                             packet.accel_count = accel_batch_count;
 
                             for (int i = 0; i < accel_batch_count; i++) {
@@ -335,9 +411,8 @@ static void data_processing_task(void *pvParameters)
                                 packet.temperature = current_temp;
                             }
 
-                            /* Publish — fault codes are appended inside
-                             * mqtt_publish_sensor_data() via
-                             * fault_log_append_to_json() */
+                            /* Publish — fault codes appended inside
+                             * mqtt_publish_sensor_data() */
                             if (mqtt_publish_sensor_data(&packet) == ESP_OK) {
                                 s_samples_published += accel_batch_count;
                                 s_packets_sent++;

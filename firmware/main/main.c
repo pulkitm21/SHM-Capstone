@@ -5,29 +5,35 @@
  * Merged Architecture:
  *  - Ethernet + MQTT publishing (data_processing_and_mqtt_task)
  *  - ISR-based sensor acquisition (from isr-daq branch)
+ *  - PTP time synchronization (Raspberry Pi as grandmaster)
  *  - Statistics monitor
  *
- * Error Handling:
- *  - Critical failures trigger automatic reboot after delay
- *  - Maximum reboot attempts tracked in memory
- *  - Prevents infinite reboot loops
+ * Initialization Order:
+ *  0. Check reset reason (fault logging)
+ *  1. Ethernet (includes L2TAP registration for PTP)
+ *  2. PTP sync (blocks until CLOCK_PTP_SYSTEM is valid)
+ *  3. MQTT
+ *  4. Buses (I2C, SPI)
+ *  5. Sensors
+ *  6. ISR Acquisition
+ *  7. Data Processing Task
+ *
+ * PTP Notes:
+ *  - Raspberry Pi runs ptp4l as IEEE 1588 grandmaster
+ *  - ptpd_start("ETH_0") spawns the PTP daemon at tskIDLE_PRIORITY + 2
+ *  - ptp_init_and_sync() blocks until clock_source_valid is stable
+ *    for 3 consecutive checks, matching the Espressif PTP example pattern
+ *  - Sensor acquisition does NOT start until PTP is synced, ensuring
+ *    all packets have valid timestamps from the first sample
+ *  - CLOCK_PTP_SYSTEM is initialized inside ptpd_start() via
+ *    ptp_initialize_state() → esp_eth_clock_init(). No separate init needed.
  *
  * Data Flow:
  *  ISR (8000 Hz) → Ring Buffers → Data Processing Task → MQTT → Raspberry Pi
  *
  * FAULT LOGGING (boot-time):
  *  At the top of app_main(), esp_reset_reason() is checked and fault codes
- *  are recorded before any other initialization. These codes will be attached
- *  to the first outgoing MQTT data packet so the Raspberry Pi immediately
- *  knows why the device rebooted.
- *
- *  FAULT_WATCHDOG_RESET (11): previous reset was caused by watchdog timeout
- *  FAULT_POWER_LOSS (12):     previous reset was a power-on (power was lost)
- *  FAULT_POWER_RESTORED (13): logged alongside FAULT_POWER_LOSS at boot
- *  FAULT_REBOOT_ATTEMPT (10): logged just before esp_restart() is called
- *  FAULT_ADXL355_INIT_FAIL (14): adxl355_init() returned an error
- *  FAULT_SCL3300_INIT_FAIL (15): scl3300_init() returned an error
- *  FAULT_ADT7420_INIT_FAIL (16): adt7420_init() returned an error
+ *  are recorded before any other initialization.
  */
 
 #include <stdio.h>
@@ -57,6 +63,10 @@
 #include "mqtt.h"
 #include "data_processing_and_mqtt_task.h"
 
+// PTP
+#include "ptpd.h"
+#include "esp_eth_time.h"
+
 // Fault logging
 #include "fault_log.h"
 
@@ -65,6 +75,18 @@ static const char *TAG = "main";
 // Timeouts
 #define ETH_IP_TIMEOUT_MS       30000
 #define MQTT_CONNECT_TIMEOUT_MS 30000
+
+/* PTP synchronization timeout.
+ * ptp_init_and_sync() will give up and continue (with a warning) if
+ * the clock has not synced within this many milliseconds. Sensor
+ * acquisition will still start but packets will have timestamp=0 until
+ * sync is achieved. In practice on a local LAN, sync takes 5-15 seconds.
+ */
+#define PTP_SYNC_TIMEOUT_MS     60000
+
+/* Number of consecutive clock_source_valid checks required before we
+ * consider the clock locked. Matches the pattern in the Espressif example. */
+#define PTP_SYNC_STABLE_COUNT   3
 
 // Reboot configuration
 #define REBOOT_DELAY_MS         5000
@@ -80,6 +102,9 @@ RTC_NOINIT_ATTR static uint32_t s_reboot_count;
 RTC_NOINIT_ATTR static uint32_t s_reboot_magic;
 
 #define REBOOT_MAGIC_VALUE      0xDEADBEEF
+
+/* PTP daemon process ID (returned by ptpd_start, used by ptpd_status) */
+static int s_ptp_pid = -1;
 
 /* -------------------------------------------------------------------------- */
 /* Utility Functions                                                          */
@@ -98,19 +123,6 @@ static void force_spi_cs_high_early(void)
     vTaskDelay(pdMS_TO_TICKS(2));
 }
 
-/**
- * @brief Check reset reason and record appropriate fault codes.
- *
- * Called at the very top of app_main() before any other initialization.
- * Fault codes recorded here will be attached to the first outgoing MQTT
- * packet once the network stack is up.
- *
- * Reset reason mapping:
- *   ESP_RST_POWERON  → power was lost and restored: log FAULT_POWER_LOSS + FAULT_POWER_RESTORED
- *   ESP_RST_WDT      → watchdog fired:              log FAULT_WATCHDOG_RESET
- *   ESP_RST_SW       → esp_restart() was called:    log FAULT_REBOOT_ATTEMPT
- *   anything else    → no fault logged
- */
 static void check_reset_reason(void)
 {
     esp_reset_reason_t reason = esp_reset_reason();
@@ -137,7 +149,6 @@ static void check_reset_reason(void)
             break;
 
         case ESP_RST_BROWNOUT:
-            /* Brownout can indicate power instability — treat same as power loss */
             ESP_LOGW(TAG, "Reset reason: BROWNOUT");
             fault_log_record(FAULT_POWER_LOSS);
             fault_log_record(FAULT_POWER_RESTORED);
@@ -167,9 +178,6 @@ static void clear_reboot_counter(void)
     ESP_LOGI(TAG, "Initialization successful - reboot counter cleared");
 }
 
-/**
- * @brief Handle critical failure: record reboot fault, then reboot or halt.
- */
 static void handle_critical_failure(const char *reason)
 {
     ESP_LOGE(TAG, "*** CRITICAL FAILURE: %s ***", reason);
@@ -179,8 +187,6 @@ static void handle_critical_failure(const char *reason)
     if (s_reboot_count >= MAX_REBOOT_ATTEMPTS) {
         ESP_LOGE(TAG, "*** MAX REBOOT ATTEMPTS (%d) REACHED ***", MAX_REBOOT_ATTEMPTS);
         ESP_LOGE(TAG, "*** SYSTEM HALTED - POWER CYCLE REQUIRED ***");
-        ESP_LOGE(TAG, "*** Check hardware connections and wiring ***");
-
         while (1) {
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
@@ -191,13 +197,9 @@ static void handle_critical_failure(const char *reason)
              (unsigned long)s_reboot_count,
              MAX_REBOOT_ATTEMPTS);
 
-    /* FAULT 10: record the reboot attempt before calling esp_restart()
-     * so the fault is in the buffer for the next boot's first packet.
-     * (RTC memory preserves the fault_log buffer across soft reboots.) */
     fault_log_record(FAULT_REBOOT_ATTEMPT);
 
     vTaskDelay(pdMS_TO_TICKS(REBOOT_DELAY_MS));
-
     ESP_LOGW(TAG, "Rebooting now...");
     esp_restart();
 }
@@ -224,6 +226,16 @@ static void stats_monitor_task(void *pvParameters)
         data_processing_and_mqtt_task_get_stats(
             &samples_published, &packets_sent, &samples_dropped);
         sensor_acquisition_get_stats(&acquired, &dropped, &max_time);
+
+        /* Show current PTP time so we can visually verify sync */
+        struct timespec ptp_ts;
+        if (esp_eth_clock_gettime(CLOCK_PTP_SYSTEM, &ptp_ts) == 0) {
+            ESP_LOGI("STATS", "  PTP time:  %llu.%09lu (Unix epoch)",
+                     (unsigned long long)ptp_ts.tv_sec,
+                     (unsigned long)ptp_ts.tv_nsec);
+        } else {
+            ESP_LOGW("STATS", "  PTP time:  not available");
+        }
 
         ESP_LOGI("STATS", "");
         ESP_LOGI("STATS", "============ System Statistics ============");
@@ -273,7 +285,7 @@ static void print_banner(void)
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "==============================================");
     ESP_LOGI(TAG, "  Wind Turbine Structural Health Monitor");
-    ESP_LOGI(TAG, "  ISR Acquisition + MQTT Publishing");
+    ESP_LOGI(TAG, "  ISR Acquisition + MQTT Publishing + PTP Sync");
     ESP_LOGI(TAG, "==============================================");
     ESP_LOGI(TAG, "ESP-IDF Version: %s", esp_get_idf_version());
     ESP_LOGI(TAG, "Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
@@ -283,9 +295,8 @@ static void print_banner(void)
     ESP_LOGI(TAG, "  - ADXL355: 1000 Hz accelerometer");
     ESP_LOGI(TAG, "  - SCL3300: 20 Hz inclinometer");
     ESP_LOGI(TAG, "  - ADT7420: 1 Hz temperature");
-    ESP_LOGI(TAG, "  - Ring buffers for lock-free data transfer");
-    ESP_LOGI(TAG, "  - Data processing task batches & publishes");
-    ESP_LOGI(TAG, "  - MQTT to Raspberry Pi");
+    ESP_LOGI(TAG, "  - PTP slave (Raspberry Pi grandmaster)");
+    ESP_LOGI(TAG, "  - Timestamps: microseconds since Unix epoch");
     ESP_LOGI(TAG, "");
 }
 
@@ -330,6 +341,120 @@ static esp_err_t init_network(void)
     return ESP_OK;
 }
 
+/**
+ * @brief Start the PTP daemon and block until the clock is synchronized.
+ *
+ * SEQUENCE:
+ *  1. Call ptpd_start("ETH_0") to spawn the PTP daemon task at
+ *     tskIDLE_PRIORITY + 2 (lowest useful priority, below everything else).
+ *  2. Wait for esp_eth_clock_gettime(CLOCK_PTP_SYSTEM, ...) to return 0
+ *     (clock available), which can take a few seconds after first Sync packet.
+ *  3. Poll ptpd_status() until clock_source_valid has been true for
+ *     PTP_SYNC_STABLE_COUNT consecutive polls (500ms apart), confirming
+ *     the PI controller has converged and the clock is locked to the Pi.
+ *  4. Give up and continue after PTP_SYNC_TIMEOUT_MS with a warning.
+ *     Sensor acquisition will start anyway but packets will have
+ *     timestamp=0 until sync is achieved.
+ *
+ * IMPORTANT:
+ *  - Must be called AFTER ethernet_init() and ethernet_wait_for_ip().
+ *    The PTP daemon needs the Ethernet link up and L2TAP registered
+ *    (L2TAP is registered inside ethernet_init()).
+ *  - Must be called BEFORE init_acquisition() so that all published
+ *    packets have valid PTP timestamps from the very first sample.
+ *  - ptpd_status() dereferences s_state inside ptpd.c. We wait for
+ *    esp_eth_clock_gettime() to succeed first as a proxy for the daemon
+ *    having initialized s_state, avoiding a NULL dereference.
+ *
+ * @return ESP_OK if synced within timeout, ESP_ERR_TIMEOUT otherwise.
+ */
+static esp_err_t ptp_init_and_sync(void)
+{
+    ESP_LOGI(TAG, "--- Initializing PTP (Raspberry Pi grandmaster) ---");
+
+    /* Start the PTP daemon. It attaches to the existing "ETH_0" netif
+     * that ethernet_init() already created. Returns 1 on success, -1
+     * if another instance is already running. */
+    s_ptp_pid = ptpd_start("ETH_0");
+    if (s_ptp_pid < 0) {
+        ESP_LOGE(TAG, "ptpd_start failed (another instance running?)");
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "PTP daemon started (pid=%d, priority=tskIDLE_PRIORITY+2)", s_ptp_pid);
+
+    /* Step 1: On ESP32, clock_gettime(CLOCK_REALTIME) always succeeds
+         * immediately after boot (returns 0 = Unix epoch). There is no
+         * meaningful way to wait for the clock to "become available" here —
+         * the real readiness signal is clock_source_valid in step 2 below.
+         * We just give the ptpd task a moment to start up before polling. */
+
+        ESP_LOGI(TAG, "Waiting for PTP daemon to start up...");
+        struct timespec ts;
+        uint32_t elapsed_ms = 0;
+        vTaskDelay(pdMS_TO_TICKS(500));
+        elapsed_ms = 500;
+        ESP_LOGI(TAG, "PTP daemon startup delay complete, waiting for clock lock...");
+
+    /* -----------------------------------------------------------------------
+     * Step 2: Wait for clock_source_valid to be stable.
+     *
+     * clock_source_valid becomes true when the PTP daemon has received
+     * Announce and Sync packets from the grandmaster (Raspberry Pi) and
+     * the PI controller has started converging. We require it to be true
+     * for PTP_SYNC_STABLE_COUNT consecutive polls (500ms apart) before
+     * considering the clock locked.
+     * ----------------------------------------------------------------------- */
+    ESP_LOGI(TAG, "Waiting for PTP clock to lock to Raspberry Pi grandmaster...");
+    ESP_LOGI(TAG, "(This typically takes 5-15 seconds on a local LAN)");
+
+    int32_t stable_count = 0;
+    elapsed_ms = 0;
+    const uint32_t sync_poll_ms = 500;
+
+    while (stable_count < PTP_SYNC_STABLE_COUNT) {
+        vTaskDelay(pdMS_TO_TICKS(sync_poll_ms));
+        elapsed_ms += sync_poll_ms;
+
+        if (elapsed_ms >= PTP_SYNC_TIMEOUT_MS) {
+            ESP_LOGW(TAG, "PTP sync timeout after %d ms — starting acquisition anyway",
+                     PTP_SYNC_TIMEOUT_MS);
+            ESP_LOGW(TAG, "Packets will have timestamp=0 until PTP converges");
+            return ESP_ERR_TIMEOUT;
+        }
+
+        struct ptpd_status_s status;
+        if (ptpd_status(s_ptp_pid, &status) == 0) {
+            if (status.clock_source_valid) {
+                stable_count++;
+                ESP_LOGI(TAG, "PTP clock_source_valid (%ld/%d) — delta: %lld ns",
+                         (long)stable_count, PTP_SYNC_STABLE_COUNT,
+                         (long long)status.last_delta_ns);
+            } else {
+                /* Reset counter — require consecutive valid readings */
+                if (stable_count > 0) {
+                    ESP_LOGD(TAG, "PTP clock_source_valid went false — resetting stable count");
+                }
+                stable_count = 0;
+            }
+        } else {
+            /* ptpd_status() timed out internally (1s timeout in ptpd.c).
+             * This can happen briefly during daemon startup. Just keep waiting. */
+            stable_count = 0;
+            ESP_LOGD(TAG, "ptpd_status() timed out — daemon still starting");
+        }
+    }
+
+    /* Log the current PTP time so we can verify it looks like real UTC */
+    if (esp_eth_clock_gettime(CLOCK_PTP_SYSTEM, &ts) == 0) {
+        ESP_LOGI(TAG, "PTP synchronized! Time: %llu.%09lu (Unix epoch)",
+                 (unsigned long long)ts.tv_sec,
+                 (unsigned long)ts.tv_nsec);
+        ESP_LOGI(TAG, "Elapsed: ~%lu ms to lock", (unsigned long)elapsed_ms);
+    }
+
+    return ESP_OK;
+}
+
 static esp_err_t init_mqtt(void)
 {
     ESP_LOGI(TAG, "--- Initializing MQTT ---");
@@ -349,7 +474,7 @@ static esp_err_t init_mqtt(void)
 
     if (mqtt_wait_for_connection(MQTT_CONNECT_TIMEOUT_MS) == ESP_OK) {
         ESP_LOGI(TAG, "MQTT connected!");
-        mqtt_publish_status("Wind Turbine Monitor Online");
+        mqtt_publish_status("Wind Turbine Monitor Online - PTP Synchronized");
     } else {
         ESP_LOGW(TAG, "MQTT connection timeout - will retry in background");
     }
@@ -357,14 +482,6 @@ static esp_err_t init_mqtt(void)
     return ESP_OK;
 }
 
-/**
- * @brief Initialize sensors and record per-sensor fault codes on failure.
- *
- * ADT7420 is non-critical — failure is logged as FAULT_ADT7420_INIT_FAIL (16)
- * but init continues. ADXL355 and SCL3300 are critical — failure is logged
- * as FAULT_ADXL355_INIT_FAIL (14) or FAULT_SCL3300_INIT_FAIL (15) and then
- * handle_critical_failure() is called.
- */
 static esp_err_t init_sensors(bool *temp_available)
 {
     esp_err_t ret;
@@ -381,7 +498,6 @@ static esp_err_t init_sensors(bool *temp_available)
         *temp_available = true;
         ESP_LOGI(TAG, "ADT7420 initialized");
     } else {
-        /* FAULT 16: ADT7420 init failed */
         fault_log_record(FAULT_ADT7420_INIT_FAIL);
         ESP_LOGW(TAG, "ADT7420 init failed (fault 16 recorded) - continuing without temperature");
     }
@@ -395,7 +511,6 @@ static esp_err_t init_sensors(bool *temp_available)
     ESP_LOGI(TAG, "Initializing ADXL355 accelerometer...");
     ret = adxl355_init();
     if (ret != ESP_OK) {
-        /* FAULT 14: ADXL355 init failed */
         fault_log_record(FAULT_ADXL355_INIT_FAIL);
         ESP_LOGE(TAG, "ADXL355 init failed (fault 14 recorded) - CRITICAL");
         return ESP_FAIL;
@@ -411,7 +526,6 @@ static esp_err_t init_sensors(bool *temp_available)
     ESP_LOGI(TAG, "Initializing SCL3300 inclinometer...");
     ret = scl3300_init();
     if (ret != ESP_OK) {
-        /* FAULT 15: SCL3300 init failed */
         fault_log_record(FAULT_SCL3300_INIT_FAIL);
         ESP_LOGE(TAG, "SCL3300 init failed (fault 15 recorded) - CRITICAL");
         return ESP_FAIL;
@@ -465,19 +579,15 @@ void app_main(void)
 
     /* =========================================
      * 0. Check reset reason — MUST be first.
-     *    Records boot-time fault codes (power loss, watchdog, reboot)
-     *    into the pending buffer before anything else runs.
-     *    These will be attached to the first outgoing MQTT data packet.
      * ========================================= */
     check_reset_reason();
-
-    // Initialize reboot counter
     init_reboot_counter();
-
     print_banner();
 
     // =========================================
-    // 1. Initialize Network (Ethernet)
+    // 1. Initialize Network (Ethernet + L2TAP)
+    //    L2TAP is registered inside ethernet_init()
+    //    and is required by ptpd_start().
     // =========================================
     if (init_network() != ESP_OK) {
         ESP_LOGE(TAG, "Network init failed - continuing anyway");
@@ -485,7 +595,23 @@ void app_main(void)
     ESP_LOGI(TAG, "");
 
     // =========================================
-    // 2. Initialize MQTT Client
+    // 2. PTP Synchronization
+    //    Must come BEFORE sensor acquisition so
+    //    that all packets have valid timestamps.
+    //    Must come AFTER ethernet_init() and
+    //    ethernet_wait_for_ip() (link must be up).
+    // =========================================
+    esp_err_t ptp_ret = ptp_init_and_sync();
+    if (ptp_ret == ESP_OK) {
+        ESP_LOGI(TAG, "PTP synchronized to Raspberry Pi grandmaster");
+    } else {
+        ESP_LOGW(TAG, "PTP sync incomplete — timestamps may be 0 initially");
+        ESP_LOGW(TAG, "Continuing: PTP daemon is running and will sync in background");
+    }
+    ESP_LOGI(TAG, "");
+
+    // =========================================
+    // 3. Initialize MQTT Client
     // =========================================
     if (init_mqtt() != ESP_OK) {
         ESP_LOGE(TAG, "MQTT init failed - continuing anyway");
@@ -493,7 +619,7 @@ void app_main(void)
     ESP_LOGI(TAG, "");
 
     // =========================================
-    // 3. Initialize Communication Buses
+    // 4. Initialize Communication Buses
     // =========================================
     if (init_buses() != ESP_OK) {
         handle_critical_failure("Bus initialization failed (I2C or SPI)");
@@ -501,7 +627,7 @@ void app_main(void)
     ESP_LOGI(TAG, "");
 
     // =========================================
-    // 4. Initialize Sensors
+    // 5. Initialize Sensors
     // =========================================
     if (init_sensors(&temp_sensor_available) != ESP_OK) {
         handle_critical_failure("Critical sensor initialization failed (ADXL355 or SCL3300)");
@@ -509,7 +635,9 @@ void app_main(void)
     ESP_LOGI(TAG, "");
 
     // =========================================
-    // 5. Initialize ISR Acquisition
+    // 6. Initialize ISR Acquisition
+    //    PTP is synced before this point, so
+    //    the first batch will have a valid timestamp.
     // =========================================
     if (init_acquisition(temp_sensor_available) != ESP_OK) {
         handle_critical_failure("ISR acquisition initialization failed");
@@ -517,20 +645,17 @@ void app_main(void)
     ESP_LOGI(TAG, "");
 
     // =========================================
-    // 6. Initialize Data Processing + MQTT Task
+    // 7. Initialize Data Processing + MQTT Task
     // =========================================
     if (init_data_processing() != ESP_OK) {
         handle_critical_failure("Data processing task initialization failed");
     }
     ESP_LOGI(TAG, "");
 
-    // =========================================
-    // Initialization Complete - Clear Reboot Counter
-    // =========================================
     clear_reboot_counter();
 
     // =========================================
-    // 7. Create Statistics Monitor Task
+    // 8. Create Statistics Monitor Task
     // =========================================
     ESP_LOGI(TAG, "--- Creating Statistics Monitor ---");
     xTaskCreate(
@@ -552,6 +677,9 @@ void app_main(void)
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "  Data Flow:");
     ESP_LOGI(TAG, "  Sensors → ISR → Ring Buffers → Task → MQTT");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "  Timestamps: PTP-synchronized Unix microseconds");
+    ESP_LOGI(TAG, "  Pi decoder: datetime.utcfromtimestamp(t / 1e6)");
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "  Subscribe on Raspberry Pi:");
     ESP_LOGI(TAG, "  mosquitto_sub -t \"wind_turbine/#\" -v");

@@ -4,13 +4,9 @@
  *
  * DEVICE IDENTIFICATION:
  * - Client ID and topics are generated at runtime from the ESP32's burned-in MAC address
-  * - Format: wind_turbine_AABBCCDDEEFF  (Ethernet MAC, 6 bytes, hex, uppercase)
+ * - Format: wind_turbine_AABBCCDDEEFF  (Ethernet MAC, 6 bytes, hex, uppercase)
  * - Data topic:   wind_turbine/AABBCCDDEEFF/data
  * - Status topic: wind_turbine/AABBCCDDEEFF/status
- *
- * ============================================================================
- * SETUP GUIDE for Tony and Pulkit (Raspberry Pi subscriber)
- * ============================================================================
  *
  * Each ESP32 node publishes to a topic that includes its own MAC address:
  *
@@ -20,13 +16,21 @@
  * To receive data from ALL nodes automatically, use:
  *
  *   Subscribe to:  wind_turbine/+/data
+ *
+ * TIMESTAMP FORMAT:
+ * - packet.timestamp is a uint64_t containing microseconds since Unix epoch
+ *   (January 1, 1970 00:00:00 UTC), derived from CLOCK_PTP_SYSTEM.
+ * - On the Raspberry Pi: datetime.utcfromtimestamp(t / 1e6)
+ * - This timestamp is synchronized across all nodes via PTP.
+ *   DO NOT use esp_timer_get_time() or FreeRTOS ticks for this field —
+ *   those are not PTP-disciplined and will not be aligned between nodes.
  */
 
 #ifndef MQTT_H
 #define MQTT_H
 
 #include "esp_err.h"
-#include "esp_netif.h"   // esp_netif_t — needed for mqtt_mdns_init
+#include "esp_netif.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -40,16 +44,9 @@ extern "C" {
 
 /*
  * BROKER HOSTNAME: resolved at runtime via mDNS, no hardcoded IP needed.
- *
- * "raspberrypi" is the default hostname on Raspberry Pi OS supposedly
  */
 #define MQTT_BROKER_HOSTNAME    "raspberrypi"
 #define MQTT_BROKER_URI         "mqtt://" MQTT_BROKER_HOSTNAME ".local:1883"
-
-/*
- * MQTT_CLIENT_ID, MQTT_TOPIC_DATA, and MQTT_TOPIC_STATUS are NOT
- * constants anymore. they are generated at runtime from the MAC address.
- */
 
 #define MQTT_PUBLISH_QOS        0
 #define MQTT_ACCEL_BATCH_SIZE   100
@@ -65,8 +62,7 @@ extern "C" {
  * @brief Single accelerometer sample with per-sample validity flag.
  *
  * valid = false means this sample was flagged as garbage by the processing
- * task (floating MISO, rail value, or physically impossible magnitude) and
- * will be serialized as JSON null instead of [x, y, z].
+ * task and will be serialized as JSON null instead of [x, y, z].
  */
 typedef struct {
     float x;
@@ -78,28 +74,35 @@ typedef struct {
 /**
  * @brief Sensor data packet with validity flags.
  *
+ * TIMESTAMP:
+ *   timestamp is microseconds since Unix epoch from CLOCK_PTP_SYSTEM.
+ *   This is a PTP-synchronized wall-clock time shared across all nodes.
+ *   It is set once per batch in data_processing_and_mqtt_task.c using
+ *   esp_eth_clock_gettime(CLOCK_PTP_SYSTEM, ...) at the start of each
+ *   processing cycle.
+ *
  * DATA INTEGRITY RULES:
- * - has_angle / has_temp:     whether to include the field in JSON at all
- * - angle_valid / temp_valid: true = show values, false = show null
- * - accel[i].valid:           per-sample flag; false = publish that sample as null
+ *   - has_angle / has_temp:     whether to include the field in JSON at all
+ *   - angle_valid / temp_valid: true = show values, false = show null
+ *   - accel[i].valid:           per-sample flag; false = publish as null
  */
 typedef struct {
-    uint32_t timestamp;
+    uint64_t timestamp;     /**< Microseconds since Unix epoch (PTP-synchronized) */
 
     // Accelerometer (always present, but individual samples may be null)
     mqtt_accel_sample_t accel[MQTT_ACCEL_BATCH_SIZE];
     int accel_count;
 
     // Inclinometer
-    bool has_angle;         // Include "i" field in JSON?
-    bool angle_valid;       // true = show values, false = show null
+    bool has_angle;         /**< Include "i" field in JSON? */
+    bool angle_valid;       /**< true = show values, false = show null */
     float angle_x;
     float angle_y;
     float angle_z;
 
     // Temperature
-    bool has_temp;          // Include "T" field in JSON?
-    bool temp_valid;        // true = show value, false = show null
+    bool has_temp;          /**< Include "T" field in JSON? */
+    bool temp_valid;        /**< true = show value, false = show null */
     float temperature;
 
 } mqtt_sensor_packet_t;
@@ -113,9 +116,10 @@ typedef struct {
  *
  * MUST be called AFTER ethernet_wait_for_ip() and BEFORE mqtt_init().
  * Pass the netif handle from your ethernet layer: ethernet_get_netif().
- * call order in main.c:
+ * Call order in main.c:
  *   ethernet_init();
  *   ethernet_wait_for_ip(10000);
+ *   ptp_init_and_sync();           // NEW: wait for PTP sync before MQTT
  *   mqtt_mdns_init(ethernet_get_netif());
  *   mqtt_init();
  *   mqtt_wait_for_connection(10000);
@@ -130,7 +134,6 @@ esp_err_t mqtt_mdns_init(esp_netif_t *netif);
  *
  * Reads the ESP32 Ethernet MAC address, builds the client ID and topic
  * strings, then starts the MQTT client and begins connecting to the broker.
- * Call mqtt_wait_for_connection() afterwards if you need to block until ready.
  *
  * @return ESP_OK on success, or an error code.
  */
@@ -158,22 +161,13 @@ esp_err_t mqtt_publish(const char *topic, const char *data, int len);
 /** @brief Stop and clean up the MQTT client. */
 esp_err_t mqtt_deinit(void);
 
-/**
- * @brief Return the generated client ID string.
- *        e.g. "wind_turbine_AABBCCDDEEFF"
- */
+/** @brief Return the generated client ID string. */
 const char *mqtt_get_client_id(void);
 
-/**
- * @brief Return the generated data topic string.
- *        e.g. "wind_turbine/AABBCCDDEEFF/data"
- */
+/** @brief Return the generated data topic string. */
 const char *mqtt_get_topic_data(void);
 
-/**
- * @brief Return the generated status topic string.
- *        e.g. "wind_turbine/AABBCCDDEEFF/status"
- */
+/** @brief Return the generated status topic string. */
 const char *mqtt_get_topic_status(void);
 
 #ifdef __cplusplus
