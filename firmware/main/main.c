@@ -498,11 +498,18 @@ void app_main(void)
     ESP_LOGI(TAG, "==============================================");
     ESP_LOGI(TAG, "  SYSTEM RUNNING");
     ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "  Node identity: %s", mqtt_get_serial_no());
+    ESP_LOGI(TAG, "  Data topic:    %s", mqtt_get_topic_data());
+    ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "  Data Flow:");
     ESP_LOGI(TAG, "  Sensors → ISR → Ring Buffers → Task → MQTT");
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "  Subscribe on Raspberry Pi:");
     ESP_LOGI(TAG, "  mosquitto_sub -t \"wind_turbine/#\" -v");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "  NOTE: If identity shows MAC-XXXXXXXXXXXX, this");
+    ESP_LOGI(TAG, "  node has no serial number provisioned yet.");
+    ESP_LOGI(TAG, "  See mqtt.h for NVS flashing instructions.");
     ESP_LOGI(TAG, "==============================================");
     ESP_LOGI(TAG, "");
 
