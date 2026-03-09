@@ -108,9 +108,59 @@ export function getSensorData(
   signal?: AbortSignal
 ) {
   const qs = new URLSearchParams();
-  qs.set("node", String(params.node));          // ✅ added
+  qs.set("node", String(params.node));          
   qs.set("minutes", String(params.minutes));
   if (params.channel) qs.set("channel", params.channel);
 
   return request<ApiResponse>(`${endpoint}?${qs.toString()}`, { signal });
+}
+
+
+/* --------------------------------------------------------------------------
+   Fault Log API
+   This section adds frontend support for retrieving fault logs from the
+   backend SQLite database via the /api/faults endpoint.
+   Supports optional filtering by node.
+-------------------------------------------------------------------------- */
+
+// Structure of a fault entry returned by backend
+export type FaultRow = {
+  id: number;
+  ts: string;
+  severity: "High" | "Warning" | "Info";
+  node_id: number;
+  sensor_id: string;
+  fault_type: string;
+
+  // Allow backend to add extra properties without breaking TypeScript
+  [key: string]: unknown;
+};
+
+// Response wrapper for fault log API
+export type FaultsResponse = {
+  faults: FaultRow[];
+
+  [key: string]: unknown;
+};
+
+// Fetch faults from backend
+export function getFaults(
+  params?: { node?: number; limit?: number },
+  signal?: AbortSignal
+) {
+  const qs = new URLSearchParams();
+
+  if (params?.node !== undefined) qs.set("node", String(params.node));
+  if (params?.limit !== undefined) qs.set("limit", String(params.limit));
+
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+
+  return request<FaultsResponse>(`/api/faults${suffix}`, { signal });
+}
+
+// Get storage information from backend
+export async function getStorage() {
+  const res = await fetch(`${API_BASE}/api/storage`);
+  if (!res.ok) throw new Error("storage failed");
+  return res.json();
 }
