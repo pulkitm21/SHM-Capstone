@@ -18,12 +18,19 @@
  *   Subscribe to:  wind_turbine/+/data
  *
  * TIMESTAMP FORMAT:
- * - packet.timestamp is a uint64_t containing microseconds since Unix epoch
- *   (January 1, 1970 00:00:00 UTC), derived from CLOCK_PTP_SYSTEM.
+ * - All sensor readings carry their own PTP-synchronized timestamp.
+ * - Timestamps are uint64_t microseconds since Unix epoch.
  * - On the Raspberry Pi: datetime.utcfromtimestamp(t / 1e6)
- * - This timestamp is synchronized across all nodes via PTP.
- *   DO NOT use esp_timer_get_time() or FreeRTOS ticks for this field —
+ * - Synchronized across all nodes via PTP (Raspberry Pi grandmaster).
+ * - DO NOT use esp_timer_get_time() or FreeRTOS ticks for timestamps —
  *   those are not PTP-disciplined and will not be aligned between nodes.
+ *
+ * JSON FORMAT:
+ * - {"a":[[t,x,y,z],...], "i":[t,x,y,z], "T":[t,val], "f":[...]}
+ *   a = accelerometer samples, each with its own timestamp
+ *   i = inclinometer [timestamp, x, y, z] or null
+ *   T = temperature [timestamp, value] or null
+ *   f = fault codes (optional, only present when faults exist)
  */
 
 #ifndef MQTT_H
@@ -42,16 +49,12 @@ extern "C" {
  * CONFIGURATION
  *****************************************************************************/
 
-/*
- * BROKER HOSTNAME: resolved at runtime via mDNS, no hardcoded IP needed.
- */
 #define MQTT_BROKER_HOSTNAME    "raspberrypi"
 #define MQTT_BROKER_URI         "mqtt://" MQTT_BROKER_HOSTNAME ".local:1883"
 
 #define MQTT_PUBLISH_QOS        0
 #define MQTT_ACCEL_BATCH_SIZE   100
 
-/* Fixed topic prefix: the node MAC is inserted between this and /data or /status */
 #define MQTT_TOPIC_PREFIX       "wind_turbine"
 
 /******************************************************************************
@@ -59,27 +62,28 @@ extern "C" {
  *****************************************************************************/
 
 /**
- * @brief Single accelerometer sample with per-sample validity flag.
+ * @brief Single accelerometer sample with per-sample timestamp and validity flag.
  *
- * valid = false means this sample was flagged as garbage by the processing
- * task and will be serialized as JSON null instead of [x, y, z].
+ * timestamp = microseconds since Unix epoch, PTP-synchronized.
+ * valid     = false means this sample was flagged as garbage and will be
+ *             serialized as JSON null instead of [t, x, y, z].
  */
 typedef struct {
     float x;
     float y;
     float z;
-    bool valid;     /**< false → serialize as null in JSON "a" array */
+    bool valid;
+    uint64_t timestamp;     /**< Microseconds since Unix epoch (PTP-synchronized) */
 } mqtt_accel_sample_t;
 
 /**
- * @brief Sensor data packet with validity flags.
+ * @brief Sensor data packet.
  *
- * TIMESTAMP:
- *   timestamp is microseconds since Unix epoch from CLOCK_PTP_SYSTEM.
- *   This is a PTP-synchronized wall-clock time shared across all nodes.
- *   It is set once per batch in data_processing_and_mqtt_task.c using
- *   esp_eth_clock_gettime(CLOCK_PTP_SYSTEM, ...) at the start of each
- *   processing cycle.
+ * ALL timestamps are microseconds since Unix epoch, PTP-synchronized.
+ * On the Raspberry Pi: datetime.utcfromtimestamp(t / 1e6)
+ *
+ * JSON format:
+ *   {"a":[[t,x,y,z],...], "i":[t,x,y,z], "T":[t,val]}
  *
  * DATA INTEGRITY RULES:
  *   - has_angle / has_temp:     whether to include the field in JSON at all
@@ -87,23 +91,23 @@ typedef struct {
  *   - accel[i].valid:           per-sample flag; false = publish as null
  */
 typedef struct {
-    uint64_t timestamp;     /**< Microseconds since Unix epoch (PTP-synchronized) */
-
-    // Accelerometer (always present, but individual samples may be null)
+    // Accelerometer (always present, individual samples may be null)
     mqtt_accel_sample_t accel[MQTT_ACCEL_BATCH_SIZE];
     int accel_count;
 
     // Inclinometer
-    bool has_angle;         /**< Include "i" field in JSON? */
-    bool angle_valid;       /**< true = show values, false = show null */
+    bool has_angle;             /**< Include "i" field in JSON? */
+    bool angle_valid;           /**< true = show values, false = show null */
     float angle_x;
     float angle_y;
     float angle_z;
+    uint64_t angle_timestamp;   /**< Microseconds since Unix epoch (PTP-synchronized) */
 
     // Temperature
-    bool has_temp;          /**< Include "T" field in JSON? */
-    bool temp_valid;        /**< true = show value, false = show null */
+    bool has_temp;              /**< Include "T" field in JSON? */
+    bool temp_valid;            /**< true = show value, false = show null */
     float temperature;
+    uint64_t temp_timestamp;    /**< Microseconds since Unix epoch (PTP-synchronized) */
 
 } mqtt_sensor_packet_t;
 
@@ -111,63 +115,16 @@ typedef struct {
  * PUBLIC FUNCTIONS
  *****************************************************************************/
 
-/**
- * @brief Initialise mDNS over the Ethernet netif for broker hostname resolution.
- *
- * MUST be called AFTER ethernet_wait_for_ip() and BEFORE mqtt_init().
- * Pass the netif handle from your ethernet layer: ethernet_get_netif().
- * Call order in main.c:
- *   ethernet_init();
- *   ethernet_wait_for_ip(10000);
- *   ptp_init_and_sync();           // NEW: wait for PTP sync before MQTT
- *   mqtt_mdns_init(ethernet_get_netif());
- *   mqtt_init();
- *   mqtt_wait_for_connection(10000);
- *
- * @param netif  The Ethernet netif handle (from ethernet_get_netif()).
- * @return ESP_OK on success, or an error code.
- */
 esp_err_t mqtt_mdns_init(esp_netif_t *netif);
-
-/**
- * @brief Initialise the MQTT client.
- *
- * Reads the ESP32 Ethernet MAC address, builds the client ID and topic
- * strings, then starts the MQTT client and begins connecting to the broker.
- *
- * @return ESP_OK on success, or an error code.
- */
 esp_err_t mqtt_init(void);
-
-/** @brief Returns true if the client is currently connected to the broker. */
 bool mqtt_is_connected(void);
-
-/**
- * @brief Block until connected to the broker (or timeout).
- * @param timeout_ms Maximum wait time in milliseconds.
- * @return ESP_OK if connected, ESP_ERR_TIMEOUT otherwise.
- */
 esp_err_t mqtt_wait_for_connection(uint32_t timeout_ms);
-
-/** @brief Publish a structured sensor data packet. */
 esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet);
-
-/** @brief Publish a plain-text status string to the status topic. */
 esp_err_t mqtt_publish_status(const char *status);
-
-/** @brief Publish arbitrary data to an arbitrary topic. */
 esp_err_t mqtt_publish(const char *topic, const char *data, int len);
-
-/** @brief Stop and clean up the MQTT client. */
 esp_err_t mqtt_deinit(void);
-
-/** @brief Return the generated client ID string. */
 const char *mqtt_get_client_id(void);
-
-/** @brief Return the generated data topic string. */
 const char *mqtt_get_topic_data(void);
-
-/** @brief Return the generated status topic string. */
 const char *mqtt_get_topic_status(void);
 
 #ifdef __cplusplus

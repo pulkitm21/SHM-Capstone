@@ -15,20 +15,21 @@
  *   ethernet_wait_for_ip() and BEFORE mqtt_init().
  *
  * TIMESTAMP FORMAT:
- * - packet.timestamp is uint64_t microseconds since Unix epoch from
- *   CLOCK_PTP_SYSTEM. Serialized in JSON as "t":<uint64> (no quotes).
+ * - All sensor readings carry their own PTP-synchronized timestamp.
+ * - Timestamps are uint64_t microseconds since Unix epoch.
  * - On the Raspberry Pi: datetime.utcfromtimestamp(t / 1e6)
  *
- * DATA INTEGRITY:
- * - Invalid/stale sensor data shows as "null" in JSON
- * - Individual accelerometer samples flagged as garbage also publish as null
+ * JSON FORMAT:
+ * - {"a":[[t,x,y,z],...], "i":[t,x,y,z], "T":[t,val]}
+ *   a = accelerometer array, each sample [t, x, y, z] or null if invalid
+ *   i = inclinometer [t, x, y, z] or null if invalid/unavailable
+ *   T = temperature [t, value] or null if invalid/unavailable
+ *   f = fault codes array (only present when faults exist)
  *
  * FAULT LOGGING:
  * - FAULT_MQTT_DISCONNECTED (4) logged on broker disconnect
  * - FAULT_MQTT_RECONNECTED  (5) logged on broker connect
  * - FAULT_MQTT_PUBLISH_FAIL (6) logged on publish failure
- * - Pending fault codes are appended to every outgoing sensor data packet
- *   under the "f" key by fault_log_append_to_json()
  */
 
 #include "mqtt.h"
@@ -105,7 +106,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 xEventGroupSetBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
                 xEventGroupClearBits(s_mqtt_event_group, MQTT_DISCONNECTED_BIT);
             }
-            /* FAULT 5: MQTT broker reconnected */
             fault_log_record(FAULT_MQTT_RECONNECTED);
             break;
 
@@ -116,7 +116,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 xEventGroupSetBits(s_mqtt_event_group, MQTT_DISCONNECTED_BIT);
                 xEventGroupClearBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
             }
-            /* FAULT 4: MQTT broker disconnected */
             fault_log_record(FAULT_MQTT_DISCONNECTED);
             break;
 
@@ -143,7 +142,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 esp_err_t mqtt_mdns_init(esp_netif_t *netif)
 {
     if (netif == NULL) {
-        ESP_LOGE(TAG, "mqtt_mdns_init: netif is NULL — pass ethernet_get_netif()");
+        ESP_LOGE(TAG, "mqtt_mdns_init: netif is NULL");
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -270,15 +269,12 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
     int offset = 0;
 
     /* ------------------------------------------------------------------
-     * Timestamp: uint64_t microseconds since Unix epoch (PTP-synchronized).
-     *
-     * Uses %llu to correctly serialize a 64-bit unsigned integer.
-     * On the Raspberry Pi subscriber: datetime.utcfromtimestamp(t / 1e6)
+     * Accelerometer array.
+     * Each valid sample: [t, x, y, z]  (t = us since Unix epoch)
+     * Invalid sample:    null
      * ------------------------------------------------------------------ */
-    offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                       "{\"t\":%llu,\"a\":[", (unsigned long long)packet->timestamp);
+    offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, "{\"a\":[");
 
-    // Accelerometer array
     for (int i = 0; i < packet->accel_count && i < MQTT_ACCEL_BATCH_SIZE; i++) {
         if (i > 0) {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, ",");
@@ -286,7 +282,8 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
 
         if (packet->accel[i].valid) {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                               "[%.4f,%.4f,%.4f]",
+                               "[%llu,%.4f,%.4f,%.4f]",
+                               (unsigned long long)packet->accel[i].timestamp,
                                packet->accel[i].x,
                                packet->accel[i].y,
                                packet->accel[i].z);
@@ -300,51 +297,59 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
         }
     }
 
-    // Close accelerometer array
     offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, "]");
 
-    // Inclinometer
+    /* ------------------------------------------------------------------
+     * Inclinometer.
+     * Valid:   "i":[t, x, y, z]
+     * Invalid: "i":null
+     * ------------------------------------------------------------------ */
     if (packet->has_angle) {
         if (packet->angle_valid) {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                               ",\"i\":[%.4f,%.4f,%.4f]",
-                               packet->angle_x, packet->angle_y, packet->angle_z);
+                               ",\"i\":[%llu,%.4f,%.4f,%.4f]",
+                               (unsigned long long)packet->angle_timestamp,
+                               packet->angle_x,
+                               packet->angle_y,
+                               packet->angle_z);
         } else {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
                                ",\"i\":null");
         }
     }
 
-    // Temperature
+    /* ------------------------------------------------------------------
+     * Temperature.
+     * Valid:   "T":[t, value]
+     * Invalid: "T":null
+     * ------------------------------------------------------------------ */
     if (packet->has_temp) {
         if (packet->temp_valid) {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                               ",\"T\":%.2f", packet->temperature);
+                               ",\"T\":[%llu,%.2f]",
+                               (unsigned long long)packet->temp_timestamp,
+                               packet->temperature);
         } else {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
                                ",\"T\":null");
         }
     }
 
-    /* -----------------------------------------------------------------------
-     * FAULT LOG: append "f":[...] if any fault codes are pending.
-     * fault_log_append_to_json() clears the pending list after writing.
-     * --------------------------------------------------------------------- */
+    /* ------------------------------------------------------------------
+     * Fault log (only appended when faults are pending).
+     * ------------------------------------------------------------------ */
     if (fault_log_has_pending()) {
         offset = fault_log_append_to_json(s_json_buffer, JSON_BUFFER_SIZE, offset);
     }
 
-    // Close JSON object
     offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, "}");
 
-    // Publish
     int msg_id = esp_mqtt_client_publish(s_mqtt_client, s_topic_data,
                                           s_json_buffer, offset,
                                           MQTT_PUBLISH_QOS, 0);
 
     if (msg_id < 0) {
         ESP_LOGE(TAG, "Failed to publish sensor data");
-        /* FAULT 6: publish failed */
         fault_log_record(FAULT_MQTT_PUBLISH_FAIL);
         return ESP_FAIL;
     }
@@ -414,10 +419,6 @@ esp_err_t mqtt_deinit(void)
     ESP_LOGI(TAG, "MQTT client deinitialized");
     return ESP_OK;
 }
-
-/******************************************************************************
- * IDENTITY ACCESSORS
- *****************************************************************************/
 
 const char *mqtt_get_client_id(void)    { return s_client_id; }
 const char *mqtt_get_topic_data(void)   { return s_topic_data; }

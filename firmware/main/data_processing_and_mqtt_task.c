@@ -19,16 +19,15 @@
  *   - Any converted angle magnitude > 91° → physically impossible
  *
  * TIMESTAMPING:
- * - packet.timestamp is set from CLOCK_PTP_SYSTEM once per processing cycle.
- * - It represents microseconds since Unix epoch, synchronized across all
- *   nodes via PTP (Raspberry Pi is grandmaster).
- * IMPORTANT: clock_gettime(CLOCK_REALTIME, ...) is used. On this ESP32
- *   build, CLOCK_REALTIME is disciplined by the PTP daemon (ptpd.c) which
- *   continuously adjusts it to track the Raspberry Pi grandmaster clock.
- *   Do NOT substitute esp_timer_get_time() — that clock is not PTP-disciplined
- *   and will not be synchronized across nodes.
- * - If the PTP daemon has not yet set the clock (timestamp is before 2024),
- *   the packet is dropped rather than published with a garbage timestamp.
+ * - All sensor readings carry their own PTP-synchronized timestamp.
+ * - Uses clock_gettime(CLOCK_REALTIME), disciplined by ptpd.c to track
+ *   the Raspberry Pi grandmaster clock.
+ * - Accelerometer: per-sample timestamp computed from PTP wall-clock at
+ *   the start of each 50ms cycle minus the FreeRTOS tick offset for each
+ *   individual decimated sample.
+ * - Inclinometer: timestamped at the moment it is read from the ring buffer.
+ * - Temperature: timestamped at the moment it is read from the sensor.
+ * - If PTP has not yet synced (time is before 2024), packets are dropped.
  *
  * FAULT LOGGING:
  * - FAULT_ADXL355_DROPPED (7): logged when adxl355 overflow counter increases
@@ -44,13 +43,13 @@
 #include "adt7420.h"
 #include "mqtt.h"
 #include "esp_log.h"
-#include "esp_eth_time.h"       // esp_eth_clock_gettime(), CLOCK_PTP_SYSTEM
+#include "esp_eth_time.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
 #include <string.h>
 #include <math.h>
-#include <time.h>               // struct timespec
+#include <time.h>
 
 static const char *TAG = "DATA_PROC";
 
@@ -73,8 +72,8 @@ static float     s_accel_y[ACCEL_SAMPLES_PER_BATCH];
 static float     s_accel_z[ACCEL_SAMPLES_PER_BATCH];
 static bool      s_accel_valid[ACCEL_SAMPLES_PER_BATCH];
 static uint32_t  s_accel_ticks[ACCEL_SAMPLES_PER_BATCH];
+static uint64_t  s_accel_timestamps_us[ACCEL_SAMPLES_PER_BATCH];
 
-// Temperature reading interval
 #define TEMP_READ_INTERVAL_MS   1000
 
 /******************************************************************************
@@ -102,12 +101,9 @@ static inline float convert_scl3300_to_deg(int16_t raw)
 /******************************************************************************
  * PTP TIMESTAMP HELPER
  *
- * Returns microseconds since Unix epoch from CLOCK_PTP_SYSTEM.
- * Returns 0 if the PTP clock is not yet available.
- *
- * This is the ONLY correct clock to use for packet timestamps. Do not
- * substitute esp_timer_get_time() or CLOCK_REALTIME — they are not
- * disciplined by PTP and will not be synchronized across nodes.
+ * Returns microseconds since Unix epoch from CLOCK_REALTIME, disciplined
+ * by ptpd.c to track the Raspberry Pi grandmaster clock.
+ * Returns 0 if PTP has not yet synced (time is before Jan 1 2024).
  *****************************************************************************/
 
 static uint64_t get_ptp_timestamp_us(void)
@@ -118,10 +114,6 @@ static uint64_t get_ptp_timestamp_us(void)
         return 0ULL;
     }
 
-    /* Sanity check: if time is before Jan 1 2024, PTP has not synced yet.
-     * CLOCK_REALTIME on ESP32 starts at 0 (Unix epoch) on boot and is
-     * only set to real wall-clock time once ptpd receives Sync packets
-     * from the Raspberry Pi grandmaster and calls clock_settime(). */
     const time_t JAN_2024 = 1704067200;
     if (ts.tv_sec < JAN_2024) {
         ESP_LOGW(TAG, "PTP not yet synced (time=%llu s) — timestamp will be 0",
@@ -204,14 +196,15 @@ static void data_processing_task(void *pvParameters)
     uint32_t last_temp_read_ms = 0;
     float current_temp = 0.0f;
     bool temp_valid = false;
+    uint64_t temp_timestamp_us = 0;
 
     // Inclinometer state
     float current_incl_x = 0.0f;
     float current_incl_y = 0.0f;
     float current_incl_z = 0.0f;
     bool incl_valid = false;
+    uint64_t incl_timestamp_us = 0;
 
-    /* Overflow counters from previous cycle — used to detect new drops */
     uint32_t prev_adxl355_overflow = 0;
     uint32_t prev_scl3300_overflow = 0;
     uint32_t prev_adt7420_overflow = 0;
@@ -220,20 +213,14 @@ static void data_processing_task(void *pvParameters)
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
         /* =================================================================
-         * Take one PTP timestamp at the START of this processing cycle.
-         *
-         * This is the wall-clock anchor for the entire batch. It is set
-         * here — once per 50ms cycle — so we are not calling
-         * esp_eth_clock_gettime() for every individual sample (which would
-         * be 1000 calls/sec and adds unnecessary overhead).
-         *
-         * This timestamp represents when we started processing this batch.
-         * On the Raspberry Pi: datetime.utcfromtimestamp(t / 1e6)
+         * Sample PTP wall-clock and FreeRTOS tick together.
+         * Used to compute per-sample accelerometer timestamps.
          * ================================================================= */
         uint64_t cycle_timestamp_us = get_ptp_timestamp_us();
+        uint32_t cycle_tick = xTaskGetTickCount();
 
         /* =================================================================
-         * FAULT CHECK: ring buffer overflows (sample drops)
+         * FAULT CHECK: ring buffer overflows
          * ================================================================= */
         uint32_t cur_adxl355_overflow = adxl355_get_overflow_count();
         uint32_t cur_scl3300_overflow = scl3300_get_overflow_count();
@@ -245,14 +232,12 @@ static void data_processing_task(void *pvParameters)
                      (unsigned long)cur_adxl355_overflow);
             prev_adxl355_overflow = cur_adxl355_overflow;
         }
-
         if (cur_scl3300_overflow != prev_scl3300_overflow) {
             fault_log_record(FAULT_SCL3300_DROPPED);
             ESP_LOGW(TAG, "SCL3300 samples dropped (overflow count: %lu)",
                      (unsigned long)cur_scl3300_overflow);
             prev_scl3300_overflow = cur_scl3300_overflow;
         }
-
         if (cur_adt7420_overflow != prev_adt7420_overflow) {
             fault_log_record(FAULT_ADT7420_DROPPED);
             ESP_LOGW(TAG, "ADT7420 samples dropped (overflow count: %lu)",
@@ -261,7 +246,8 @@ static void data_processing_task(void *pvParameters)
         }
 
         /* =================================================================
-         * Read Temperature directly via I2C (every 1 second)
+         * Read Temperature via I2C (every 1 second).
+         * Timestamp is taken immediately after a successful read.
          * ================================================================= */
         if ((now_ms - last_temp_read_ms) >= TEMP_READ_INTERVAL_MS) {
             last_temp_read_ms = now_ms;
@@ -272,10 +258,10 @@ static void data_processing_task(void *pvParameters)
             if (err == ESP_OK) {
                 current_temp = temp_celsius;
                 temp_valid = true;
+                temp_timestamp_us = get_ptp_timestamp_us();
             } else {
                 temp_valid = false;
                 s_temp_read_errors++;
-                /* FAULT 18: I2C bus error during mid-run temperature read */
                 fault_log_record(FAULT_I2C_ERROR);
                 ESP_LOGW(TAG, "Temperature read FAILED (I2C error): %s (error #%lu)",
                          esp_err_to_name(err), (unsigned long)s_temp_read_errors);
@@ -283,18 +269,18 @@ static void data_processing_task(void *pvParameters)
         }
 
         /* =================================================================
-         * Read ALL available SCL3300 samples from ring buffer
+         * Read ALL available SCL3300 samples from ring buffer.
+         * Timestamp is taken after the last valid sample is processed,
+         * representing when we read it out of the ring buffer this cycle.
          * ================================================================= */
         incl_valid = false;
 
         while (scl3300_data_available()) {
             if (scl3300_read_sample(&scl_sample)) {
-
                 if (is_incl_garbage(scl_sample.raw_x, scl_sample.raw_y, scl_sample.raw_z)) {
                     s_incl_garbage_count++;
-                    /* FAULT 17: treat garbage inclinometer read as an SPI bus error */
                     fault_log_record(FAULT_SPI_ERROR);
-                    ESP_LOGW(TAG, "Inclinometer garbage detected (raw: %d %d %d) → null (total: %lu)",
+                    ESP_LOGW(TAG, "Inclinometer garbage detected (raw: %d %d %d) -> null (total: %lu)",
                              scl_sample.raw_x, scl_sample.raw_y, scl_sample.raw_z,
                              (unsigned long)s_incl_garbage_count);
                 } else {
@@ -302,6 +288,8 @@ static void data_processing_task(void *pvParameters)
                     current_incl_y = convert_scl3300_to_deg(scl_sample.raw_y);
                     current_incl_z = convert_scl3300_to_deg(scl_sample.raw_z);
                     incl_valid = true;
+                    /* Timestamp at the moment this sample was read from the buffer */
+                    incl_timestamp_us = get_ptp_timestamp_us();
                 }
             }
         }
@@ -311,7 +299,8 @@ static void data_processing_task(void *pvParameters)
         }
 
         /* =================================================================
-         * Read ALL available ADXL355 samples (with decimation)
+         * Read ALL available ADXL355 samples (with decimation).
+         * Per-sample timestamps computed from cycle_tick / cycle_timestamp_us.
          * ================================================================= */
         while (adxl355_data_available() && s_task_running) {
             if (adxl355_read_sample(&adxl_sample)) {
@@ -332,12 +321,10 @@ static void data_processing_task(void *pvParameters)
 
                     if (is_accel_garbage(avg_raw_x, avg_raw_y, avg_raw_z)) {
                         s_accel_garbage_count++;
-                        /* FAULT 17: garbage accel read treated as SPI error */
                         fault_log_record(FAULT_SPI_ERROR);
-                        ESP_LOGW(TAG, "Accel garbage detected (raw: %ld %ld %ld) → null (total: %lu)",
+                        ESP_LOGW(TAG, "Accel garbage detected (raw: %ld %ld %ld) -> null (total: %lu)",
                                  (long)avg_raw_x, (long)avg_raw_y, (long)avg_raw_z,
                                  (unsigned long)s_accel_garbage_count);
-
                         s_accel_x[accel_batch_count] = 0.0f;
                         s_accel_y[accel_batch_count] = 0.0f;
                         s_accel_z[accel_batch_count] = 0.0f;
@@ -350,6 +337,23 @@ static void data_processing_task(void *pvParameters)
                     }
 
                     s_accel_ticks[accel_batch_count] = decim_first_tick;
+
+                    /* -------------------------------------------------
+                     * Per-sample timestamp:
+                     * sample_time = cycle_timestamp_us
+                     *               - (cycle_tick - decim_first_tick)
+                     *                 * portTICK_PERIOD_MS * 1000
+                     * Guard against underflow.
+                     * ------------------------------------------------- */
+                    uint32_t tick_delta = cycle_tick - decim_first_tick;
+                    uint64_t offset_us  = (uint64_t)tick_delta
+                                          * (uint64_t)portTICK_PERIOD_MS
+                                          * 1000ULL;
+                    s_accel_timestamps_us[accel_batch_count] =
+                        (cycle_timestamp_us > offset_us)
+                        ? (cycle_timestamp_us - offset_us)
+                        : cycle_timestamp_us;
+
                     accel_batch_count++;
 
                     decim_count = 0;
@@ -359,17 +363,6 @@ static void data_processing_task(void *pvParameters)
 
                     if (accel_batch_count >= ACCEL_SAMPLES_PER_BATCH) {
 
-                        /* -----------------------------------------------------
-                         * Drop the packet if PTP timestamp is not yet available.
-                         *
-                         * A timestamp of 0 means esp_eth_clock_gettime() returned
-                         * -1 — the PTP clock has not yet synced. Publishing a
-                         * packet with timestamp=0 would be misleading on the Pi.
-                         * This should never happen in normal operation because
-                         * main.c blocks in ptp_init_and_sync() until the clock
-                         * is valid before starting sensor acquisition, but we
-                         * guard here defensively.
-                         * ----------------------------------------------------- */
                         if (cycle_timestamp_us == 0ULL) {
                             s_samples_dropped += accel_batch_count;
                             ESP_LOGW(TAG, "PTP timestamp not available — dropped %d samples",
@@ -381,38 +374,31 @@ static void data_processing_task(void *pvParameters)
                         if (mqtt_is_connected()) {
                             mqtt_sensor_packet_t packet = {0};
 
-                            /* --------------------------------------------------
-                             * Set PTP-synchronized wall-clock timestamp.
-                             * This is microseconds since Unix epoch from
-                             * CLOCK_PTP_SYSTEM, taken at the start of this cycle.
-                             * -------------------------------------------------- */
-                            packet.timestamp = cycle_timestamp_us;
-
                             packet.accel_count = accel_batch_count;
-
                             for (int i = 0; i < accel_batch_count; i++) {
-                                packet.accel[i].x     = s_accel_x[i];
-                                packet.accel[i].y     = s_accel_y[i];
-                                packet.accel[i].z     = s_accel_z[i];
-                                packet.accel[i].valid = s_accel_valid[i];
+                                packet.accel[i].x         = s_accel_x[i];
+                                packet.accel[i].y         = s_accel_y[i];
+                                packet.accel[i].z         = s_accel_z[i];
+                                packet.accel[i].valid     = s_accel_valid[i];
+                                packet.accel[i].timestamp = s_accel_timestamps_us[i];
                             }
 
-                            packet.has_angle   = true;
-                            packet.angle_valid = incl_valid;
+                            packet.has_angle       = true;
+                            packet.angle_valid     = incl_valid;
+                            packet.angle_timestamp = incl_timestamp_us;
                             if (incl_valid) {
                                 packet.angle_x = current_incl_x;
                                 packet.angle_y = current_incl_y;
                                 packet.angle_z = current_incl_z;
                             }
 
-                            packet.has_temp   = true;
-                            packet.temp_valid = temp_valid;
+                            packet.has_temp       = true;
+                            packet.temp_valid     = temp_valid;
+                            packet.temp_timestamp = temp_timestamp_us;
                             if (temp_valid) {
                                 packet.temperature = current_temp;
                             }
 
-                            /* Publish — fault codes appended inside
-                             * mqtt_publish_sensor_data() */
                             if (mqtt_publish_sensor_data(&packet) == ESP_OK) {
                                 s_samples_published += accel_batch_count;
                                 s_packets_sent++;
