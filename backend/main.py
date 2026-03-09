@@ -329,8 +329,6 @@ def api_temperature(
 import shutil
 from fastapi import FastAPI
 
-app=FastAPI()
-
 @app.get("/api/storage")
 def get_storage():
     
