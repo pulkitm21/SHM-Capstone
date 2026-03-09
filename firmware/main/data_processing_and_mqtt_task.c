@@ -29,6 +29,11 @@
  * - Temperature: timestamped at the moment it is read from the sensor.
  * - If PTP has not yet synced (time is before 2024), packets are dropped.
  *
+ * DECIMATION FIX:
+ * - The while loop breaks immediately after publishing a full batch.
+ * - This ensures exactly one batch is published per 50ms cycle and
+ *   prevents stale partial-batch accumulation across cycles.
+ *
  * FAULT LOGGING:
  * - FAULT_ADXL355_DROPPED (7): logged when adxl355 overflow counter increases
  * - FAULT_SCL3300_DROPPED (8): logged when scl3300 overflow counter increases
@@ -247,7 +252,7 @@ static void data_processing_task(void *pvParameters)
 
         /* =================================================================
          * Read Temperature via I2C (every 1 second).
-         * Timestamp is taken immediately after a successful read.
+         * Timestamp taken immediately after a successful read.
          * ================================================================= */
         if ((now_ms - last_temp_read_ms) >= TEMP_READ_INTERVAL_MS) {
             last_temp_read_ms = now_ms;
@@ -270,8 +275,7 @@ static void data_processing_task(void *pvParameters)
 
         /* =================================================================
          * Read ALL available SCL3300 samples from ring buffer.
-         * Timestamp is taken after the last valid sample is processed,
-         * representing when we read it out of the ring buffer this cycle.
+         * Timestamp taken after the last valid sample this cycle.
          * ================================================================= */
         incl_valid = false;
 
@@ -288,7 +292,6 @@ static void data_processing_task(void *pvParameters)
                     current_incl_y = convert_scl3300_to_deg(scl_sample.raw_y);
                     current_incl_z = convert_scl3300_to_deg(scl_sample.raw_z);
                     incl_valid = true;
-                    /* Timestamp at the moment this sample was read from the buffer */
                     incl_timestamp_us = get_ptp_timestamp_us();
                 }
             }
@@ -299,8 +302,11 @@ static void data_processing_task(void *pvParameters)
         }
 
         /* =================================================================
-         * Read ALL available ADXL355 samples (with decimation).
-         * Per-sample timestamps computed from cycle_tick / cycle_timestamp_us.
+         * Read ADXL355 samples with decimation.
+         *
+         * IMPORTANT: break out of the while loop immediately after
+         * publishing a full batch. This ensures exactly one batch per
+         * 50ms cycle and prevents stale partial-batch accumulation.
          * ================================================================= */
         while (adxl355_data_available() && s_task_running) {
             if (adxl355_read_sample(&adxl_sample)) {
@@ -338,13 +344,7 @@ static void data_processing_task(void *pvParameters)
 
                     s_accel_ticks[accel_batch_count] = decim_first_tick;
 
-                    /* -------------------------------------------------
-                     * Per-sample timestamp:
-                     * sample_time = cycle_timestamp_us
-                     *               - (cycle_tick - decim_first_tick)
-                     *                 * portTICK_PERIOD_MS * 1000
-                     * Guard against underflow.
-                     * ------------------------------------------------- */
+                    /* Per-sample PTP timestamp */
                     uint32_t tick_delta = cycle_tick - decim_first_tick;
                     uint64_t offset_us  = (uint64_t)tick_delta
                                           * (uint64_t)portTICK_PERIOD_MS
@@ -368,7 +368,7 @@ static void data_processing_task(void *pvParameters)
                             ESP_LOGW(TAG, "PTP timestamp not available — dropped %d samples",
                                      accel_batch_count);
                             accel_batch_count = 0;
-                            continue;
+                            break;  // exit while loop, wait for next cycle
                         }
 
                         if (mqtt_is_connected()) {
@@ -414,6 +414,7 @@ static void data_processing_task(void *pvParameters)
                         }
 
                         accel_batch_count = 0;
+                        break;  // exit while loop, let vTaskDelay fire next cycle
                     }
                 }
             }
