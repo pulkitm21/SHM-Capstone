@@ -107,13 +107,12 @@ export function getSensorData(
 export type FaultRow = {
   id: number;
   ts: string;
-  severity: "High" | "Warning" | "Info";
-  node_id: number;
-  sensor_id: string;
+  serial_number: string;
+  sensor_type: string;
   fault_type: string;
-  node_label?: string;
-  node_serial?: string;
-  node_online?: boolean;
+  severity: number;
+  fault_status: string;
+  description: string;
   [key: string]: unknown;
 };
 
@@ -123,12 +122,12 @@ export type FaultsResponse = {
 };
 
 export function getFaults(
-  params?: { node?: number; limit?: number },
+  params?: { serial_number?: string; limit?: number },
   signal?: AbortSignal
 ) {
   const qs = new URLSearchParams();
 
-  if (params?.node !== undefined) qs.set("node", String(params.node));
+  if (params?.serial_number) qs.set("serial_number", params.serial_number);
   if (params?.limit !== undefined) qs.set("limit", String(params.limit));
 
   const suffix = qs.toString() ? `?${qs.toString()}` : "";

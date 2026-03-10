@@ -27,13 +27,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DATA_DIR = Path("/home/pi/Data")
+DATA_DIR = Path("/mnt/ssd")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 ACCEL_BIN = DATA_DIR / "accel_data_20260219.bin"
 INCL_BIN = DATA_DIR / "incl_data.bin"
 TEMP_BIN = DATA_DIR / "temp_data.bin"
-FAULTS_DB = DATA_DIR / "faults.db"
+
+FAULT_DIR = Path("/mnt/ssd/fault")
+FAULT_DIR.mkdir(parents=True, exist_ok=True)
+FAULTS_DB = FAULT_DIR / "faults.db"
 
 ACCEL_FORMAT = "<dfff"
 ACCEL_SIZE = struct.calcsize(ACCEL_FORMAT)
@@ -218,7 +221,7 @@ def put_settings(payload: SettingsModel):
 
 @app.get("/api/faults")
 def get_faults(
-    node: Optional[int] = Query(default=None),
+    serial_number: Optional[str] = Query(default=None),
     limit: int = Query(default=200, ge=1, le=5000),
 ):
     if not FAULTS_DB.exists():
@@ -228,10 +231,10 @@ def get_faults(
     con.row_factory = sqlite3.Row
     cur = con.cursor()
 
-    if node is None:
+    if serial_number is None:
         cur.execute(
             """
-            SELECT id, node_id, sensor_id, fault_type, severity, ts
+            SELECT id, serial_number, sensor_type, fault_type, severity, fault_status, description, ts
             FROM faults
             ORDER BY ts DESC
             LIMIT ?
@@ -241,27 +244,17 @@ def get_faults(
     else:
         cur.execute(
             """
-            SELECT id, node_id, sensor_id, fault_type, severity, ts
+            SELECT id, serial_number, sensor_type, fault_type, severity, fault_status, description, ts
             FROM faults
-            WHERE node_id = ?
+            WHERE serial_number = ?
             ORDER BY ts DESC
             LIMIT ?
             """,
-            (node, limit),
+            (serial_number, limit),
         )
 
     rows = [dict(r) for r in cur.fetchall()]
     con.close()
-
-    for row in rows:
-        try:
-            reg = get_node_by_id(int(row["node_id"]), timeout_seconds=60)
-            if reg:
-                row["node_label"] = reg["label"]
-                row["node_serial"] = reg["serial"]
-                row["node_online"] = reg["online"]
-        except Exception:
-            pass
 
     return {"faults": rows}
 

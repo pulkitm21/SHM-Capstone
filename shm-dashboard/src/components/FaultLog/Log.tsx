@@ -5,19 +5,32 @@ import "./Log.css";
 type FaultEntry = {
   id: number;
   ts: string;
-  severity: "High" | "Warning" | "Info";
-  node_id: number;
-  sensor_id: string;
+  severity: number;
+  serial_number: string;
+  sensor_type: string;
   fault_type: string;
-  node_label?: string;
+  fault_status: string;
+  description: string;
 };
 
 type FaultLogProps = {
-  node?: number;
+  serial_number?: string;
   limit?: number;
 };
 
-export default function FaultLog({ node, limit = 200 }: FaultLogProps) {
+function getSeverityLabel(severity: number) {
+  if (severity >= 3) return "High";
+  if (severity === 2) return "Warning";
+  return "Info";
+}
+
+function getSeverityClass(severity: number) {
+  if (severity >= 3) return "high";
+  if (severity === 2) return "warning";
+  return "info";
+}
+
+export default function FaultLog({ serial_number, limit = 200 }: FaultLogProps) {
   const [faults, setFaults] = useState<FaultEntry[]>([]);
   const [status, setStatus] = useState("Loading…");
 
@@ -28,20 +41,20 @@ export default function FaultLog({ node, limit = 200 }: FaultLogProps) {
       try {
         setStatus("Loading…");
 
-        const res = await getFaults({ node, limit }, controller.signal);
+        const res = await getFaults({ serial_number, limit }, controller.signal);
 
         setFaults(res.faults ?? []);
         setStatus("");
       } catch (err: any) {
         console.error(err);
         setFaults([]);
-        setStatus(`Fault log load failed`);
+        setStatus("Fault log load failed");
       }
     }
 
     loadFaults();
     return () => controller.abort();
-  }, [node, limit]);
+  }, [serial_number, limit]);
 
   return (
     <div className="fault-log">
@@ -64,23 +77,32 @@ export default function FaultLog({ node, limit = 200 }: FaultLogProps) {
             </tr>
           )}
 
-          {faults.map((entry) => (
-            <tr key={entry.id}>
-              <td className="mono">{entry.ts}</td>
+          {faults.map((entry) => {
+            const severityLabel = getSeverityLabel(entry.severity);
+            const severityClass = getSeverityClass(entry.severity);
 
-              <td>
-                <span className={`status-pill ${entry.severity.toLowerCase()}`}>
-                  {entry.severity}
-                </span>
-              </td>
+            return (
+              <tr key={entry.id}>
+                <td className="mono">{entry.ts}</td>
 
-              <td>
-                {entry.node_label ?? `Node ${entry.node_id}`} – {entry.sensor_id}
-              </td>
+                <td>
+                  <span className={`status-pill ${severityClass}`}>
+                    {severityLabel}
+                  </span>
+                </td>
 
-              <td>{entry.fault_type}</td>
-            </tr>
-          ))}
+                <td>
+                  {entry.serial_number} – {entry.sensor_type}
+                </td>
+
+                <td>
+                  {entry.fault_type}
+                  {entry.description ? `: ${entry.description}` : ""}
+                  {entry.fault_status ? ` (${entry.fault_status})` : ""}
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>

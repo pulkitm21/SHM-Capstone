@@ -5,7 +5,7 @@ from typing import Optional
 
 from settings_store import ensure_node_defaults
 
-DATA_DIR = Path("/home/pi/Data")
+DATA_DIR = Path("/mnt/ssd")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 NODES_JSON = DATA_DIR / "nodes.json"

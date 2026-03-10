@@ -11,7 +11,7 @@ from settings_schema import (
     to_dict,
 )
 
-DATA_DIR = Path("/home/pi/Data")
+DATA_DIR = Path("/storage")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 SETTINGS_JSON = DATA_DIR / "settings.json"

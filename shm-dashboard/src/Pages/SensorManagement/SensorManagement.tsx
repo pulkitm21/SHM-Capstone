@@ -471,7 +471,7 @@ export default function SensorManagement() {
         <div className="sc-card">
           <div className="sc-card-title">Fault Log</div>
           <div className="sc-card-body">
-            <FaultLog node={nodeId || undefined} limit={10} />
+            <FaultLog serial_number={selectedNode?.serial} limit={10} />
           </div>
         </div>
       </div>
