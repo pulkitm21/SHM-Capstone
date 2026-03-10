@@ -3,11 +3,18 @@
  * @brief MQTT Client Implementation
  *
  * DEVICE IDENTIFICATION:
- * - At init time, the ESP32 Ethernet MAC address is read via esp_read_mac().
- * - A unique client ID and per-node topics are built from those 6 MAC bytes:
- *     Client ID:    wind_turbine_AABBCCDDEEFF
- *     Data topic:   wind_turbine/AABBCCDDEEFF/data
- *     Status topic: wind_turbine/AABBCCDDEEFF/status
+ * - At init time, the node's serial number is read from NVS (namespace "node_cfg",
+ *   key "serial_no").  If found, it is used as the node identity:
+ *     Client ID:    wind_turbine_WT01-N03
+ *     Data topic:   wind_turbine/WT01-N03/data
+ *     Status topic: wind_turbine/WT01-N03/status
+ * - If no serial number has been provisioned, the Ethernet MAC address is used
+ *   as a fallback so the node still appears on the broker, visibly unprovisioned:
+ *     Client ID:    wind_turbine_MAC-AABBCCDDEEFF
+ *     Data topic:   wind_turbine/MAC-AABBCCDDEEFF/data
+ *     Status topic: wind_turbine/MAC-AABBCCDDEEFF/status
+ *
+ * PROVISIONING: see mqtt.h for the one-time NVS flashing instructions.
  *
  * BROKER DISCOVERY:
  * - The broker URI uses an mDNS hostname ("raspberrypi.local") instead of a
@@ -36,8 +43,10 @@
 #include "fault_log.h"
 #include "mqtt_client.h"
 #include "esp_log.h"
-#include "esp_mac.h"
-#include "mdns.h"
+#include "esp_mac.h"          // esp_read_mac(), ESP_MAC_ETH
+#include "mdns.h"             // mDNS hostname resolution over Ethernet
+#include "nvs_flash.h"        // nvs_flash_init()
+#include "nvs.h"              // nvs_open(), nvs_get_str()
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include <stdio.h>
@@ -55,10 +64,21 @@ static bool s_is_connected = false;
 #define JSON_BUFFER_SIZE    4096
 static char *s_json_buffer = NULL;
 
-#define MAC_STR_LEN         12
-#define CLIENT_ID_MAX_LEN   32
+/*
+ * Runtime-generated identity strings.
+ *
+ * s_serial_no holds the provisioned serial number (e.g. "WT01-N03") or the
+ * MAC-based fallback (e.g. "MAC-AABBCCDDEEFF") if NVS has no entry yet.
+ *
+ * Sizes:
+ *   serial_no  = MQTT_SERIAL_MAX_LEN (32)
+ *   client_id  = "wind_turbine_" (13) + serial (32) + '\0' = 46  → use 64
+ *   topic      = "wind_turbine/" (13) + serial (32) + "/data" (5) + '\0' = 51 → use 64
+ */
+#define CLIENT_ID_MAX_LEN   64
 #define TOPIC_MAX_LEN       64
 
+static char s_serial_no[MQTT_SERIAL_MAX_LEN];
 static char s_client_id[CLIENT_ID_MAX_LEN];
 static char s_topic_data[TOPIC_MAX_LEN];
 static char s_topic_status[TOPIC_MAX_LEN];
@@ -67,26 +87,92 @@ static char s_topic_status[TOPIC_MAX_LEN];
  * INTERNAL HELPERS
  *****************************************************************************/
 
-static void build_identity_strings(void)
+/**
+ * @brief Try to read the serial number from NVS.
+ *
+ * Opens the "node_cfg" namespace and reads the "serial_no" string key.
+ * On success, copies the value into s_serial_no and returns ESP_OK.
+ * On any failure (NVS not initialised, key absent, etc.) returns an error
+ * code — the caller should then fall back to the MAC address.
+ */
+static esp_err_t read_serial_from_nvs(void)
+{
+    /* Initialise NVS flash if not already done by app_main */
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        /* NVS partition was truncated; erase and re-init (loses stored data) */
+        ESP_LOGW(TAG, "NVS partition issue (err=0x%x), erasing...", ret);
+        nvs_flash_erase();
+        ret = nvs_flash_init();
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_flash_init failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    nvs_handle_t handle;
+    ret = nvs_open(MQTT_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (ret != ESP_OK) {
+        /* Namespace does not exist yet — node has never been provisioned */
+        ESP_LOGW(TAG, "NVS namespace '%s' not found — node is unprovisioned",
+                 MQTT_NVS_NAMESPACE);
+        return ret;
+    }
+
+    size_t len = sizeof(s_serial_no);
+    ret = nvs_get_str(handle, MQTT_NVS_SERIAL_KEY, s_serial_no, &len);
+    nvs_close(handle);
+
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "NVS key '%s' not found in namespace '%s' — node is unprovisioned",
+                 MQTT_NVS_SERIAL_KEY, MQTT_NVS_NAMESPACE);
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "NVS serial number read: '%s'", s_serial_no);
+    return ESP_OK;
+}
+
+/**
+ * @brief Build the MAC-based fallback identity string into s_serial_no.
+ *
+ * Produces "MAC-AABBCCDDEEFF" so unprovisioned nodes are obviously visible
+ * on the broker and easy to distinguish from properly provisioned ones.
+ */
+static void build_mac_fallback(void)
 {
     uint8_t mac[6] = {0};
     esp_err_t ret = esp_read_mac(mac, ESP_MAC_ETH);
 
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to read Ethernet MAC (err=0x%x), using fallback ID", ret);
-        snprintf(s_client_id,    sizeof(s_client_id),    "%s_UNKNOWN", MQTT_TOPIC_PREFIX);
-        snprintf(s_topic_data,   sizeof(s_topic_data),   "%s/UNKNOWN/data",   MQTT_TOPIC_PREFIX);
-        snprintf(s_topic_status, sizeof(s_topic_status), "%s/UNKNOWN/status", MQTT_TOPIC_PREFIX);
+        ESP_LOGE(TAG, "Failed to read Ethernet MAC (err=0x%x), using UNKNOWN", ret);
+        snprintf(s_serial_no, sizeof(s_serial_no), "UNKNOWN");
         return;
     }
 
-    char mac_str[MAC_STR_LEN + 1];
-    snprintf(mac_str, sizeof(mac_str), "%02X%02X%02X%02X%02X%02X",
+    snprintf(s_serial_no, sizeof(s_serial_no), "MAC-%02X%02X%02X%02X%02X%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-    snprintf(s_client_id,    sizeof(s_client_id),    "%s_%s",         MQTT_TOPIC_PREFIX, mac_str);
-    snprintf(s_topic_data,   sizeof(s_topic_data),   "%s/%s/data",    MQTT_TOPIC_PREFIX, mac_str);
-    snprintf(s_topic_status, sizeof(s_topic_status), "%s/%s/status",  MQTT_TOPIC_PREFIX, mac_str);
+    ESP_LOGW(TAG, "Node is UNPROVISIONED — using MAC fallback ID: %s", s_serial_no);
+    ESP_LOGW(TAG, "Flash a serial number via NVS to assign a proper identity.");
+}
+
+/**
+ * @brief Resolve the node identity and build client ID + topic strings.
+ *
+ * Priority:
+ *   1. NVS serial number (e.g. "WT01-N03")   — provisioned node
+ *   2. MAC-based fallback (e.g. "MAC-AABBCCDDEEFF") — unprovisioned node
+ */
+static void build_identity_strings(void)
+{
+    if (read_serial_from_nvs() != ESP_OK) {
+        build_mac_fallback();
+    }
+
+    snprintf(s_client_id,    sizeof(s_client_id),    "%s_%s",        MQTT_TOPIC_PREFIX, s_serial_no);
+    snprintf(s_topic_data,   sizeof(s_topic_data),   "%s/%s/data",   MQTT_TOPIC_PREFIX, s_serial_no);
+    snprintf(s_topic_status, sizeof(s_topic_status), "%s/%s/status", MQTT_TOPIC_PREFIX, s_serial_no);
 }
 
 /******************************************************************************
@@ -180,6 +266,7 @@ esp_err_t mqtt_init(void)
     build_identity_strings();
 
     ESP_LOGI(TAG, "  Broker:    %s (resolved via mDNS)", MQTT_BROKER_URI);
+    ESP_LOGI(TAG, "  Serial No: %s", s_serial_no);
     ESP_LOGI(TAG, "  Client ID: %s", s_client_id);
     ESP_LOGI(TAG, "  Data topic:   %s", s_topic_data);
     ESP_LOGI(TAG, "  Status topic: %s", s_topic_status);
@@ -420,6 +507,26 @@ esp_err_t mqtt_deinit(void)
     return ESP_OK;
 }
 
-const char *mqtt_get_client_id(void)    { return s_client_id; }
-const char *mqtt_get_topic_data(void)   { return s_topic_data; }
-const char *mqtt_get_topic_status(void) { return s_topic_status; }
+/******************************************************************************
+ * IDENTITY ACCESSORS
+ *****************************************************************************/
+
+const char *mqtt_get_serial_no(void)
+{
+    return s_serial_no;
+}
+
+const char *mqtt_get_client_id(void)
+{
+    return s_client_id;
+}
+
+const char *mqtt_get_topic_data(void)
+{
+    return s_topic_data;
+}
+
+const char *mqtt_get_topic_status(void)
+{
+    return s_topic_status;
+}

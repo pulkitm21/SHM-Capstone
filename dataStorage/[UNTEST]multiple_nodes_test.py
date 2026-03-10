@@ -6,7 +6,7 @@ import paho.mqtt.client as mqtt
 
 BROKER_IP = "localhost"
 PORT = 1883
-TOPIC = "wind_turbine/+"
+TOPIC = "wind_turbine/+/data"
 DATA_DIR = "/home/pi/Data"
 
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -30,8 +30,8 @@ def get_daily_filenames(node_id):
     return date_str, accel_file, inclin_file, temp_file
 
 
-def on_connect(client, userdata, flags, rc):
-    print("Connected to broker")
+def on_connect(client, userdata, flags, reason_code, properties):
+    print("Connected with result code", reason_code)
     client.subscribe(TOPIC)
 
 
@@ -41,8 +41,6 @@ def on_message(client, userdata, msg):
     # Extract node ID from topic
     # Example: wind_turbine/node2 → node2
     topic_parts = msg.topic.split("/")
-    if len(topic_parts) != 2:
-        return
 
     node_id = topic_parts[1]
 
@@ -58,15 +56,20 @@ def on_message(client, userdata, msg):
 
     # --- Acceleration ---
     if "a" in data:
-        packet = struct.pack(
-            ACCEL_FORMAT,
-            timestamp,
-            float(data["a"][0]),
-            float(data["a"][1]),
-            float(data["a"][2]),
-        )
+        accel_samples = data["a"]  #[[x,y,z], [x,y,z], ...]
+
         with open(accel_path, "ab") as f:
-            f.write(packet)
+            for sample in accel_samples:
+                if len(sample) == 3:
+                    packet = struct.pack(
+                        ACCEL_FORMAT,
+                        timestamp,
+                        float(sample[0]),
+                        float(sample[1]),
+                        float(sample[2]),
+                    )
+                    with open(accel_path, "ab") as f:
+                        f.write(packet)
 
     # --- Inclinometer ---
     if "i" in data:
@@ -91,7 +94,7 @@ def on_message(client, userdata, msg):
             f.write(packet)
 
 
-client = mqtt.Client()
+client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 client.on_connect = on_connect
 client.on_message = on_message
 
