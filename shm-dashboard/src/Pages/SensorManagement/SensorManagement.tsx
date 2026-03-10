@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 
 import SensorStatus from "../../components/SensorStatus/SensorStatus";
 import SensorInfoCard, { type SensorMeta } from "../../components/SensorInfo/SensorInfo";
@@ -8,11 +8,17 @@ import FaultLog from "../../components/FaultLog/Log";
 import SensorFilters, { type SensorValue } from "../../components/SensorFilter/SensorFilter";
 import SensorLineChart from "../../components/SensorPlot/SensorPlot";
 
-import { getSettings, putSettings, getSensorData, type ApiResponse } from "../../services/api";
+import {
+  getSettings,
+  putSettings,
+  getSensorData,
+  getNodes,
+  type ApiResponse,
+  type NodeRecord,
+} from "../../services/api";
 
 import "./SensorManagement.css";
 
-// ---- SETTINGS CACHE (stores last known backend settings locally)
 const SETTINGS_CACHE_KEY = "shm_settings_cache";
 
 function loadCachedSettings():
@@ -37,12 +43,9 @@ function saveCachedSettings(metaByNode: any, configByNode: any) {
         config: configByNode,
       })
     );
-  } catch {
-    // ignore storage errors
-  }
+  } catch {}
 }
 
-// stores last known plot data per node/sensor/channel/timeframe
 const PLOT_CACHE_KEY = "shm_plot_cache";
 
 type PlotCacheRecord = {
@@ -51,12 +54,12 @@ type PlotCacheRecord = {
 };
 
 function plotCacheKey(params: {
-  node: number;
+  nodeKey: string;
   sensor: SensorValue;
   minutes: number;
   channel: string;
 }) {
-  return `${params.node}|${params.sensor}|${params.minutes}|${params.channel}`;
+  return `${params.nodeKey}|${params.sensor}|${params.minutes}|${params.channel}`;
 }
 
 function loadPlotCache(): Record<string, PlotCacheRecord> {
@@ -76,9 +79,7 @@ function savePlotCacheEntry(key: string, data: ApiResponse) {
     const all = loadPlotCache();
     all[key] = { savedAt: new Date().toISOString(), data };
     localStorage.setItem(PLOT_CACHE_KEY, JSON.stringify(all));
-  } catch {
-    // ignore storage errors
-  }
+  } catch {}
 }
 
 const SENSOR_OPTIONS = [
@@ -115,25 +116,24 @@ const ENDPOINT_BY_SENSOR: Record<SensorValue, string> = {
   temperature: "/api/temperature",
 };
 
-// Frontend fallback defaults. To be removed later when backend is fully implemented and stable.
 const FALLBACK_META: Record<SensorValue, SensorMeta> = {
   accelerometer: {
     model: "ADXL355",
-    serial: "SN00023",
+    serial: "ACCEL-001",
     installationDate: "2024-03-15",
     location: "Tower",
     orientation: "+X +Y +Z",
   },
   inclinometer: {
     model: "SCL3300",
-    serial: "SN00110",
+    serial: "INCL-001",
     installationDate: "2024-03-15",
     location: "Foundation",
     orientation: "Pitch/Roll",
   },
   temperature: {
     model: "ADT7420",
-    serial: "SN00402",
+    serial: "TEMP-001",
     installationDate: "2024-03-15",
     location: "Tower",
     orientation: "N/A",
@@ -161,7 +161,6 @@ const FALLBACK_CONFIG: Record<SensorValue, SensorConfig> = {
   },
 };
 
-// Utility: normalize object keys like {"1": ...} into {1: ...}
 function normalizeNodeKeyedObject<T>(obj: any): Record<number, T> {
   const out: Record<number, T> = {};
   if (!obj || typeof obj !== "object") return out;
@@ -173,54 +172,98 @@ function normalizeNodeKeyedObject<T>(obj: any): Record<number, T> {
   return out;
 }
 
-export default function Home() {
+export default function SensorManagement() {
   const navigate = useNavigate();
-  const isOnline = true;
+  const [searchParams] = useSearchParams();
+  const requestedSerial = searchParams.get("serial");
 
-  const [node, setNode] = useState<number>(1);
   const [sensor, setSensor] = useState<SensorValue>("accelerometer");
   const [timeframeMin, setTimeframeMin] = useState<number>(60);
   const [channel, setChannel] = useState<string>("all");
 
-  // Keep this behavior: sensor change resets channel to "all"
+  const [nodes, setNodes] = useState<NodeRecord[]>([]);
+  const [nodesStatus, setNodesStatus] = useState<string>("");
+  const [selectedNodeLabel, setSelectedNodeLabel] = useState<string>("");
+
   useEffect(() => setChannel("all"), [sensor]);
 
-  const NODE_OPTIONS = useMemo(() => Array.from({ length: 5 }, (_, i) => i + 1), []);
+  useEffect(() => {
+    let mounted = true;
 
-  // INITIALIZE SETTINGS STATE FROM CACHE (if available)
+    async function loadNodeList() {
+      try {
+        const res = await getNodes();
+        if (!mounted) return;
+
+        const nextNodes = res.nodes ?? [];
+        setNodes(nextNodes);
+        setNodesStatus("");
+      } catch (e: any) {
+        if (!mounted) return;
+
+        setNodes([]);
+        setNodesStatus(`Node list load failed: ${e?.message ?? "Unknown error"}`);
+      }
+    }
+
+    loadNodeList();
+  }, []);
+
+  useEffect(() => {
+    if (!nodes.length) {
+      setSelectedNodeLabel("");
+      return;
+    }
+
+    if (requestedSerial) {
+      const matched = nodes.find((n) => n.serial === requestedSerial);
+      if (matched) {
+        setSelectedNodeLabel(matched.label);
+        return;
+      }
+    }
+
+    setSelectedNodeLabel((prev) => {
+      if (nodes.some((n) => n.label === prev)) return prev;
+      return nodes[0].label;
+    });
+  }, [nodes, requestedSerial]);
+
+  const selectedNode = useMemo(
+    () => nodes.find((n) => n.label === selectedNodeLabel) ?? null,
+    [nodes, selectedNodeLabel]
+  );
+
+  const nodeId = selectedNode?.node_id ?? 0;
+  const nodeKey = selectedNode?.serial ?? "none";
+  const isOnline = selectedNode?.online ?? false;
+
   const [metaByNode, setMetaByNode] = useState<Record<number, Record<SensorValue, SensorMeta>>>(() => {
     const cached = loadCachedSettings();
-    return cached?.meta ?? { 1: FALLBACK_META };
+    return cached?.meta ?? {};
   });
 
   const [configByNode, setConfigByNode] = useState<Record<number, Record<SensorValue, SensorConfig>>>(() => {
     const cached = loadCachedSettings();
-    return cached?.config ?? { 1: FALLBACK_CONFIG };
+    return cached?.config ?? {};
   });
 
   const [settingsStatus, setSettingsStatus] = useState<string>("");
 
-  // Load settings once (global)
   useEffect(() => {
-    async function loadSettings() {
+    async function loadSettingsFromBackend() {
       try {
-        setSettingsStatus("Loading settings…");
         const json = await getSettings();
 
-        // Expecting:
-        // json.meta   = { "1": { accelerometer: {...}, ... }, "2": {...}, ... }
-        // json.config = { "1": { accelerometer: {...}, ... }, "2": {...}, ... }
         const rawMetaByNode = normalizeNodeKeyedObject<Record<SensorValue, SensorMeta>>(json.meta);
         const rawConfigByNode = normalizeNodeKeyedObject<Record<SensorValue, SensorConfig>>(json.config);
 
-        // Merge defaults per node/sensor so missing fields don't break UI
         const nextMetaByNode: Record<number, Record<SensorValue, SensorMeta>> = {};
         const nextConfigByNode: Record<number, Record<SensorValue, SensorConfig>> = {};
 
         const nodeIds = new Set<number>([
           ...Object.keys(rawMetaByNode).map(Number),
           ...Object.keys(rawConfigByNode).map(Number),
-          1,
         ]);
 
         nodeIds.forEach((n) => {
@@ -228,7 +271,6 @@ export default function Home() {
           nextConfigByNode[n] = { ...FALLBACK_CONFIG, ...(rawConfigByNode[n] ?? {}) };
         });
 
-        //  UPDATE UI STATE + CACHE AFTER SUCCESSFUL BACKEND FETCH
         setMetaByNode(nextMetaByNode);
         setConfigByNode(nextConfigByNode);
         saveCachedSettings(nextMetaByNode, nextConfigByNode);
@@ -237,9 +279,7 @@ export default function Home() {
       } catch (e: any) {
         console.error(e);
 
-        // FALLBACK TO CACHED SETTINGS IF BACKEND UNAVAILABLE
         const cached = loadCachedSettings();
-
         if (cached?.savedAt) {
           setSettingsStatus(
             `Backend unreachable — using cached settings (last synced: ${new Date(
@@ -252,7 +292,7 @@ export default function Home() {
       }
     }
 
-    loadSettings();
+    loadSettingsFromBackend();
   }, []);
 
   async function saveAllSettings(
@@ -262,10 +302,7 @@ export default function Home() {
     try {
       setSettingsStatus("Saving…");
       await putSettings({ meta: nextMetaByNode, config: nextConfigByNode });
-
-      // KEEP LOCAL CACHE IN SYNC AFTER SAVE
       saveCachedSettings(nextMetaByNode, nextConfigByNode);
-
       setSettingsStatus("");
     } catch (e: any) {
       console.error(e);
@@ -274,55 +311,69 @@ export default function Home() {
   }
 
   function ensureNodeDefaults(n: number) {
-    setMetaByNode((prev) => (prev[n] ? prev : { ...prev, [n]: FALLBACK_META }));
-    setConfigByNode((prev) => (prev[n] ? prev : { ...prev, [n]: FALLBACK_CONFIG }));
+    if (!n) return;
+
+    setMetaByNode((prev) =>
+      prev[n] ? prev : { ...prev, [n]: { ...FALLBACK_META } }
+    );
+
+    setConfigByNode((prev) =>
+      prev[n] ? prev : { ...prev, [n]: { ...FALLBACK_CONFIG } }
+    );
   }
 
-  // Ensure selected node always has defaults so UI updates cleanly
   useEffect(() => {
-    ensureNodeDefaults(node);
-  }, [node]);
+    if (nodeId) ensureNodeDefaults(nodeId);
+  }, [nodeId]);
 
   function handleSaveMeta(updated: SensorMeta) {
-    const currentNodeMeta = metaByNode[node] ?? FALLBACK_META;
+    if (!nodeId) return;
+
+    const currentNodeMeta = metaByNode[nodeId] ?? FALLBACK_META;
     const nextNodeMeta = { ...currentNodeMeta, [sensor]: updated };
 
-    const nextMetaByNode = { ...metaByNode, [node]: nextNodeMeta };
+    const nextMetaByNode = { ...metaByNode, [nodeId]: nextNodeMeta };
     setMetaByNode(nextMetaByNode);
 
     saveAllSettings(nextMetaByNode, configByNode);
   }
 
   function handleSaveConfig(updated: SensorConfig) {
-    const currentNodeConfig = configByNode[node] ?? FALLBACK_CONFIG;
+    if (!nodeId) return;
+
+    const currentNodeConfig = configByNode[nodeId] ?? FALLBACK_CONFIG;
     const nextNodeConfig = { ...currentNodeConfig, [sensor]: updated };
 
-    const nextConfigByNode = { ...configByNode, [node]: nextNodeConfig };
+    const nextConfigByNode = { ...configByNode, [nodeId]: nextNodeConfig };
     setConfigByNode(nextConfigByNode);
 
     saveAllSettings(metaByNode, nextConfigByNode);
   }
 
-  const metaForNode = metaByNode[node] ?? FALLBACK_META;
-  const configForNode = configByNode[node] ?? FALLBACK_CONFIG;
+  const metaForNode = nodeId ? (metaByNode[nodeId] ?? FALLBACK_META) : FALLBACK_META;
+  const configForNode = nodeId ? (configByNode[nodeId] ?? FALLBACK_CONFIG) : FALLBACK_CONFIG;
 
   const meta = metaForNode[sensor];
   const config = configForNode[sensor];
 
-  // Plot state
   const [apiData, setApiData] = useState<ApiResponse | null>(null);
   const [plotStatus, setPlotStatus] = useState("Loading…");
 
   useEffect(() => {
     async function loadPlot() {
+      if (!nodeId) {
+        setApiData(null);
+        setPlotStatus("No node selected");
+        return;
+      }
+
       const cacheKey = plotCacheKey({
-        node,
+        nodeKey,
         sensor,
         minutes: timeframeMin,
         channel,
       });
 
-      // SHOW CACHED PLOT IMMEDIATELY (if available), then refresh from backend
       const cache = loadPlotCache();
       const cachedEntry = cache[cacheKey];
 
@@ -339,20 +390,17 @@ export default function Home() {
       try {
         const endpoint = ENDPOINT_BY_SENSOR[sensor];
         const json = await getSensorData(endpoint, {
-          node,
+          node: nodeId,
           minutes: timeframeMin,
           channel,
         });
 
         setApiData(json);
         setPlotStatus("Loaded");
-
-        // SAVE FRESH PLOT TO CACHE
         savePlotCacheEntry(cacheKey, json);
       } catch (err: any) {
         console.error(err);
 
-        // If we already showed cached data, keep it and just show an offline message
         if (cachedEntry?.data?.points?.length) {
           setPlotStatus(
             `Backend unreachable — showing cached plot (last synced: ${new Date(
@@ -368,7 +416,7 @@ export default function Home() {
     }
 
     loadPlot();
-  }, [node, sensor, channel, timeframeMin]);
+  }, [nodeId, nodeKey, sensor, channel, timeframeMin]);
 
   return (
     <div className="sc-page">
@@ -377,14 +425,18 @@ export default function Home() {
           <label className="control-label">Node</label>
           <select
             className="control-select"
-            value={node}
-            onChange={(e) => setNode(Number(e.target.value))}
+            value={selectedNodeLabel}
+            onChange={(e) => setSelectedNodeLabel(e.target.value)}
           >
-            {NODE_OPTIONS.map((n) => (
-              <option key={n} value={n}>
-                {n}
-              </option>
-            ))}
+            {nodes.length === 0 ? (
+              <option value="">No nodes discovered</option>
+            ) : (
+              nodes.map((n) => (
+                <option key={n.serial} value={n.label}>
+                  {n.label}
+                </option>
+              ))
+            )}
           </select>
         </div>
 
@@ -404,6 +456,8 @@ export default function Home() {
         </div>
       </div>
 
+      {nodesStatus && <p style={{ marginTop: 8, marginBottom: 0 }}>{nodesStatus}</p>}
+
       <SensorStatus isOnline={isOnline} />
 
       <div className="sc-top-cards">
@@ -417,7 +471,7 @@ export default function Home() {
         <div className="sc-card">
           <div className="sc-card-title">Fault Log</div>
           <div className="sc-card-body">
-          <FaultLog node={node} limit={10} />
+            <FaultLog node={nodeId || undefined} limit={10} />
           </div>
         </div>
       </div>
@@ -435,9 +489,9 @@ export default function Home() {
 
       <div className="sc-plot-card">
         <p style={{ margin: 0 }}>{plotStatus}</p>
-        {apiData && (
+        {apiData && selectedNode && (
           <SensorLineChart
-            title={`${SENSOR_OPTIONS.find((s) => s.value === sensor)?.label ?? "Sensor"} (Node ${node})`}
+            title={`${SENSOR_OPTIONS.find((s) => s.value === sensor)?.label ?? "Sensor"} (${selectedNode.label})`}
             sensorKey={apiData.sensor ?? sensor}
             unit={apiData.unit ?? ""}
             points={apiData.points.map((p) => ({ ts: p.t, value: p.v }))}

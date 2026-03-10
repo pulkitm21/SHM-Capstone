@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 import { getFaults } from "../../services/api";
 import "./Log.css";
 
-// ---- Fault structure returned by backend
 type FaultEntry = {
   id: number;
   ts: string;
@@ -10,12 +9,12 @@ type FaultEntry = {
   node_id: number;
   sensor_id: string;
   fault_type: string;
+  node_label?: string;
 };
 
-// ---- Component props
 type FaultLogProps = {
-  node?: number;   // optional node filter (used on Home page)
-  limit?: number;  // limit number of faults returned
+  node?: number;
+  limit?: number;
 };
 
 export default function FaultLog({ node, limit = 200 }: FaultLogProps) {
@@ -29,10 +28,7 @@ export default function FaultLog({ node, limit = 200 }: FaultLogProps) {
       try {
         setStatus("Loading…");
 
-        const res = await getFaults(
-          { node, limit },
-          controller.signal
-        );
+        const res = await getFaults({ node, limit }, controller.signal);
 
         setFaults(res.faults ?? []);
         setStatus("");
@@ -44,7 +40,6 @@ export default function FaultLog({ node, limit = 200 }: FaultLogProps) {
     }
 
     loadFaults();
-
     return () => controller.abort();
   }, [node, limit]);
 
@@ -80,7 +75,7 @@ export default function FaultLog({ node, limit = 200 }: FaultLogProps) {
               </td>
 
               <td>
-                Node {entry.node_id} – {entry.sensor_id}
+                {entry.node_label ?? `Node ${entry.node_id}`} – {entry.sensor_id}
               </td>
 
               <td>{entry.fault_type}</td>

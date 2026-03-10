@@ -1,22 +1,30 @@
 import json
 from pathlib import Path
 
-# Paths
+from settings_schema import (
+    DEFAULT_SETTINGS,
+    SettingsModel,
+    build_default_node_meta,
+    build_default_node_config,
+    validate_model,
+    copy_deep,
+    to_dict,
+)
+
 DATA_DIR = Path("/home/pi/Data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 SETTINGS_JSON = DATA_DIR / "settings.json"
 
+
 def save_settings(settings) -> None:
-    from main import to_dict
     SETTINGS_JSON.write_text(json.dumps(to_dict(settings), indent=2), encoding="utf-8")
 
-def load_settings():
-    from main import DEFAULT_SETTINGS, SettingsModel, validate_model, copy_deep
 
+def load_settings():
     if not SETTINGS_JSON.exists():
         save_settings(DEFAULT_SETTINGS)
-        return DEFAULT_SETTINGS
+        return copy_deep(DEFAULT_SETTINGS)
 
     try:
         raw = json.loads(SETTINGS_JSON.read_text(encoding="utf-8"))
@@ -28,4 +36,23 @@ def load_settings():
         return merged
     except Exception:
         save_settings(DEFAULT_SETTINGS)
-        return DEFAULT_SETTINGS
+        return copy_deep(DEFAULT_SETTINGS)
+
+
+def ensure_node_defaults(node_id: int):
+    settings = load_settings()
+    key = str(node_id)
+    changed = False
+
+    if key not in settings.meta:
+        settings.meta[key] = build_default_node_meta()
+        changed = True
+
+    if key not in settings.config:
+        settings.config[key] = build_default_node_config()
+        changed = True
+
+    if changed:
+        save_settings(settings)
+
+    return settings

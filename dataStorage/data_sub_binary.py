@@ -1,20 +1,29 @@
 import json
 import os
 import struct
-import paho.mqtt.client as mqtt
+import sys
+from pathlib import Path
 from datetime import datetime
+
+import paho.mqtt.client as mqtt
+
+BACKEND_DIR = Path(__file__).resolve().parents[1] / "backend"
+sys.path.insert(0, str(BACKEND_DIR))
+
+from backend.node_registry import register_serial, serial_from_topic  # noqa: E402
+
 
 BROKER_IP = "localhost"
 PORT = 1883
-TOPIC = "wind_turbine/data"
+TOPICS = [
+    ("wind_turbine/+/data", 0),
+    ("wind_turbine/+/status", 0),
+]
 DATA_DIR = "/home/pi/Data"
 
 current_date_str = None
 current_file_path = None
 
-# Define binary packet format
-# d = float64 (timestamp)
-# f = float32 (ax, ay, az)
 PACKET_FORMAT = "<dfff"
 PACKET_SIZE = struct.calcsize(PACKET_FORMAT)
 
@@ -25,15 +34,30 @@ def get_daily_filename():
     return date_str, os.path.join(DATA_DIR, filename)
 
 
-def on_connect(client, userdata, flags, reason_code, properties):
+def on_connect(client, userdata, flags, reason_code, properties=None):
     print("Connected with result code", reason_code)
-    client.subscribe(TOPIC)
+    for topic, qos in TOPICS:
+        client.subscribe(topic, qos=qos)
 
 
 def on_message(client, userdata, msg):
     global current_date_str, current_file_path
 
-    data = json.loads(msg.payload.decode())
+    try:
+        serial = serial_from_topic(msg.topic)
+        node_info = register_serial(serial)
+    except Exception as exc:
+        print(f"Topic parse / registry update failed for {msg.topic}: {exc}")
+        return
+
+    if msg.topic.endswith("/status"):
+        return
+
+    try:
+        data = json.loads(msg.payload.decode())
+    except Exception as exc:
+        print(f"JSON decode failed for {msg.topic}: {exc}")
+        return
 
     today_str, file_path = get_daily_filename()
 
@@ -42,14 +66,17 @@ def on_message(client, userdata, msg):
         current_file_path = file_path
         print(f"Switched to new daily binary file: {current_file_path}")
 
-    # Pack into binary
-    packet = struct.pack(
-        PACKET_FORMAT,
-        float(data["timestamp"]),
-        float(data["ax"]),
-        float(data["ay"]),
-        float(data["az"]),
-    )
+    try:
+        packet = struct.pack(
+            PACKET_FORMAT,
+            float(data["timestamp"]),
+            float(data["ax"]),
+            float(data["ay"]),
+            float(data["az"]),
+        )
+    except Exception as exc:
+        print(f"Binary pack failed for {node_info['label']}: {exc}")
+        return
 
     with open(current_file_path, "ab") as f:
         f.write(packet)
