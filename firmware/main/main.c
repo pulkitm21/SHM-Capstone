@@ -50,8 +50,8 @@ static const char *TAG = "main";
 #define MQTT_CONNECT_TIMEOUT_MS 30000
 
 // Reboot configuration
-#define REBOOT_DELAY_MS         5000    // Wait 5 seconds before reboot
-#define MAX_REBOOT_ATTEMPTS     5       // Max reboots before halting permanently
+#define REBOOT_DELAY_MS         5000
+#define MAX_REBOOT_ATTEMPTS     5
 
 // Stats
 #define STATS_TASK_PRIORITY     1
@@ -88,9 +88,7 @@ static void force_spi_cs_high_early(void)
  */
 static void init_reboot_counter(void)
 {
-    // Check if RTC memory is valid (survives soft reboot, not power cycle)
     if (s_reboot_magic != REBOOT_MAGIC_VALUE) {
-        // First boot after power cycle - reset counter
         s_reboot_count = 0;
         s_reboot_magic = REBOOT_MAGIC_VALUE;
         ESP_LOGI(TAG, "Fresh boot detected - reboot counter reset");
@@ -121,7 +119,6 @@ static void handle_critical_failure(const char *reason)
     s_reboot_count++;
 
     if (s_reboot_count >= MAX_REBOOT_ATTEMPTS) {
-        // Too many reboots: halt permanently
         ESP_LOGE(TAG, "*** MAX REBOOT ATTEMPTS (%d) REACHED ***", MAX_REBOOT_ATTEMPTS);
         ESP_LOGE(TAG, "*** SYSTEM HALTED - POWER CYCLE REQUIRED ***");
         ESP_LOGE(TAG, "*** Check hardware connections and wiring ***");
@@ -130,7 +127,6 @@ static void handle_critical_failure(const char *reason)
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
     } else {
-        // Attempt reboot
         ESP_LOGW(TAG, "Rebooting in %d seconds... (attempt %lu of %d)",
                  REBOOT_DELAY_MS / 1000,
                  (unsigned long)s_reboot_count,
@@ -151,36 +147,30 @@ static void stats_monitor_task(void *pvParameters)
 {
     (void)pvParameters;
 
-    // MQTT/Data processing stats
     uint32_t samples_published;
     uint32_t packets_sent;
     uint32_t samples_dropped;
 
-    // ISR acquisition stats
     uint32_t acquired;
     uint32_t dropped;
     uint32_t max_time;
 
-    // Network info
     esp_netif_ip_info_t ip_info;
 
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(STATS_INTERVAL_MS));
 
-        // Get data processing stats
         data_processing_and_mqtt_task_get_stats(
             &samples_published,
             &packets_sent,
             &samples_dropped
         );
 
-        // Get ISR acquisition stats
         sensor_acquisition_get_stats(&acquired, &dropped, &max_time);
 
         ESP_LOGI("STATS", "");
         ESP_LOGI("STATS", "============ System Statistics ============");
 
-        // ISR Stats
         ESP_LOGI("STATS", "--- ISR Acquisition ---");
         ESP_LOGI("STATS", "  ADXL355 samples:  %lu", (unsigned long)adxl355_get_sample_count());
         ESP_LOGI("STATS", "  ADXL355 overflow: %lu", (unsigned long)adxl355_get_overflow_count());
@@ -190,19 +180,16 @@ static void stats_monitor_task(void *pvParameters)
         ESP_LOGI("STATS", "  Total acquired:   %lu", (unsigned long)acquired);
         ESP_LOGI("STATS", "  Total dropped:    %lu", (unsigned long)dropped);
 
-        // Ring buffer status
         ESP_LOGI("STATS", "--- Ring Buffers ---");
         ESP_LOGI("STATS", "  ADXL355 pending:  %lu", (unsigned long)adxl355_samples_available());
         ESP_LOGI("STATS", "  SCL3300 pending:  %lu", (unsigned long)scl3300_samples_available());
         ESP_LOGI("STATS", "  ADT7420 pending:  %lu", (unsigned long)adt7420_samples_available());
 
-        // MQTT Stats
         ESP_LOGI("STATS", "--- MQTT Publishing ---");
         ESP_LOGI("STATS", "  Samples published: %lu", (unsigned long)samples_published);
         ESP_LOGI("STATS", "  Packets sent:      %lu", (unsigned long)packets_sent);
         ESP_LOGI("STATS", "  Samples dropped:   %lu", (unsigned long)samples_dropped);
 
-        // Network status
         ESP_LOGI("STATS", "--- Network ---");
         if (ethernet_is_connected()) {
             ethernet_get_ip_info(&ip_info);
@@ -295,8 +282,6 @@ static esp_err_t init_mqtt(void)
 {
     ESP_LOGI(TAG, "--- Initializing MQTT ---");
 
-    // REQUIRED for MQTT_BROKER_URI = "raspberrypi.local"
-    // Non fatal if it fails.
     esp_err_t mdns_ret = mqtt_mdns_init(ethernet_get_netif());
     if (mdns_ret != ESP_OK) {
         ESP_LOGW(TAG, "mDNS init failed (broker hostname resolution may fail): %s",
@@ -327,10 +312,8 @@ static esp_err_t init_sensors(bool *temp_available)
 
     ESP_LOGI(TAG, "--- Initializing Sensors ---");
 
-    // Force CS pins high before SPI communication
     force_spi_cs_high_early();
 
-    // ADT7420 Temperature Sensor 
     ESP_LOGI(TAG, "Initializing ADT7420 temperature sensor...");
     ret = adt7420_init();
     if (ret == ESP_OK) {
@@ -340,13 +323,11 @@ static esp_err_t init_sensors(bool *temp_available)
         ESP_LOGW(TAG, "ADT7420 init failed - continuing without temperature");
     }
 
-    // Ensure SCL3300 CS is high before ADXL355 init
 #ifdef SPI_CS_SCL3300_IO
     gpio_set_level(SPI_CS_SCL3300_IO, 1);
     vTaskDelay(pdMS_TO_TICKS(1));
 #endif
 
-    // ADXL355 Accelerometer (critical)
     ESP_LOGI(TAG, "Initializing ADXL355 accelerometer...");
     ret = adxl355_init();
     if (ret != ESP_OK) {
@@ -355,13 +336,11 @@ static esp_err_t init_sensors(bool *temp_available)
     }
     ESP_LOGI(TAG, "ADXL355 initialized");
 
-    // Ensure ADXL355 CS is high before SCL3300 init
 #ifdef SPI_CS_ADXL355_IO
     gpio_set_level(SPI_CS_ADXL355_IO, 1);
     vTaskDelay(pdMS_TO_TICKS(1));
 #endif
 
-    // SCL3300 Inclinometer (critical)
     ESP_LOGI(TAG, "Initializing SCL3300 inclinometer...");
     ret = scl3300_init();
     if (ret != ESP_OK) {
@@ -377,14 +356,12 @@ static esp_err_t init_acquisition(bool temp_available)
 {
     ESP_LOGI(TAG, "--- Initializing ISR Acquisition ---");
 
-    // Initialize ring buffers and timer
     esp_err_t ret = sensor_acquisition_init(temp_available);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Sensor acquisition init failed");
         return ESP_FAIL;
     }
 
-    // Start the ISR timer
     ret = sensor_acquisition_start();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Sensor acquisition start failed");
@@ -417,69 +394,42 @@ void app_main(void)
 {
     bool temp_sensor_available = false;
 
-    // Initialize reboot counter (check if this is a retry)
     init_reboot_counter();
 
     print_banner();
 
-    // =========================================
-    // 1. Initialize Network (Ethernet)
-    // =========================================
     if (init_network() != ESP_OK) {
         ESP_LOGE(TAG, "Network init failed - continuing anyway");
-        // Don't reboot - network might come up later
     }
     ESP_LOGI(TAG, "");
 
-    // =========================================
-    // 2. Initialize MQTT Client
-    // =========================================
     if (init_mqtt() != ESP_OK) {
         ESP_LOGE(TAG, "MQTT init failed - continuing anyway");
-        // Don't reboot - MQTT will reconnect
     }
     ESP_LOGI(TAG, "");
 
-    // =========================================
-    // 3. Initialize Communication Buses
-    // =========================================
     if (init_buses() != ESP_OK) {
         handle_critical_failure("Bus initialization failed (I2C or SPI)");
     }
     ESP_LOGI(TAG, "");
 
-    // =========================================
-    // 4. Initialize Sensors
-    // =========================================
     if (init_sensors(&temp_sensor_available) != ESP_OK) {
         handle_critical_failure("Critical sensor initialization failed (ADXL355 or SCL3300)");
     }
     ESP_LOGI(TAG, "");
 
-    // =========================================
-    // 5. Initialize ISR Acquisition
-    // =========================================
     if (init_acquisition(temp_sensor_available) != ESP_OK) {
         handle_critical_failure("ISR acquisition initialization failed");
     }
     ESP_LOGI(TAG, "");
 
-    // =========================================
-    // 6. Initialize Data Processing + MQTT Task
-    // =========================================
     if (init_data_processing() != ESP_OK) {
         handle_critical_failure("Data processing task initialization failed");
     }
     ESP_LOGI(TAG, "");
 
-    // =========================================
-    // Initialization Complete - Clear Reboot Counter
-    // =========================================
     clear_reboot_counter();
 
-    // =========================================
-    // 7. Create Statistics Monitor Task
-    // =========================================
     ESP_LOGI(TAG, "--- Creating Statistics Monitor ---");
     xTaskCreate(
         stats_monitor_task,
@@ -492,9 +442,6 @@ void app_main(void)
     ESP_LOGI(TAG, "Statistics monitor created (interval: %d sec)", STATS_INTERVAL_MS / 1000);
     ESP_LOGI(TAG, "");
 
-    // =========================================
-    // System Running
-    // =========================================
     ESP_LOGI(TAG, "==============================================");
     ESP_LOGI(TAG, "  SYSTEM RUNNING");
     ESP_LOGI(TAG, "");
@@ -512,6 +459,4 @@ void app_main(void)
     ESP_LOGI(TAG, "  See mqtt.h for NVS flashing instructions.");
     ESP_LOGI(TAG, "==============================================");
     ESP_LOGI(TAG, "");
-
-    // app_main() returns - tasks continue running
 }
