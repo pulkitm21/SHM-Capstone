@@ -1,37 +1,65 @@
+import { useEffect, useState } from "react";
+import { getFaults } from "../../services/api";
 import "./Log.css";
 
 type FaultEntry = {
-  time: string;        // ISO or HH:MM:SS
-  status: "High" | "Warning" | "Info";
-  location: string;    // which sensor / node
+  id: number;
+  ts: string;
+  severity: number;
+  serial_number: string;
+  sensor_type: string;
+  fault_type: string;
+  fault_status: string;
   description: string;
 };
 
-// Static for now
-const FAULT_LOG: FaultEntry[] = [
-  {
-    time: "12:45:33",
-    status: "High",
-    location: "Nacelle – A1",
-    description: "High temperature alert",
-  },
-  {
-    time: "09:20:45",
-    status: "Warning",
-    location: "Tower mid – B2",
-    description: "Intermittent connection loss",
-  },
-  {
-    time: "09:18:07",
-    status: "High",
-    location: "Foundation – C1",
-    description: "Tilt angle out of range",
-  },
-];
+type FaultLogProps = {
+  serial_number?: string;
+  limit?: number;
+};
 
-export default function FaultLog() {
+function getSeverityLabel(severity: number) {
+  if (severity >= 3) return "High";
+  if (severity === 2) return "Warning";
+  return "Info";
+}
+
+function getSeverityClass(severity: number) {
+  if (severity >= 3) return "high";
+  if (severity === 2) return "warning";
+  return "info";
+}
+
+export default function FaultLog({ serial_number, limit = 200 }: FaultLogProps) {
+  const [faults, setFaults] = useState<FaultEntry[]>([]);
+  const [status, setStatus] = useState("Loading…");
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    async function loadFaults() {
+      try {
+        setStatus("Loading…");
+
+        const res = await getFaults({ serial_number, limit }, controller.signal);
+
+        setFaults(res.faults ?? []);
+        setStatus("");
+      } catch (err: any) {
+        console.error(err);
+        setFaults([]);
+        setStatus("Fault log load failed");
+      }
+    }
+
+    loadFaults();
+    return () => controller.abort();
+  }, [serial_number, limit]);
+
   return (
     <div className="fault-log">
+      {status && <p>{status}</p>}
+
       <table className="fault-table">
         <thead>
           <tr>
@@ -43,18 +71,38 @@ export default function FaultLog() {
         </thead>
 
         <tbody>
-          {FAULT_LOG.map((entry, idx) => (
-            <tr key={idx}>
-              <td className="mono">{entry.time}</td>
-              <td>
-                <span className={`status-pill ${entry.status.toLowerCase()}`}>
-                  {entry.status}
-                </span>
-              </td>
-              <td>{entry.location}</td>
-              <td>{entry.description}</td>
+          {faults.length === 0 && !status && (
+            <tr>
+              <td colSpan={4}>No faults recorded</td>
             </tr>
-          ))}
+          )}
+
+          {faults.map((entry) => {
+            const severityLabel = getSeverityLabel(entry.severity);
+            const severityClass = getSeverityClass(entry.severity);
+
+            return (
+              <tr key={entry.id}>
+                <td className="mono">{entry.ts}</td>
+
+                <td>
+                  <span className={`status-pill ${severityClass}`}>
+                    {severityLabel}
+                  </span>
+                </td>
+
+                <td>
+                  {entry.serial_number} – {entry.sensor_type}
+                </td>
+
+                <td>
+                  {entry.fault_type}
+                  {entry.description ? `: ${entry.description}` : ""}
+                  {entry.fault_status ? ` (${entry.fault_status})` : ""}
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>

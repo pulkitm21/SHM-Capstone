@@ -1,235 +1,238 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
-import SystemStatus from "../../components/SystemStatus/SystemStatus";
-import SensorInfoCard, { type SensorMeta } from "../../components/SensorInfo/SensorInfo";
-import SensorConfigCard, { type SensorConfig } from "../../components/SensorConfig/SensorConfig";
 import FaultLog from "../../components/FaultLog/Log";
-import SensorFilters, { type SensorValue } from "../../components/SensorFilter/SensorFilter";
-
-import SensorLineChart from "../../components/SensorPlot/SensorPlot";
-
-import { getSettings, putSettings, getSensorData, type ApiResponse } from "../../services/api";
+import NodeMap from "../../components/NodeMap/NodeMap";
+import {
+  getNodes,
+  getStorage,
+  type NodeRecord,
+  type StorageResponse,
+} from "../../services/api";
 
 import "./Home.css";
 
-const SENSOR_OPTIONS = [
-  { label: "Accelerometer", value: "accelerometer" },
-  { label: "Inclinometer", value: "inclinometer" },
-  { label: "Temperature", value: "temperature" },
-] as const;
-
-const TIMEFRAME_OPTIONS = [
-  { label: "1 hour", minutes: 60 },
-  { label: "6 hours", minutes: 360 },
-  { label: "12 hours", minutes: 720 },
-  { label: "1 day", minutes: 1440 },
-] as const;
-
-const CHANNELS_BY_SENSOR: Record<string, { label: string; value: string }[]> = {
-  accelerometer: [
-    { label: "All", value: "all" },
-    { label: "X", value: "x" },
-    { label: "Y", value: "y" },
-    { label: "Z", value: "z" },
-  ],
-  inclinometer: [
-    { label: "All", value: "all" },
-    { label: "Pitch", value: "pitch" },
-    { label: "Roll", value: "roll" },
-  ],
-  temperature: [{ label: "All", value: "all" }],
-};
-
-const ENDPOINT_BY_SENSOR: Record<SensorValue, string> = {
-  accelerometer: "/api/accel",
-  inclinometer: "/api/inclinometer",
-  temperature: "/api/temperature",
-};
-
-// Frontend fallback defaults (used until backend loads)
-const FALLBACK_META: Record<SensorValue, SensorMeta> = {
-  accelerometer: {
-    model: "ADXL355",
-    serial: "SN00023",
-    installationDate: "2024-03-15",
-    location: "Tower",
-    orientation: "+X +Y +Z",
-  },
-  inclinometer: {
-    model: "SCL3300",
-    serial: "SN00110",
-    installationDate: "2024-03-15",
-    location: "Foundation",
-    orientation: "Pitch/Roll",
-  },
-  temperature: {
-    model: "ADT7420",
-    serial: "SN00402",
-    installationDate: "2024-03-15",
-    location: "Tower",
-    orientation: "N/A",
-  },
-};
-
-const FALLBACK_CONFIG: Record<SensorValue, SensorConfig> = {
-  accelerometer: {
-    samplingRate: "400",
-    measurementRange: "2g",
-    lowPassFilter: "none",
-    highPassFilter: "none",
-  },
-  inclinometer: {
-    samplingRate: "200",
-    measurementRange: "2g",
-    lowPassFilter: "none",
-    highPassFilter: "none",
-  },
-  temperature: {
-    samplingRate: "100",
-    measurementRange: "2g",
-    lowPassFilter: "none",
-    highPassFilter: "none",
-  },
-};
-
-
 export default function Home() {
   const navigate = useNavigate();
-  const isOnline = true;
 
-  const [sensor, setSensor] = useState<SensorValue>("accelerometer");
-  const [timeframeMin, setTimeframeMin] = useState<number>(60);
-  const [channel, setChannel] = useState<string>("all");
+  const [backendOnline, setBackendOnline] = useState<boolean>(false);
+  const [backendStatusText, setBackendStatusText] = useState<string>("Loading…");
+  const [backendTime, setBackendTime] = useState<string>("");
+  const [lastOnline, setLastOnline] = useState<string>("");
+  const [lastUpdate, setLastUpdate] = useState<string>("");
 
-  useEffect(() => setChannel("all"), [sensor]);
+  const [nodes, setNodes] = useState<NodeRecord[]>([]);
+  const [nodesStatus, setNodesStatus] = useState<string>("");
 
-  // Settings state (now backend-driven)
-  const [metaBySensor, setMetaBySensor] = useState<Record<SensorValue, SensorMeta>>(FALLBACK_META);
-  const [configBySensor, setConfigBySensor] = useState<Record<SensorValue, SensorConfig>>(FALLBACK_CONFIG);
-  const [settingsStatus, setSettingsStatus] = useState<string>("");
+  const [storageUsed, setStorageUsed] = useState<number>(0);
+  const [storageFree, setStorageFree] = useState<number>(0);
+  const [storageTotal, setStorageTotal] = useState<number>(0);
+  const [storagePercent, setStoragePercent] = useState<number>(0);
 
-  // Load settings from backend once on mount
   useEffect(() => {
-    async function loadSettings() {
+    let mounted = true;
+    let eventSource: EventSource | null = null;
+    let reconnectTimeoutId: number | null = null;
+
+    function formatLocalDateTime(value: string) {
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return value;
+      return date.toLocaleString();
+    }
+
+    function connectBackendStatusSSE() {
+      // SSE code for backend status live updates on the frontend dashboard.
+      eventSource = new EventSource(
+        `${import.meta.env.VITE_API_BASE_URL}/api/events/health`
+      );
+
+      eventSource.onopen = () => {
+        if (!mounted) return;
+
+        setBackendOnline(true);
+      };
+
+      eventSource.onmessage = (event) => {
+        if (!mounted) return;
+
+        try {
+          const data = JSON.parse(event.data);
+          const receivedAt = new Date().toLocaleString();
+          const onlineTime = data.time ? formatLocalDateTime(data.time) : receivedAt;
+
+          setBackendOnline(true);
+          setBackendStatusText(data.status ?? "OK");
+          setBackendTime(data.time ?? "");
+          setLastOnline(onlineTime);
+          setLastUpdate(receivedAt);
+        } catch {
+          const receivedAt = new Date().toLocaleString();
+
+          setBackendOnline(true);
+          setBackendStatusText("OK");
+          setLastOnline(receivedAt);
+          setLastUpdate(receivedAt);
+        }
+      };
+
+      eventSource.onerror = () => {
+        if (!mounted) return;
+
+        setBackendOnline(false);
+        setBackendStatusText("Offline");
+        setBackendTime("");
+
+        eventSource?.close();
+
+        reconnectTimeoutId = window.setTimeout(() => {
+          if (mounted) connectBackendStatusSSE();
+        }, 3000);
+      };
+    }
+
+    async function pollNodes() {
       try {
-        setSettingsStatus("Loading settings…");
-        const json = await getSettings();
+        const res = await getNodes();
+        if (!mounted) return;
 
-        setMetaBySensor((prev) => ({
-          ...prev,
-          ...(json.meta as Record<string, SensorMeta>),
-        }));
-
-        setConfigBySensor((prev) => ({
-          ...prev,
-          ...(json.config as Record<string, SensorConfig>),
-        }));
-
-        setSettingsStatus("");
+        setNodes(res.nodes ?? []);
+        setNodesStatus("");
       } catch (e: any) {
-        console.error(e);
-        setSettingsStatus(`Settings load failed: ${e?.message ?? "Unknown error"}`);
+        if (!mounted) return;
+
+        setNodes([]);
+        setNodesStatus(`Node load failed: ${e?.message ?? "Unknown error"}`);
       }
     }
 
-    loadSettings();
+    async function pollStorage() {
+      try {
+        const res: StorageResponse = await getStorage();
+        if (!mounted) return;
+
+        setStorageUsed(Number(res.used_gb ?? 0));
+        setStorageFree(Number(res.free_gb ?? 0));
+        setStorageTotal(Number(res.total_gb ?? 0));
+        setStoragePercent(Number(res.usage_percent ?? 0));
+      } catch {
+        if (!mounted) return;
+
+        setStorageUsed(0);
+        setStorageFree(0);
+        setStorageTotal(0);
+        setStoragePercent(0);
+      }
+    }
+
+    connectBackendStatusSSE();
+    pollNodes();
+    pollStorage();
+
+    const id = window.setInterval(() => {
+      pollNodes();
+      pollStorage();
+    }, 5000);
+
+    return () => {
+      mounted = false;
+      eventSource?.close();
+      if (reconnectTimeoutId !== null) {
+        window.clearTimeout(reconnectTimeoutId);
+      }
+      window.clearInterval(id);
+    };
   }, []);
 
-  async function saveSettings(
-    nextMeta: Record<SensorValue, SensorMeta>,
-    nextConfig: Record<SensorValue, SensorConfig>
-  ) {
-    try {
-      setSettingsStatus("Saving…");
-      await putSettings({ meta: nextMeta, config: nextConfig });
-      setSettingsStatus("");
-    } catch (e: any) {
-      console.error(e);
-      setSettingsStatus(`Save failed: ${e?.message ?? "Unknown error"}`);
-    }
-  }
-
-  function handleSaveMeta(updated: SensorMeta) {
-    const nextMeta = { ...metaBySensor, [sensor]: updated };
-    setMetaBySensor(nextMeta);
-    saveSettings(nextMeta, configBySensor);
-  }
-
-  function handleSaveConfig(updated: SensorConfig) {
-    const nextConfig = { ...configBySensor, [sensor]: updated };
-    setConfigBySensor(nextConfig);
-    saveSettings(metaBySensor, nextConfig);
-  }
-
-  const meta = metaBySensor[sensor];
-  const config = configBySensor[sensor];
-
-  // Plot
-  const [apiData, setApiData] = useState<ApiResponse | null>(null);
-  const [plotStatus, setPlotStatus] = useState("Loading…");
-
-  useEffect(() => {
-    async function load() {
-      try {
-        setPlotStatus("Loading…");
-        setApiData(null);
-
-        const endpoint = ENDPOINT_BY_SENSOR[sensor];
-        const json = await getSensorData(endpoint, { minutes: timeframeMin, channel });
-
-        setApiData(json);
-        setPlotStatus("Loaded");
-      } catch (err: any) {
-        console.error(err);
-        setApiData(null);
-        setPlotStatus(`Error: ${err?.message ?? "Unknown error"}`);
-      }
-    }
-
-    load();
-  }, [sensor, channel, timeframeMin]);
-
   return (
-    <div className="sc-page">
-      <SystemStatus isOnline={isOnline} />
-      {settingsStatus && <p style={{ marginTop: 0 }}>{settingsStatus}</p>}
+    <div className="home-grid">
+      <div className="sc-card">
+        <div className="sc-card-title">Backend Status</div>
 
-      <div className="sc-top-cards">
-        <SensorInfoCard meta={meta} onSave={handleSaveMeta} />
-        <SensorConfigCard config={config} onSave={handleSaveConfig} />
-        <div className="sc-card">
-          <div className="sc-card-title">Fault Log</div>
-          <div className="sc-card-body">
-            <FaultLog />
+        <div className="sc-card-body">
+          <div className="backend-status-row">
+            <span className={`status-pill ${backendOnline ? "info" : "high"}`}>
+              {backendOnline ? "Online" : "Offline"}
+            </span>
+          </div>
+
+          <div style={{ marginTop: 8 }}>{backendStatusText}</div>
+
+          {backendTime && (
+            <div className="backend-time">
+              <span className="mono">{backendTime}</span>
+            </div>
+          )}
+
+          {lastOnline && (
+            <div style={{ marginTop: 8 }}>
+              Last Online: <span className="mono">{lastOnline}</span>
+            </div>
+          )}
+
+          {lastUpdate && (
+            <div style={{ marginTop: 4 }}>
+              Last Update: <span className="mono">{lastUpdate}</span>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="sc-card">
+        <div className="sc-card-title">Storage</div>
+
+        <div className="sc-card-body">
+          <div className="storage-row">
+            <div>Used: {storageUsed.toFixed(1)} GB</div>
+            <div>Free: {storageFree.toFixed(1)} GB</div>
+            <div>Total: {storageTotal.toFixed(1)} GB</div>
+          </div>
+
+          <div className="storage-bar">
+            <div
+              className="storage-fill"
+              style={{ width: `${Math.max(0, Math.min(100, storagePercent))}%` }}
+            />
+          </div>
+
+          <div className="storage-percent">
+            {storagePercent.toFixed(1)}% used
           </div>
         </div>
       </div>
 
-      <SensorFilters
-        sensorOptions={[...SENSOR_OPTIONS]}
-        timeframeOptions={[...TIMEFRAME_OPTIONS]}
-        channelOptionsBySensor={CHANNELS_BY_SENSOR}
-        sensor={sensor}
-        timeframeMin={timeframeMin}
-        channel={channel}
-        onSensorChange={setSensor}
-        onTimeframeChange={setTimeframeMin}
-        onChannelChange={setChannel}
-        onExport={() => navigate("/export")}
-      />
+      <div className="sc-card node-health-card">
+        <div className="sc-card-title">Node Placement</div>
 
-      <div className="sc-plot-card">
-        <p style={{ margin: 0 }}>{plotStatus}</p>
-        {apiData && (
-        <SensorLineChart
-          title={SENSOR_OPTIONS.find((s) => s.value === sensor)?.label ?? "Sensor"}
-          sensorKey={apiData.sensor ?? sensor}
-          unit={apiData.unit ?? ""}
-          points={apiData.points.map((p) => ({ ts: p.t, value: p.v }))}
-          height={420}
-        />
-      )}
+        <div className="sc-card-body">
+          {nodesStatus ? (
+            <p>{nodesStatus}</p>
+          ) : (
+            <NodeMap
+              nodes={nodes}
+              onNodeClick={(node) =>
+                navigate(`/sensor-management?serial=${encodeURIComponent(node.serial)}`)
+              }
+            />
+          )}
+        </div>
+      </div>
+
+      <div className="sc-card home-faults-card">
+        <div className="sc-card-title">Recent Faults</div>
+
+        <div className="sc-card-body">
+          <FaultLog limit={10} />
+        </div>
+
+        <div className="home-faults-footer">
+          <button
+            className="home-link-btn"
+            onClick={() => navigate("/fault-log")}
+            type="button"
+          >
+            View all faults
+          </button>
+        </div>
       </div>
     </div>
   );

@@ -1,15 +1,14 @@
 import "./SensorFilter.css";
 
 // This component does NOT perform any data filtering.
+// It only provides UI controls for timeframe/channel + export.
 
 export type SensorValue = "accelerometer" | "inclinometer" | "temperature";
 
-export type SensorOption = { label: string; value: SensorValue };
 export type TimeframeOption = { label: string; minutes: number };
 export type ChannelOption = { label: string; value: string };
 
 type Props = {
-  sensorOptions: SensorOption[];
   timeframeOptions: TimeframeOption[];
   channelOptionsBySensor: Record<string, ChannelOption[]>;
 
@@ -17,20 +16,17 @@ type Props = {
   timeframeMin: number;
   channel: string;
 
-  onSensorChange: (s: SensorValue) => void;
   onTimeframeChange: (minutes: number) => void;
   onChannelChange: (c: string) => void;
   onExport: () => void;
 };
 
 export default function SensorFilters({
-  sensorOptions,
   timeframeOptions,
   channelOptionsBySensor,
   sensor,
   timeframeMin,
   channel,
-  onSensorChange,
   onTimeframeChange,
   onChannelChange,
   onExport,
@@ -40,21 +36,6 @@ export default function SensorFilters({
 
   return (
     <div className="filters-row">
-      <div className="control-box">
-        <label className="control-label">Sensor</label>
-        <select
-          className="control-select"
-          value={sensor}
-          onChange={(e) => onSensorChange(e.target.value as SensorValue)}
-        >
-          {sensorOptions.map((opt) => (
-            <option key={opt.value} value={opt.value}>
-              {opt.label}
-            </option>
-          ))}
-        </select>
-      </div>
-
       <div className="control-box">
         <label className="control-label">Timeframe</label>
         <select

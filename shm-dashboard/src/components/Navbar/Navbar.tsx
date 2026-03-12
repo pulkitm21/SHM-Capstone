@@ -10,6 +10,8 @@ interface NavItem {
 
 const navItems: NavItem[] = [
   { id: "home", label: "Home", icon: "🏠︎", to: "/" },
+  {id: "sensor-management", label: "Sensor Management", icon: "🛠️", to: "/sensor-management" },
+  { id: "fault-log", label: "Fault Log", icon: "⚠️", to: "/fault-log" },
   { id: "export", label: "Export", icon: "💾", to: "/export" },
 ];
 
