@@ -3,6 +3,7 @@ import os
 import struct
 from datetime import datetime
 import paho.mqtt.client as mqtt
+import queue
 
 BROKER_IP = "localhost"
 PORT = 1883
@@ -19,6 +20,8 @@ TEMP_FORMAT = "<df"
 # Track current date
 current_date_str = None
 
+# Linear buffer
+data_buffer = queue.Queue()
 
 def get_daily_filenames(node_id):
     date_str = datetime.now().strftime("%Y%m%d")

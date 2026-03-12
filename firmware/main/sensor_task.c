@@ -40,6 +40,7 @@
 #include "esp_log.h"
 #include "driver/spi_master.h"
 #include "driver/i2c_master.h"
+#include "driver/gpio.h"
 
 #include "hal/i2c_hal.h"
 #include "hal/i2c_ll.h"
@@ -192,6 +193,36 @@ static inline void IRAM_ATTR read_adxl355_raw(int32_t *raw_x, int32_t *raw_y, in
 }
 
 /**
+ * @brief Perform one 32-bit SCL3300 SPI frame with manual CS control
+ *
+ * This mirrors the manual-CS behavior used in scl3300.c.
+ */
+static inline void IRAM_ATTR scl3300_isr_transfer(uint32_t cmd, uint32_t *resp_out)
+{
+    spi_transaction_t t;
+    memset(&t, 0, sizeof(t));
+
+    t.flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
+    t.length = 32;
+    t.rxlength = 32;
+    t.tx_data[0] = (uint8_t)((cmd >> 24) & 0xFF);
+    t.tx_data[1] = (uint8_t)((cmd >> 16) & 0xFF);
+    t.tx_data[2] = (uint8_t)((cmd >> 8) & 0xFF);
+    t.tx_data[3] = (uint8_t)(cmd & 0xFF);
+
+    gpio_set_level(SPI_CS_SCL3300_IO, 0);
+    spi_device_polling_transmit(scl3300_spi_handle, &t);
+    gpio_set_level(SPI_CS_SCL3300_IO, 1);
+
+    if (resp_out) {
+        *resp_out = ((uint32_t)t.rx_data[0] << 24) |
+                    ((uint32_t)t.rx_data[1] << 16) |
+                    ((uint32_t)t.rx_data[2] << 8)  |
+                    (uint32_t)t.rx_data[3];
+    }
+}
+
+/**
  * @brief Read raw SCL3300 angle/acceleration data directly from SPI
  * 
  * SCL3300 uses off-frame protocol:
@@ -205,88 +236,21 @@ static inline void IRAM_ATTR read_adxl355_raw(int32_t *raw_x, int32_t *raw_y, in
  */
 static inline void IRAM_ATTR read_scl3300_raw(int16_t *raw_x, int16_t *raw_y, int16_t *raw_z)
 {
-    spi_transaction_t t;
-    uint32_t cmd, resp;
-    
-    // Note: We're reading ACCELERATION, not angle, for speed
-    // Each axis requires 2 SPI transactions (prime + fetch)
-    
-    //--------------------------------------------------------------------------
-    // Read X-axis acceleration
-    //--------------------------------------------------------------------------
-    cmd = 0x040000F7u;  // SCL3300_CMD_READ_ACC_X
-    
-    // Send command
-    memset(&t, 0, sizeof(t));
-    t.flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
-    t.length = 32;
-    t.rxlength = 32;
-    t.tx_data[0] = (uint8_t)((cmd >> 24) & 0xFF);
-    t.tx_data[1] = (uint8_t)((cmd >> 16) & 0xFF);
-    t.tx_data[2] = (uint8_t)((cmd >> 8) & 0xFF);
-    t.tx_data[3] = (uint8_t)(cmd & 0xFF);
-    
-    spi_device_polling_transmit(scl3300_spi_handle, &t);
-    
-    // Send same command again to get response
-    spi_device_polling_transmit(scl3300_spi_handle, &t);
-    
-    resp = ((uint32_t)t.rx_data[0] << 24) |
-           ((uint32_t)t.rx_data[1] << 16) |
-           ((uint32_t)t.rx_data[2] << 8)  |
-           (uint32_t)t.rx_data[3];
-    
-    // Extract data from bits [23:8]
+    uint32_t resp;
+
+    // X-axis acceleration
+    scl3300_isr_transfer(0x040000F7u, NULL);   // prime
+    scl3300_isr_transfer(0x040000F7u, &resp);  // fetch
     *raw_x = (int16_t)((resp >> 8) & 0xFFFF);
-    
-    //--------------------------------------------------------------------------
-    // Read Y-axis acceleration
-    //--------------------------------------------------------------------------
-    cmd = 0x080000FDu;  // SCL3300_CMD_READ_ACC_Y
-    
-    memset(&t, 0, sizeof(t));
-    t.flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
-    t.length = 32;
-    t.rxlength = 32;
-    t.tx_data[0] = (uint8_t)((cmd >> 24) & 0xFF);
-    t.tx_data[1] = (uint8_t)((cmd >> 16) & 0xFF);
-    t.tx_data[2] = (uint8_t)((cmd >> 8) & 0xFF);
-    t.tx_data[3] = (uint8_t)(cmd & 0xFF);
-    
-    spi_device_polling_transmit(scl3300_spi_handle, &t);
-    
-    spi_device_polling_transmit(scl3300_spi_handle, &t);
-    
-    resp = ((uint32_t)t.rx_data[0] << 24) |
-           ((uint32_t)t.rx_data[1] << 16) |
-           ((uint32_t)t.rx_data[2] << 8)  |
-           (uint32_t)t.rx_data[3];
-    
+
+    // Y-axis acceleration
+    scl3300_isr_transfer(0x080000FDu, NULL);   // prime
+    scl3300_isr_transfer(0x080000FDu, &resp);  // fetch
     *raw_y = (int16_t)((resp >> 8) & 0xFFFF);
-    
-    //--------------------------------------------------------------------------
-    // Read Z-axis acceleration
-    //--------------------------------------------------------------------------
-    cmd = 0x0C0000FBu;  // SCL3300_CMD_READ_ACC_Z
-    
-    memset(&t, 0, sizeof(t));
-    t.flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
-    t.length = 32;
-    t.rxlength = 32;
-    t.tx_data[0] = (uint8_t)((cmd >> 24) & 0xFF);
-    t.tx_data[1] = (uint8_t)((cmd >> 16) & 0xFF);
-    t.tx_data[2] = (uint8_t)((cmd >> 8) & 0xFF);
-    t.tx_data[3] = (uint8_t)(cmd & 0xFF);
-    
-    spi_device_polling_transmit(scl3300_spi_handle, &t);
-    
-    spi_device_polling_transmit(scl3300_spi_handle, &t);
-    
-    resp = ((uint32_t)t.rx_data[0] << 24) |
-           ((uint32_t)t.rx_data[1] << 16) |
-           ((uint32_t)t.rx_data[2] << 8)  |
-           (uint32_t)t.rx_data[3];
-    
+
+    // Z-axis acceleration
+    scl3300_isr_transfer(0x0C0000FBu, NULL);   // prime
+    scl3300_isr_transfer(0x0C0000FBu, &resp);  // fetch
     *raw_z = (int16_t)((resp >> 8) & 0xFFFF);
 }
 
