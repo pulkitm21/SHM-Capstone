@@ -74,7 +74,7 @@ def encode_first_record(data: dict, state: dict) -> bytes:
     out += struct.pack("<Bq", 0xFF, ts_us)
 
     # Accel
-    if "a" in data:
+    if "a" in data and len(data["a"]) > 0:
         header |= 0x01
         samples = data["a"]
         last = samples[-1] if samples else [0.0, 0.0, 0.0]
@@ -126,7 +126,7 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
     body   = bytearray()
 
     # Accel delta from last sample of previous message
-    if "a" in data:
+    if "a" in data and len(data["a"]) > 0:
         header |= 0x01
         samples = data["a"]
         prev    = state["accel_prev"]
