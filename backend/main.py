@@ -1,107 +1,50 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.responses import StreamingResponse
 from datetime import datetime, timezone
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+from pydantic import BaseModel, Field
+import asyncio
+import json
 import struct
+import sqlite3
+import shutil
+import os
 from pathlib import Path
 
-from settings_store import load_settings, save_settings
+from settings_schema import SettingsModel, to_dict, copy_deep
+from settings_store import (
+    load_settings,
+    save_settings,
+    ensure_node_defaults,
+    update_accelerometer_hpf_request,
+)
+from node_registry import list_nodes, get_node_by_id, update_node_position
 
 app = FastAPI()
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://192.168.20.34:5173"], # Allowed IP addresses for frontend access on the local network
+    allow_origins=[
+        "http://localhost:5173",
+        "http://192.168.20.34:5173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Paths
-DATA_DIR = Path("/home/pi/Data")
+DATA_DIR = Path("/mnt/ssd")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 ACCEL_BIN = DATA_DIR / "accel_data_20260219.bin"
-INCL_BIN  = DATA_DIR / "incl_data.bin"
-TEMP_BIN  = DATA_DIR / "temp_data.bin"
+INCL_BIN = DATA_DIR / "incl_data.bin"
+TEMP_BIN = DATA_DIR / "temp_data.bin"
 
-# Pydantic helpers
-def to_dict(model: BaseModel) -> dict:
-    return model.model_dump() if hasattr(model, "model_dump") else model.dict()
+FAULT_DIR = Path("/mnt/ssd/fault")
+FAULT_DIR.mkdir(parents=True, exist_ok=True)
+FAULTS_DB = FAULT_DIR / "faults.db"
 
-def validate_model(model_cls, data: dict):
-    return model_cls.model_validate(data) if hasattr(model_cls, "model_validate") else model_cls.parse_obj(data)
-
-def copy_deep(model: BaseModel):
-    return model.model_copy(deep=True) if hasattr(model, "model_copy") else model.copy(deep=True)
-
-# Models
-class SensorMetaModel(BaseModel):
-    model: str = ""
-    serial: str = ""
-    installationDate: str = ""
-    location: str = ""
-    orientation: str = ""
-
-class SensorConfigModel(BaseModel):
-    samplingRate: str = "200"
-    measurementRange: str = "2g"
-    lowPassFilter: str = "none"
-    highPassFilter: str = "none"
-
-class SettingsModel(BaseModel):
-    meta: Dict[str, SensorMetaModel] = Field(default_factory=dict)
-    config: Dict[str, SensorConfigModel] = Field(default_factory=dict)
-
-DEFAULT_SETTINGS = SettingsModel(
-    meta={
-        "accelerometer": SensorMetaModel(
-            model="ADXL355",
-            serial="SN00023",
-            installationDate="2025-09-15",
-            location="Tower",
-            orientation="+X +Y +Z",
-        ),
-        "inclinometer": SensorMetaModel(
-            model="SCL3300",
-            serial="SN00110",
-            installationDate="2025-09-15",
-            location="Foundation",
-            orientation="+X +Y",
-        ),
-        "temperature": SensorMetaModel(
-            model="ADT7420",
-            serial="SN00402",
-            installationDate="2025-09-15",
-            location="Tower",
-            orientation="N/A",
-        ),
-    },
-    config={
-        "accelerometer": SensorConfigModel(
-            samplingRate="200",
-            measurementRange="2g",
-            lowPassFilter="none",
-            highPassFilter="none",
-        ),
-        "inclinometer": SensorConfigModel(
-            samplingRate="200",
-            measurementRange="2g",
-            lowPassFilter="none",
-            highPassFilter="none",
-        ),
-        "temperature": SensorConfigModel(
-            samplingRate="100",
-            measurementRange="2g",
-            lowPassFilter="none",
-            highPassFilter="none",
-        ),
-    },
-)
-
-# Binary formats
 ACCEL_FORMAT = "<dfff"
 ACCEL_SIZE = struct.calcsize(ACCEL_FORMAT)
 
@@ -110,6 +53,16 @@ INCL_SIZE = struct.calcsize(INCL_FORMAT)
 
 TEMP_FORMAT = "<df"
 TEMP_SIZE = struct.calcsize(TEMP_FORMAT)
+
+
+class NodePositionUpdate(BaseModel):
+    x: float = Field(..., ge=0.0, le=1.0)
+    y: float = Field(..., ge=0.0, le=1.0)
+
+
+class AccelerometerHpfUpdate(BaseModel):
+    highPassFilterDesired: str = Field(..., pattern="^(none|on)$")
+
 
 def _read_tail_bytes(path: Path, record_size: int, max_records: int) -> bytes:
     if not path.exists():
@@ -122,8 +75,36 @@ def _read_tail_bytes(path: Path, record_size: int, max_records: int) -> bytes:
         f.seek(size - bytes_needed)
         return f.read()
 
+
 def _iso_from_epoch_seconds(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def get_ssd_mount_status() -> Dict[str, Any]:
+    """
+    Diagnostic check for SSD mount health.
+    Verifies whether /mnt/ssd exists, is mounted, and is accessible.
+    """
+    mount_path = DATA_DIR
+
+    exists = mount_path.exists()
+    mounted = os.path.ismount(mount_path)
+    readable = os.access(mount_path, os.R_OK) if exists else False
+    writable = os.access(mount_path, os.W_OK) if exists else False
+
+    available = bool(exists and mounted and readable)
+
+    return {
+        "mount_path": str(mount_path),
+        "exists": exists,
+        "mounted": mounted,
+        "readable": readable,
+        "writable": writable,
+        "available": available,
+        "status": "mounted" if available else "unavailable",
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
+
 
 def read_accel_points(minutes: int, channel: str, max_records_to_scan: int = 50000, limit: int = 500):
     now_s = datetime.now(timezone.utc).timestamp()
@@ -150,6 +131,7 @@ def read_accel_points(minutes: int, channel: str, max_records_to_scan: int = 500
 
     return points[-limit:]
 
+
 def read_inclinometer_points(minutes: int, channel: str, max_records_to_scan: int = 50000, limit: int = 500):
     now_s = datetime.now(timezone.utc).timestamp()
     cutoff_s = now_s - (minutes * 60)
@@ -175,6 +157,7 @@ def read_inclinometer_points(minutes: int, channel: str, max_records_to_scan: in
 
     return points[-limit:]
 
+
 def read_temperature_points(minutes: int, max_records_to_scan: int = 50000, limit: int = 500):
     now_s = datetime.now(timezone.utc).timestamp()
     cutoff_s = now_s - (minutes * 60)
@@ -194,48 +177,255 @@ def read_temperature_points(minutes: int, max_records_to_scan: int = 50000, limi
 
     return points[-limit:]
 
+
 @app.get("/")
 def root():
     return {"message": "backend working"}
 
+
 @app.get("/health")
 def health():
-    return {"status": "OK"}
+    # Testing/manual health check endpoint only. SSE is used for backend status updates in the dashboard.
+    return {
+        "status": "OK",
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/api/events/health")
+async def health_events(request: Request):
+    # SSE code for backend status live updates on the frontend dashboard.
+    async def event_generator():
+        while True:
+            if await request.is_disconnected():
+                break
+
+            payload = {
+                "status": "OK",
+                "time": datetime.now(timezone.utc).isoformat(),
+            }
+
+            yield f"data: {json.dumps(payload)}\n\n"
+            await asyncio.sleep(5)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@app.get("/api/storage")
+def get_storage():
+    mount_status = get_ssd_mount_status()
+
+    if not mount_status["available"]:
+        return {
+            "total_gb": 0,
+            "used_gb": 0,
+            "free_gb": 0,
+            "usage_percent": 0,
+            "ssd_status": mount_status,
+        }
+
+    total, used, free = shutil.disk_usage(DATA_DIR)
+    return {
+        "total_gb": round(total / (1024 ** 3), 2),
+        "used_gb": round(used / (1024 ** 3), 2),
+        "free_gb": round(free / (1024 ** 3), 2),
+        "usage_percent": round((used / total) * 100, 2) if total > 0 else 0,
+        "ssd_status": mount_status,
+    }
+
+
+@app.get("/api/storage/status")
+def get_storage_status():
+    """
+    Returns SSD mount diagnostic information for the dashboard.
+    """
+    return get_ssd_mount_status()
+
+
+@app.get("/api/nodes")
+def get_nodes():
+    return {"nodes": list_nodes(timeout_seconds=60)}
+
+
+@app.get("/api/nodes/{node_id}")
+def get_node(node_id: int):
+    node = get_node_by_id(node_id, timeout_seconds=60)
+    if node is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+    return {"node": node}
+
+
+@app.put("/api/nodes/{node_id}/position")
+def put_node_position(node_id: int, payload: NodePositionUpdate):
+    updated = update_node_position(node_id=node_id, x=payload.x, y=payload.y)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+    return {"ok": True, "node": updated}
+
 
 @app.get("/api/settings")
 def get_settings():
+    for node in list_nodes(timeout_seconds=60):
+        ensure_node_defaults(node["node_id"])
+
     settings = load_settings()
     return to_dict(settings)
 
+
 @app.put("/api/settings")
 def put_settings(payload: SettingsModel):
-    merged = copy_deep(DEFAULT_SETTINGS)
-    merged.meta.update(payload.meta)
-    merged.config.update(payload.config)
+    merged = copy_deep(load_settings())
+
+    for node_id, per_sensor_meta in payload.meta.items():
+        if node_id not in merged.meta:
+            merged.meta[node_id] = {}
+        merged.meta[node_id].update(per_sensor_meta)
+
+    for node_id, per_sensor_cfg in payload.config.items():
+        if node_id not in merged.config:
+            merged.config[node_id] = {}
+        merged.config[node_id].update(per_sensor_cfg)
+
     save_settings(merged)
     return {"ok": True, "settings": to_dict(merged)}
 
+
+@app.put("/api/nodes/{node_id}/config/accelerometer/hpf")
+def put_accelerometer_hpf(node_id: int, payload: AccelerometerHpfUpdate):
+    node = get_node_by_id(node_id, timeout_seconds=60)
+    if node is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    ensure_node_defaults(node_id)
+
+    updated = update_accelerometer_hpf_request(
+        node_id=node_id,
+        desired=payload.highPassFilterDesired,
+    )
+
+    return {
+        "node_id": node["node_id"],
+        "serial": node["serial"],
+        "sensor": "accelerometer",
+        "desired": {
+            "highPassFilter": updated.highPassFilterDesired,
+        },
+        "applied": {
+            "highPassFilter": updated.highPassFilterApplied,
+        },
+        "sync_status": updated.highPassFilterStatus,
+        "request_id": updated.lastRequestId,
+        "acked_at": updated.lastAckAt,
+    }
+
+
+def read_fault_rows(serial_number: Optional[str], limit: int) -> List[Dict[str, Any]]:
+    if not FAULTS_DB.exists():
+        return []
+
+    con = sqlite3.connect(str(FAULTS_DB))
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+
+    if serial_number is None:
+        cur.execute(
+            """
+            SELECT id, serial_number, sensor_type, fault_type, severity, fault_status, description, ts
+            FROM faults
+            ORDER BY ts DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT id, serial_number, sensor_type, fault_type, severity, fault_status, description, ts
+            FROM faults
+            WHERE serial_number = ?
+            ORDER BY ts DESC
+            LIMIT ?
+            """,
+            (serial_number, limit),
+        )
+
+    rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+    return rows
+
+
+@app.get("/api/faults")
+def get_faults(
+    serial_number: Optional[str] = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=5000),
+):
+    # Testing/manual fault log endpoint only. SSE is used for live fault log updates in the dashboard.
+    return {"faults": read_fault_rows(serial_number=serial_number, limit=limit)}
+
+
+@app.get("/api/events/faults")
+async def fault_events(
+    request: Request,
+    serial_number: Optional[str] = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=5000),
+):
+    # SSE code for live fault log updates on the frontend dashboard.
+    async def event_generator():
+        while True:
+            if await request.is_disconnected():
+                break
+
+            payload = {
+                "faults": read_fault_rows(serial_number=serial_number, limit=limit),
+                "time": datetime.now(timezone.utc).isoformat(),
+            }
+
+            yield f"data: {json.dumps(payload)}\n\n"
+            await asyncio.sleep(5)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+
+
 @app.get("/api/accel")
 def get_accel_data(
+    node: int = Query(1, ge=1),
     channel: str = Query("x"),
     minutes: int = Query(60, ge=1, le=1440),
 ):
     channel = channel.lower()
     pts = read_accel_points(minutes=minutes, channel=channel)
-    return {"sensor": "accelerometer", "unit": "g", "channel": channel, "points": pts}
+    return {"sensor": "accelerometer", "unit": "g", "node": node, "channel": channel, "points": pts}
+
 
 @app.get("/api/inclinometer")
 def api_inclinometer(
+    node: int = Query(1, ge=1),
     channel: str = Query("pitch"),
     minutes: int = Query(60, ge=1, le=1440),
 ):
     channel = channel.lower()
     pts = read_inclinometer_points(minutes=minutes, channel=channel)
-    return {"sensor": "inclinometer", "unit": "deg", "channel": channel, "points": pts}
+    return {"sensor": "inclinometer", "unit": "deg", "node": node, "channel": channel, "points": pts}
+
 
 @app.get("/api/temperature")
 def api_temperature(
+    node: int = Query(1, ge=1),
     minutes: int = Query(60, ge=1, le=1440),
 ):
     pts = read_temperature_points(minutes=minutes)
-    return {"sensor": "temperature", "unit": "C", "points": pts}
+    return {"sensor": "temperature", "unit": "C", "node": node, "points": pts}
