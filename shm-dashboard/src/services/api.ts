@@ -50,6 +50,18 @@ export type StorageResponse = {
   [key: string]: unknown;
 };
 
+export type StorageStatusResponse = {
+  mount_path?: string;
+  exists?: boolean;
+  mounted?: boolean;
+  readable?: boolean;
+  writable?: boolean;
+  available?: boolean;
+  status?: string;
+  time?: string;
+  [key: string]: unknown;
+};
+
 export type NodeRecord = {
   node_id: number;
   serial: string;
@@ -57,12 +69,49 @@ export type NodeRecord = {
   first_seen: string;
   last_seen: string;
   online: boolean;
+  x?: number;
+  y?: number;
   [key: string]: unknown;
 };
 
 export type NodesResponse = {
   nodes: NodeRecord[];
   [key: string]: unknown;
+};
+
+export type NodeResponse = {
+  node: NodeRecord;
+  [key: string]: unknown;
+};
+
+export type UpdateNodePositionRequest = {
+  x: number;
+  y: number;
+};
+
+export type UpdateNodePositionResponse = {
+  ok: boolean;
+  node: NodeRecord;
+  [key: string]: unknown;
+};
+
+export type SetAccelerometerHpfBody = {
+  highPassFilterDesired: "none" | "on";
+};
+
+export type SetAccelerometerHpfResponse = {
+  node_id: number;
+  serial: string;
+  sensor: "accelerometer";
+  desired: {
+    highPassFilter: "none" | "on";
+  };
+  applied: {
+    highPassFilter: "none" | "on" | null;
+  };
+  sync_status: "unknown" | "synced" | "pending" | "failed";
+  request_id?: string;
+  acked_at?: string | null;
 };
 
 export function getHealth(signal?: AbortSignal) {
@@ -74,8 +123,29 @@ export function getStorage(signal?: AbortSignal) {
   return request<StorageResponse>("/api/storage", { signal });
 }
 
+export function getStorageStatus(signal?: AbortSignal) {
+  return request<StorageStatusResponse>("/api/storage/status", { signal });
+}
+
 export function getNodes(signal?: AbortSignal) {
   return request<NodesResponse>("/api/nodes", { signal });
+}
+
+export function getNode(nodeId: number, signal?: AbortSignal) {
+  return request<NodeResponse>(`/api/nodes/${nodeId}`, { signal });
+}
+
+export function putNodePosition(
+  nodeId: number,
+  body: UpdateNodePositionRequest,
+  signal?: AbortSignal
+) {
+  return request<UpdateNodePositionResponse>(`/api/nodes/${nodeId}/position`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
 }
 
 export function getSettings(signal?: AbortSignal) {
@@ -84,6 +154,19 @@ export function getSettings(signal?: AbortSignal) {
 
 export function putSettings(body: SettingsResponse, signal?: AbortSignal) {
   return request<SettingsResponse>("/api/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+}
+
+export function putAccelerometerHpf(
+  nodeId: number,
+  body: SetAccelerometerHpfBody,
+  signal?: AbortSignal
+) {
+  return request<SetAccelerometerHpfResponse>(`/api/nodes/${nodeId}/config/accelerometer/hpf`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),

@@ -1,18 +1,25 @@
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
+from pydantic import BaseModel, Field
 import asyncio
 import json
 import struct
 import sqlite3
 import shutil
+import os
 from pathlib import Path
 
 from settings_schema import SettingsModel, to_dict, copy_deep
-from settings_store import load_settings, save_settings, ensure_node_defaults
-from node_registry import list_nodes, get_node_by_id
+from settings_store import (
+    load_settings,
+    save_settings,
+    ensure_node_defaults,
+    update_accelerometer_hpf_request,
+)
+from node_registry import list_nodes, get_node_by_id, update_node_position
 
 app = FastAPI()
 
@@ -48,6 +55,15 @@ TEMP_FORMAT = "<df"
 TEMP_SIZE = struct.calcsize(TEMP_FORMAT)
 
 
+class NodePositionUpdate(BaseModel):
+    x: float = Field(..., ge=0.0, le=1.0)
+    y: float = Field(..., ge=0.0, le=1.0)
+
+
+class AccelerometerHpfUpdate(BaseModel):
+    highPassFilterDesired: str = Field(..., pattern="^(none|on)$")
+
+
 def _read_tail_bytes(path: Path, record_size: int, max_records: int) -> bytes:
     if not path.exists():
         return b""
@@ -62,6 +78,32 @@ def _read_tail_bytes(path: Path, record_size: int, max_records: int) -> bytes:
 
 def _iso_from_epoch_seconds(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def get_ssd_mount_status() -> Dict[str, Any]:
+    """
+    Diagnostic check for SSD mount health.
+    Verifies whether /mnt/ssd exists, is mounted, and is accessible.
+    """
+    mount_path = DATA_DIR
+
+    exists = mount_path.exists()
+    mounted = os.path.ismount(mount_path)
+    readable = os.access(mount_path, os.R_OK) if exists else False
+    writable = os.access(mount_path, os.W_OK) if exists else False
+
+    available = bool(exists and mounted and readable)
+
+    return {
+        "mount_path": str(mount_path),
+        "exists": exists,
+        "mounted": mounted,
+        "readable": readable,
+        "writable": writable,
+        "available": available,
+        "status": "mounted" if available else "unavailable",
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def read_accel_points(minutes: int, channel: str, max_records_to_scan: int = 50000, limit: int = 500):
@@ -178,18 +220,54 @@ async def health_events(request: Request):
 
 @app.get("/api/storage")
 def get_storage():
-    total, used, free = shutil.disk_usage("/mnt/ssd")
+    mount_status = get_ssd_mount_status()
+
+    if not mount_status["available"]:
+        return {
+            "total_gb": 0,
+            "used_gb": 0,
+            "free_gb": 0,
+            "usage_percent": 0,
+            "ssd_status": mount_status,
+        }
+
+    total, used, free = shutil.disk_usage(DATA_DIR)
     return {
         "total_gb": round(total / (1024 ** 3), 2),
         "used_gb": round(used / (1024 ** 3), 2),
         "free_gb": round(free / (1024 ** 3), 2),
         "usage_percent": round((used / total) * 100, 2) if total > 0 else 0,
+        "ssd_status": mount_status,
     }
+
+
+@app.get("/api/storage/status")
+def get_storage_status():
+    """
+    Returns SSD mount diagnostic information for the dashboard.
+    """
+    return get_ssd_mount_status()
 
 
 @app.get("/api/nodes")
 def get_nodes():
     return {"nodes": list_nodes(timeout_seconds=60)}
+
+
+@app.get("/api/nodes/{node_id}")
+def get_node(node_id: int):
+    node = get_node_by_id(node_id, timeout_seconds=60)
+    if node is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+    return {"node": node}
+
+
+@app.put("/api/nodes/{node_id}/position")
+def put_node_position(node_id: int, payload: NodePositionUpdate):
+    updated = update_node_position(node_id=node_id, x=payload.x, y=payload.y)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+    return {"ok": True, "node": updated}
 
 
 @app.get("/api/settings")
@@ -219,13 +297,38 @@ def put_settings(payload: SettingsModel):
     return {"ok": True, "settings": to_dict(merged)}
 
 
-@app.get("/api/faults")
-def get_faults(
-    serial_number: Optional[str] = Query(default=None),
-    limit: int = Query(default=200, ge=1, le=5000),
-):
+@app.put("/api/nodes/{node_id}/config/accelerometer/hpf")
+def put_accelerometer_hpf(node_id: int, payload: AccelerometerHpfUpdate):
+    node = get_node_by_id(node_id, timeout_seconds=60)
+    if node is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    ensure_node_defaults(node_id)
+
+    updated = update_accelerometer_hpf_request(
+        node_id=node_id,
+        desired=payload.highPassFilterDesired,
+    )
+
+    return {
+        "node_id": node["node_id"],
+        "serial": node["serial"],
+        "sensor": "accelerometer",
+        "desired": {
+            "highPassFilter": updated.highPassFilterDesired,
+        },
+        "applied": {
+            "highPassFilter": updated.highPassFilterApplied,
+        },
+        "sync_status": updated.highPassFilterStatus,
+        "request_id": updated.lastRequestId,
+        "acked_at": updated.lastAckAt,
+    }
+
+
+def read_fault_rows(serial_number: Optional[str], limit: int) -> List[Dict[str, Any]]:
     if not FAULTS_DB.exists():
-        return {"faults": []}
+        return []
 
     con = sqlite3.connect(str(FAULTS_DB))
     con.row_factory = sqlite3.Row
@@ -255,8 +358,46 @@ def get_faults(
 
     rows = [dict(r) for r in cur.fetchall()]
     con.close()
+    return rows
 
-    return {"faults": rows}
+
+@app.get("/api/faults")
+def get_faults(
+    serial_number: Optional[str] = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=5000),
+):
+    # Testing/manual fault log endpoint only. SSE is used for live fault log updates in the dashboard.
+    return {"faults": read_fault_rows(serial_number=serial_number, limit=limit)}
+
+
+@app.get("/api/events/faults")
+async def fault_events(
+    request: Request,
+    serial_number: Optional[str] = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=5000),
+):
+    # SSE code for live fault log updates on the frontend dashboard.
+    async def event_generator():
+        while True:
+            if await request.is_disconnected():
+                break
+
+            payload = {
+                "faults": read_fault_rows(serial_number=serial_number, limit=limit),
+                "time": datetime.now(timezone.utc).isoformat(),
+            }
+
+            yield f"data: {json.dumps(payload)}\n\n"
+            await asyncio.sleep(5)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.get("/api/accel")

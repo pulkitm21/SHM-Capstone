@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Dict
+from typing import Dict, Optional
 
 
 class SensorMetaModel(BaseModel):
@@ -14,7 +14,19 @@ class SensorConfigModel(BaseModel):
     samplingRate: str = "200"
     measurementRange: str = "2g"
     lowPassFilter: str = "none"
-    highPassFilter: str = "none"
+
+    # desired configuration (what the user requested)
+    highPassFilterDesired: str = "none"
+
+    # applied configuration (what the ESP32 last confirmed)
+    highPassFilterApplied: Optional[str] = None
+
+    # sync state: unknown | pending | synced | failed
+    highPassFilterStatus: str = "unknown"
+
+    # request/ack tracking
+    lastRequestId: Optional[str] = None
+    lastAckAt: Optional[str] = None
 
 
 class SettingsModel(BaseModel):
@@ -66,19 +78,31 @@ def build_default_node_config():
             samplingRate="200",
             measurementRange="2g",
             lowPassFilter="none",
-            highPassFilter="none",
+            highPassFilterDesired="none",
+            highPassFilterApplied=None,
+            highPassFilterStatus="unknown",
+            lastRequestId=None,
+            lastAckAt=None,
         ),
         "inclinometer": SensorConfigModel(
             samplingRate="200",
             measurementRange="2g",
             lowPassFilter="none",
-            highPassFilter="none",
+            highPassFilterDesired="none",
+            highPassFilterApplied=None,
+            highPassFilterStatus="unknown",
+            lastRequestId=None,
+            lastAckAt=None,
         ),
         "temperature": SensorConfigModel(
             samplingRate="100",
             measurementRange="2g",
             lowPassFilter="none",
-            highPassFilter="none",
+            highPassFilterDesired="none",
+            highPassFilterApplied=None,
+            highPassFilterStatus="unknown",
+            lastRequestId=None,
+            lastAckAt=None,
         ),
     }
 
