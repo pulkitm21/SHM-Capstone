@@ -49,7 +49,6 @@
  * ============================================================================
  *
  * Each ESP32 node publishes to a topic that includes its serial number:
->>>>>>> origin/main
  *
  *   wind_turbine/<SERIAL>/data    e.g. wind_turbine/WT01-N03/data
  *   wind_turbine/<SERIAL>/status  e.g. wind_turbine/WT01-N03/status
@@ -97,8 +96,6 @@ extern "C" {
 #define MQTT_BROKER_HOSTNAME    "raspberrypi"
 #define MQTT_BROKER_URI         "mqtt://" MQTT_BROKER_HOSTNAME ".local:1883"
 
-<<<<<<< HEAD
-=======
 /*
  * MQTT_CLIENT_ID, MQTT_TOPIC_DATA, and MQTT_TOPIC_STATUS are NOT
  * constants — they are generated at runtime from the NVS serial number
@@ -116,7 +113,6 @@ extern "C" {
  */
 #define MQTT_SERIAL_MAX_LEN     32
 
->>>>>>> origin/main
 #define MQTT_PUBLISH_QOS        0
 #define MQTT_ACCEL_BATCH_SIZE   100
 
@@ -188,10 +184,6 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet);
 esp_err_t mqtt_publish_status(const char *status);
 esp_err_t mqtt_publish(const char *topic, const char *data, int len);
 esp_err_t mqtt_deinit(void);
-<<<<<<< HEAD
-const char *mqtt_get_client_id(void);
-const char *mqtt_get_topic_data(void);
-=======
 
 /**
  * @brief Return the serial number used for this node's identity.
@@ -216,7 +208,6 @@ const char *mqtt_get_topic_data(void);
  * @brief Return the generated status topic string.
  *        e.g. "wind_turbine/WT01-N03/status"
  */
->>>>>>> origin/main
 const char *mqtt_get_topic_status(void);
 
 #ifdef __cplusplus
