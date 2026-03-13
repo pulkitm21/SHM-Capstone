@@ -35,14 +35,13 @@ app.add_middleware(
 )
 
 DATA_DIR = Path("/mnt/ssd")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+# DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 ACCEL_BIN = DATA_DIR / "accel_data_20260219.bin"
 INCL_BIN = DATA_DIR / "incl_data.bin"
 TEMP_BIN = DATA_DIR / "temp_data.bin"
-
 FAULT_DIR = Path("/mnt/ssd/fault")
-FAULT_DIR.mkdir(parents=True, exist_ok=True)
+# FAULT_DIR.mkdir(parents=True, exist_ok=True)
 FAULTS_DB = FAULT_DIR / "faults.db"
 
 ACCEL_FORMAT = "<dfff"

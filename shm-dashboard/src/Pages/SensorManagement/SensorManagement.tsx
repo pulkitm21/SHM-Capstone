@@ -3,7 +3,10 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 
 import SensorStatus from "../../components/SensorStatus/SensorStatus";
 import SensorInfoCard, { type SensorMeta } from "../../components/SensorInfo/SensorInfo";
-import SensorConfigCard, { type SensorConfig } from "../../components/SensorConfig/SensorConfig";
+import SensorConfigCard, {
+  type HpfValue,
+  type SensorConfig,
+} from "../../components/SensorConfig/SensorConfig";
 import FaultLog from "../../components/FaultLog/Log";
 import SensorFilters, { type SensorValue } from "../../components/SensorFilter/SensorFilter";
 import SensorLineChart from "../../components/SensorPlot/SensorPlot";
@@ -11,6 +14,7 @@ import SensorLineChart from "../../components/SensorPlot/SensorPlot";
 import {
   getSettings,
   putSettings,
+  putAccelerometerHpf,
   getSensorData,
   getNodes,
   type ApiResponse,
@@ -140,25 +144,18 @@ const FALLBACK_META: Record<SensorValue, SensorMeta> = {
   },
 };
 
+const EMPTY_SENSOR_CONFIG: SensorConfig = {
+  highPassFilterDesired: "none",
+  highPassFilterApplied: null,
+  highPassFilterStatus: "unknown",
+  lastRequestId: undefined,
+  lastAckAt: null,
+};
+
 const FALLBACK_CONFIG: Record<SensorValue, SensorConfig> = {
-  accelerometer: {
-    samplingRate: "400",
-    measurementRange: "2g",
-    lowPassFilter: "none",
-    highPassFilter: "none",
-  },
-  inclinometer: {
-    samplingRate: "200",
-    measurementRange: "2g",
-    lowPassFilter: "none",
-    highPassFilter: "none",
-  },
-  temperature: {
-    samplingRate: "100",
-    measurementRange: "2g",
-    lowPassFilter: "none",
-    highPassFilter: "none",
-  },
+  accelerometer: { ...EMPTY_SENSOR_CONFIG },
+  inclinometer: { ...EMPTY_SENSOR_CONFIG },
+  temperature: { ...EMPTY_SENSOR_CONFIG },
 };
 
 function normalizeNodeKeyedObject<T>(obj: any): Record<number, T> {
@@ -170,6 +167,47 @@ function normalizeNodeKeyedObject<T>(obj: any): Record<number, T> {
     if (Number.isFinite(n)) out[n] = v as T;
   }
   return out;
+}
+
+function normalizeSensorConfig(raw: any): SensorConfig {
+  const desired = raw?.highPassFilterDesired ?? raw?.highPassFilter ?? "none";
+  const applied =
+    raw?.highPassFilterApplied ??
+    raw?.applied?.highPassFilter ??
+    raw?.highPassFilterAppliedValue ??
+    null;
+
+  const status =
+    raw?.highPassFilterStatus ??
+    raw?.sync_status ??
+    (applied === null ? "unknown" : desired === applied ? "synced" : "pending");
+
+  return {
+    highPassFilterDesired: desired === "on" ? "on" : "none",
+    highPassFilterApplied: applied === "on" || applied === "none" ? applied : null,
+    highPassFilterStatus:
+      status === "synced" || status === "pending" || status === "failed" ? status : "unknown",
+    lastRequestId:
+      typeof raw?.lastRequestId === "string"
+        ? raw.lastRequestId
+        : typeof raw?.request_id === "string"
+          ? raw.request_id
+          : undefined,
+    lastAckAt:
+      typeof raw?.lastAckAt === "string"
+        ? raw.lastAckAt
+        : typeof raw?.acked_at === "string"
+          ? raw.acked_at
+          : null,
+  };
+}
+
+function normalizeSensorConfigMap(raw: any): Record<SensorValue, SensorConfig> {
+  return {
+    accelerometer: normalizeSensorConfig(raw?.accelerometer),
+    inclinometer: normalizeSensorConfig(raw?.inclinometer),
+    temperature: normalizeSensorConfig(raw?.temperature),
+  };
 }
 
 export default function SensorManagement() {
@@ -207,6 +245,10 @@ export default function SensorManagement() {
     }
 
     loadNodeList();
+
+    return () => {
+      mounted = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -256,7 +298,7 @@ export default function SensorManagement() {
         const json = await getSettings();
 
         const rawMetaByNode = normalizeNodeKeyedObject<Record<SensorValue, SensorMeta>>(json.meta);
-        const rawConfigByNode = normalizeNodeKeyedObject<Record<SensorValue, SensorConfig>>(json.config);
+        const rawConfigByNode = normalizeNodeKeyedObject<any>(json.config);
 
         const nextMetaByNode: Record<number, Record<SensorValue, SensorMeta>> = {};
         const nextConfigByNode: Record<number, Record<SensorValue, SensorConfig>> = {};
@@ -268,7 +310,7 @@ export default function SensorManagement() {
 
         nodeIds.forEach((n) => {
           nextMetaByNode[n] = { ...FALLBACK_META, ...(rawMetaByNode[n] ?? {}) };
-          nextConfigByNode[n] = { ...FALLBACK_CONFIG, ...(rawConfigByNode[n] ?? {}) };
+          nextConfigByNode[n] = normalizeSensorConfigMap(rawConfigByNode[n]);
         });
 
         setMetaByNode(nextMetaByNode);
@@ -313,13 +355,9 @@ export default function SensorManagement() {
   function ensureNodeDefaults(n: number) {
     if (!n) return;
 
-    setMetaByNode((prev) =>
-      prev[n] ? prev : { ...prev, [n]: { ...FALLBACK_META } }
-    );
+    setMetaByNode((prev) => (prev[n] ? prev : { ...prev, [n]: { ...FALLBACK_META } }));
 
-    setConfigByNode((prev) =>
-      prev[n] ? prev : { ...prev, [n]: { ...FALLBACK_CONFIG } }
-    );
+    setConfigByNode((prev) => (prev[n] ? prev : { ...prev, [n]: { ...FALLBACK_CONFIG } }));
   }
 
   useEffect(() => {
@@ -338,16 +376,90 @@ export default function SensorManagement() {
     saveAllSettings(nextMetaByNode, configByNode);
   }
 
-  function handleSaveConfig(updated: SensorConfig) {
-    if (!nodeId) return;
+  async function handleSaveConfig(updatedDesired: HpfValue) {
+    if (!nodeId || sensor !== "accelerometer" || !selectedNode) return;
 
     const currentNodeConfig = configByNode[nodeId] ?? FALLBACK_CONFIG;
-    const nextNodeConfig = { ...currentNodeConfig, [sensor]: updated };
+    const currentAccelConfig = currentNodeConfig.accelerometer ?? FALLBACK_CONFIG.accelerometer;
 
-    const nextConfigByNode = { ...configByNode, [nodeId]: nextNodeConfig };
-    setConfigByNode(nextConfigByNode);
+    const optimisticAccelConfig: SensorConfig = {
+      ...currentAccelConfig,
+      highPassFilterDesired: updatedDesired,
+      highPassFilterStatus: "pending",
+    };
 
-    saveAllSettings(metaByNode, nextConfigByNode);
+    const optimisticNodeConfig: Record<SensorValue, SensorConfig> = {
+      ...currentNodeConfig,
+      accelerometer: optimisticAccelConfig,
+    };
+
+    const optimisticConfigByNode: Record<number, Record<SensorValue, SensorConfig>> = {
+      ...configByNode,
+      [nodeId]: optimisticNodeConfig,
+    };
+
+    setConfigByNode(optimisticConfigByNode);
+
+    try {
+      setSettingsStatus(selectedNode.online ? "Applying HPF…" : "Saving desired config…");
+
+      const res = await putAccelerometerHpf(nodeId, {
+        highPassFilterDesired: updatedDesired,
+      });
+
+      const nextAccelConfig: SensorConfig = {
+        highPassFilterDesired: res.desired.highPassFilter,
+        highPassFilterApplied: res.applied.highPassFilter,
+        highPassFilterStatus: res.sync_status,
+        lastRequestId: res.request_id,
+        lastAckAt: res.acked_at ?? null,
+      };
+
+      setConfigByNode((prev) => {
+        const baseNodeConfig = prev[nodeId] ?? FALLBACK_CONFIG;
+
+        const nextNodeConfig: Record<SensorValue, SensorConfig> = {
+          ...baseNodeConfig,
+          accelerometer: nextAccelConfig,
+        };
+
+        const nextConfigByNode: Record<number, Record<SensorValue, SensorConfig>> = {
+          ...prev,
+          [nodeId]: nextNodeConfig,
+        };
+
+        saveCachedSettings(metaByNode, nextConfigByNode);
+        return nextConfigByNode;
+      });
+
+      setSettingsStatus("");
+    } catch (e: any) {
+      console.error(e);
+
+      setConfigByNode((prev) => {
+        const baseNodeConfig = prev[nodeId] ?? FALLBACK_CONFIG;
+
+        const failedAccelConfig: SensorConfig = {
+          ...optimisticAccelConfig,
+          highPassFilterStatus: "failed",
+        };
+
+        const failedNodeConfig: Record<SensorValue, SensorConfig> = {
+          ...baseNodeConfig,
+          accelerometer: failedAccelConfig,
+        };
+
+        const nextConfigByNode: Record<number, Record<SensorValue, SensorConfig>> = {
+          ...prev,
+          [nodeId]: failedNodeConfig,
+        };
+
+        saveCachedSettings(metaByNode, nextConfigByNode);
+        return nextConfigByNode;
+      });
+
+      setSettingsStatus(`HPF apply failed: ${e?.message ?? "Unknown error"}`);
+    }
   }
 
   const metaForNode = nodeId ? (metaByNode[nodeId] ?? FALLBACK_META) : FALLBACK_META;
@@ -466,7 +578,19 @@ export default function SensorManagement() {
           {settingsStatus && <p style={{ marginTop: 8, marginBottom: 0 }}>{settingsStatus}</p>}
         </div>
 
-        <SensorConfigCard config={config} onSave={handleSaveConfig} />
+        <div>
+          {sensor !== "accelerometer" && (
+            <p style={{ marginTop: 0, marginBottom: 8 }}>
+              Runtime configuration is currently implemented for the accelerometer HPF only.
+            </p>
+          )}
+
+          <SensorConfigCard
+            config={config}
+            onSave={handleSaveConfig}
+            disabled={sensor !== "accelerometer" || !selectedNode}
+          />
+        </div>
 
         <div className="sc-card">
           <div className="sc-card-title">Fault Log</div>
@@ -491,7 +615,9 @@ export default function SensorManagement() {
         <p style={{ margin: 0 }}>{plotStatus}</p>
         {apiData && selectedNode && (
           <SensorLineChart
-            title={`${SENSOR_OPTIONS.find((s) => s.value === sensor)?.label ?? "Sensor"} (${selectedNode.label})`}
+            title={`${
+              SENSOR_OPTIONS.find((s) => s.value === sensor)?.label ?? "Sensor"
+            } (${selectedNode.label})`}
             sensorKey={apiData.sensor ?? sensor}
             unit={apiData.unit ?? ""}
             points={apiData.points.map((p) => ({ ts: p.t, value: p.v }))}

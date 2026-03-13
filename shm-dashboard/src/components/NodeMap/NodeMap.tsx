@@ -1,37 +1,37 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { NodeRecord } from "../../services/api";
+import {
+  putNodePosition,
+  type NodeRecord,
+} from "../../services/api";
 import "./NodeMap.css";
 
 type NodePos = { x: number; y: number };
 type NodePosMap = Record<string, NodePos>;
 
-const STORAGE_KEY = "shm_node_positions_v2";
-
 function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
 }
 
-function loadPositions(nodes: NodeRecord[]): NodePosMap {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) throw new Error("no data");
-    const parsed = JSON.parse(raw) as Record<string, NodePos>;
+function buildPositions(nodes: NodeRecord[]): NodePosMap {
+  const out: NodePosMap = {};
 
-    const out: NodePosMap = {};
-    nodes.forEach((node) => {
-      const p = parsed[node.serial];
-      if (p && typeof p.x === "number" && typeof p.y === "number") {
-        out[node.serial] = { x: clamp(p.x, 0, 1), y: clamp(p.y, 0, 1) };
-      }
-    });
-    return out;
-  } catch {
-    return {};
-  }
-}
+  nodes.forEach((node, idx) => {
+    const hasBackendPosition =
+      typeof node.x === "number" && typeof node.y === "number";
 
-function savePositions(pos: NodePosMap) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(pos));
+    if (hasBackendPosition) {
+      out[node.serial] = {
+        x: clamp(node.x as number, 0, 1),
+        y: clamp(node.y as number, 0, 1),
+      };
+      return;
+    }
+
+    const y = 0.20 + idx * (0.65 / Math.max(1, nodes.length - 1));
+    out[node.serial] = { x: 0.50, y: clamp(y, 0.12, 0.90) };
+  });
+
+  return out;
 }
 
 type NodeMapProps = {
@@ -48,27 +48,47 @@ export default function NodeMap({ nodes, onNodeClick }: NodeMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const pointerStartRef = useRef<{ x: number; y: number } | null>(null);
   const movedRef = useRef(false);
+  const saveTimeoutRef = useRef<number | null>(null);
 
-  const [positions, setPositions] = useState<NodePosMap>(() => loadPositions(sortedNodes));
+  const [positions, setPositions] = useState<NodePosMap>(() => buildPositions(sortedNodes));
   const [draggingSerial, setDraggingSerial] = useState<string | null>(null);
+  const [savingSerial, setSavingSerial] = useState<string | null>(null);
 
   useEffect(() => {
-    setPositions((prev) => {
-      const next: NodePosMap = { ...prev };
-      let changed = false;
-
-      sortedNodes.forEach((node, idx) => {
-        if (!next[node.serial]) {
-          const y = 0.20 + idx * (0.65 / Math.max(1, sortedNodes.length - 1));
-          next[node.serial] = { x: 0.50, y: clamp(y, 0.12, 0.90) };
-          changed = true;
-        }
-      });
-
-      if (changed) savePositions(next);
-      return next;
-    });
+    setPositions(buildPositions(sortedNodes));
   }, [sortedNodes]);
+
+  useEffect(() => {
+    return () => {
+      if (saveTimeoutRef.current !== null) {
+        window.clearTimeout(saveTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  async function persistNodePosition(node: NodeRecord, pos: NodePos) {
+    try {
+      setSavingSerial(node.serial);
+      await putNodePosition(node.node_id, {
+        x: clamp(pos.x, 0, 1),
+        y: clamp(pos.y, 0, 1),
+      });
+    } catch (error) {
+      console.error("Failed to save node position:", error);
+    } finally {
+      setSavingSerial((current) => (current === node.serial ? null : current));
+    }
+  }
+
+  function schedulePositionSave(node: NodeRecord, pos: NodePos) {
+    if (saveTimeoutRef.current !== null) {
+      window.clearTimeout(saveTimeoutRef.current);
+    }
+
+    saveTimeoutRef.current = window.setTimeout(() => {
+      persistNodePosition(node, pos);
+    }, 150);
+  }
 
   function setNodePositionFromClientPoint(serial: string, clientX: number, clientY: number) {
     const el = containerRef.current;
@@ -78,11 +98,7 @@ export default function NodeMap({ nodes, onNodeClick }: NodeMapProps) {
     const x = clamp((clientX - rect.left) / rect.width, 0, 1);
     const y = clamp((clientY - rect.top) / rect.height, 0, 1);
 
-    setPositions((prev) => {
-      const next = { ...prev, [serial]: { x, y } };
-      savePositions(next);
-      return next;
-    });
+    setPositions((prev) => ({ ...prev, [serial]: { x, y } }));
   }
 
   function onPointerDown(serial: string, e: React.PointerEvent) {
@@ -112,11 +128,17 @@ export default function NodeMap({ nodes, onNodeClick }: NodeMapProps) {
     e.preventDefault();
 
     const clickedNode = sortedNodes.find((n) => n.serial === draggingSerial) ?? null;
+    const finalPos = positions[draggingSerial];
     const wasMoved = movedRef.current;
 
     setDraggingSerial(null);
     pointerStartRef.current = null;
     movedRef.current = false;
+
+    if (wasMoved && clickedNode && finalPos) {
+      schedulePositionSave(clickedNode, finalPos);
+      return;
+    }
 
     if (!wasMoved && clickedNode && onNodeClick) {
       onNodeClick(clickedNode);
@@ -175,16 +197,19 @@ export default function NodeMap({ nodes, onNodeClick }: NodeMapProps) {
         const pos = positions[node.serial];
         if (!pos) return null;
 
+        const isDragging = draggingSerial === node.serial;
+        const isSaving = savingSerial === node.serial;
+
         return (
           <button
             key={node.serial}
-            className={`node-marker ${draggingSerial === node.serial ? "dragging" : ""} ${node.online ? "online" : "offline"}`}
+            className={`node-marker ${isDragging ? "dragging" : ""} ${node.online ? "online" : "offline"}`}
             style={{
               left: `${pos.x * 100}%`,
               top: `${pos.y * 100}%`,
             }}
             onPointerDown={(e) => onPointerDown(node.serial, e)}
-            title={node.label}
+            title={isSaving ? `${node.label} (saving...)` : node.label}
             type="button"
           >
             N{node.node_id}
