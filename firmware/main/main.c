@@ -4,7 +4,7 @@
  *
  * Merged Architecture:
  *  - Ethernet + MQTT publishing (data_processing_and_mqtt_task)
- *  - ISR-based sensor acquisition (from isr-daq branch)
+ *  - ISR-based sensor acquisition
  *  - Statistics monitor
  *
  * Error Handling:
@@ -13,7 +13,7 @@
  *  - Prevents infinite reboot loops
  *
  * Data Flow:
- *  ISR (8000 Hz) → Ring Buffers → Data Processing Task → MQTT → Raspberry Pi
+ *  ISR (8000 Hz) -> Ring Buffers -> Data Processing Task -> MQTT -> Raspberry Pi
  */
 
 #include <stdio.h>
@@ -32,7 +32,7 @@
 #include "i2c_bus.h"
 #include "spi_bus.h"
 
-// Sensors (ISR branch)
+// Sensors
 #include "adt7420.h"
 #include "adxl355.h"
 #include "scl3300.h"
@@ -99,7 +99,7 @@ static void init_reboot_counter(void)
 }
 
 /**
- * @brief Clear reboot counter (after successful initialization)
+ * @brief Clear reboot counter after successful initialization
  */
 static void clear_reboot_counter(void)
 {
@@ -312,7 +312,18 @@ static esp_err_t init_sensors(bool *temp_available)
 
     ESP_LOGI(TAG, "--- Initializing Sensors ---");
 
+    /*
+     * Important CS logic:
+     * - ADXL355 uses automatic CS in its SPI device config
+     * - SCL3300 uses manual CS
+     * - Only do an early safety deselect of both lines here
+     * - Do NOT keep manually toggling ADXL355 CS after init
+     */
     force_spi_cs_high_early();
+
+#ifdef SPI_CS_SCL3300_IO
+    gpio_set_level(SPI_CS_SCL3300_IO, 1);
+#endif
 
     ESP_LOGI(TAG, "Initializing ADT7420 temperature sensor...");
     ret = adt7420_init();
@@ -336,8 +347,13 @@ static esp_err_t init_sensors(bool *temp_available)
     }
     ESP_LOGI(TAG, "ADXL355 initialized");
 
-#ifdef SPI_CS_ADXL355_IO
-    gpio_set_level(SPI_CS_ADXL355_IO, 1);
+    /*
+     * Do NOT manually touch SPI_CS_ADXL355_IO here.
+     * ADXL355 CS is handled automatically by the SPI driver.
+     * Only keep SCL3300 deselected before its own init.
+     */
+#ifdef SPI_CS_SCL3300_IO
+    gpio_set_level(SPI_CS_SCL3300_IO, 1);
     vTaskDelay(pdMS_TO_TICKS(1));
 #endif
 
@@ -348,6 +364,10 @@ static esp_err_t init_sensors(bool *temp_available)
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "SCL3300 initialized");
+
+#ifdef SPI_CS_SCL3300_IO
+    gpio_set_level(SPI_CS_SCL3300_IO, 1);
+#endif
 
     return ESP_OK;
 }
@@ -449,7 +469,7 @@ void app_main(void)
     ESP_LOGI(TAG, "  Data topic:    %s", mqtt_get_topic_data());
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "  Data Flow:");
-    ESP_LOGI(TAG, "  Sensors → ISR → Ring Buffers → Task → MQTT");
+    ESP_LOGI(TAG, "  Sensors -> ISR -> Ring Buffers -> Task -> MQTT");
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "  Subscribe on Raspberry Pi:");
     ESP_LOGI(TAG, "  mosquitto_sub -t \"wind_turbine/#\" -v");

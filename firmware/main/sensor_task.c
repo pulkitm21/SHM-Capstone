@@ -2,36 +2,30 @@
  * @file sensor_task.c
  * @brief ISR-Based Sensor Data Acquisition with Ring Buffers
  *
- * Design Philosophy (based on recommendation):
+ * Design Philosophy:
  * ================================================
  * 1. SINGLE ISR driven by GPTimer frequency (8000 Hz)
  * 2. Staggered sensor sampling to prevent conflicts
- * 3. Raw data collection ONLY in ISR. NO function calls, NO processing
- * 4. Chose ring buffering because it allows lock-free communication between ISR and processing task. 
- * 5. Hopefully smaller ISR overhead
- * 6. Processing happens OUTSIDE the ISR in separate tasks
+ * 3. Raw data collection ONLY in ISR
+ * 4. Ring buffers provide lock-free handoff to processing tasks
+ * 5. Processing happens OUTSIDE the ISR
  *
  * Sensor Configuration:
  * =====================
- * - ADXL355: 1000 Hz (samples every 8 ticks at 8000 Hz base)
+ * - ADXL355: 1000 Hz (samples every 8 ticks)
  * - SCL3300: 20 Hz   (samples every 400 ticks)
- * - ADT7420: 1 Hz    (samples every 8000 ticks)
+ * - ADT7420: 1 Hz    (NOT read in ISR; left commented out)
  *
- * Timing Strategy:
- * ================
- * - Base timer: 8000 Hz (125 microsecond period)
- * - Sensors staggered by 1 tick (125us) to avoid simultaneous access
- * - ADXL355 offset: 0 ticks (samples at tick 0, 8, 16, 24...)
- * - SCL3300 offset: 1 tick  (samples at tick 1, 401, 801...)
- * - ADT7420 offset: 2 ticks (samples at tick 2, 8002, 16002...)
+ * CS ownership model:
+ * ===================
+ * - ADXL355: automatic CS handled by SPI device config
+ * - SCL3300: manual CS handled explicitly
  *
- * CRITICAL RULES FOR ISR:
- * =======================
- * - NO function calls (except direct hardware register reads)
- * - NO data processing or conversion
- * - NO MQTT, no logging, no printf
- * - Only raw data collection and ring buffer writes
- * - Keep execution time minimal
+ * Important:
+ * ==========
+ * - Do NOT manually toggle ADXL355 CS in ISR
+ * - Do keep SCL3300 CS manual and explicit
+ * - Temperature ISR block remains commented out
  */
 
 #include "sensor_task.h"
@@ -53,6 +47,8 @@
 #include "scl3300.h"
 
 #include <string.h>
+#include <stdbool.h>
+#include <stdint.h>
 
 static const char *TAG = "sensor_task";
 
@@ -60,39 +56,41 @@ static const char *TAG = "sensor_task";
  * CONFIGURATION
  *****************************************************************************/
 
-// Base timer frequency
-#define BASE_TIMER_FREQ_HZ      8000    // 125 microsecond period
+#define BASE_TIMER_FREQ_HZ      8000
 #define TIMER_PERIOD_US         125
 
-// Sensor sample rates
 #define ADXL355_RATE_HZ         1000
 #define SCL3300_RATE_HZ         20
 #define ADT7420_RATE_HZ         1
 
-// Calculate tick divisors (how many ticks between samples)
-#define ADXL355_TICK_DIVISOR    (BASE_TIMER_FREQ_HZ / ADXL355_RATE_HZ)  // 8
-#define SCL3300_TICK_DIVISOR    (BASE_TIMER_FREQ_HZ / SCL3300_RATE_HZ)  // 400
-#define ADT7420_TICK_DIVISOR    (BASE_TIMER_FREQ_HZ / ADT7420_RATE_HZ)  // 8000
+#define ADXL355_TICK_DIVISOR    (BASE_TIMER_FREQ_HZ / ADXL355_RATE_HZ)
+#define SCL3300_TICK_DIVISOR    (BASE_TIMER_FREQ_HZ / SCL3300_RATE_HZ)
+#define ADT7420_TICK_DIVISOR    (BASE_TIMER_FREQ_HZ / ADT7420_RATE_HZ)
 
-// Stagger offsets (in ticks) to prevent simultaneous sampling
-#define ADXL355_OFFSET          0       // ADXL samples first
-#define SCL3300_OFFSET          1       // SCL samples 1 tick (125us) after ADXL
-#define ADT7420_OFFSET          2       // ADT samples 2 ticks (250us) after ADXL
+#define ADXL355_OFFSET          0
+#define SCL3300_OFFSET          1
+#define ADT7420_OFFSET          2
 
-// Ring buffer sizes (power of 2 for efficient modulo with &)
-#define ADXL355_BUFFER_SIZE     4096    // ~2 seconds at 2000 Hz
-#define SCL3300_BUFFER_SIZE     128     // ~6 seconds at 20 Hz
-#define ADT7420_BUFFER_SIZE     16      // ~16 seconds at 1 Hz
+#define ADXL355_BUFFER_SIZE     4096
+#define SCL3300_BUFFER_SIZE     128
+#define ADT7420_BUFFER_SIZE     16
+
+/******************************************************************************
+ * SCL3300 COMMANDS
+ *****************************************************************************/
+
+#define SCL3300_CMD_X           0x040000F7u
+#define SCL3300_CMD_Y           0x080000FDu
+#define SCL3300_CMD_Z           0x0C0000FBu
 
 /******************************************************************************
  * DATA STRUCTURES
  *****************************************************************************/
 
-// Ring buffer structures
 typedef struct {
     adxl355_raw_sample_t buffer[ADXL355_BUFFER_SIZE];
-    volatile uint32_t write_index;  // ISR writes here
-    volatile uint32_t read_index;   // Processing task reads here
+    volatile uint32_t write_index;
+    volatile uint32_t read_index;
     volatile uint32_t overflow_count;
 } adxl355_ring_buffer_t;
 
@@ -114,89 +112,63 @@ typedef struct {
  * GLOBAL VARIABLES
  *****************************************************************************/
 
-// Ring buffers (accessible by processing tasks)
 static adxl355_ring_buffer_t adxl355_ring_buffer = {0};
 static scl3300_ring_buffer_t scl3300_ring_buffer = {0};
 static adt7420_ring_buffer_t adt7420_ring_buffer = {0};
 
-// Hardware timer handle
 static gptimer_handle_t s_timer = NULL;
 
-// Tick counter
 static volatile uint32_t tick_counter = 0;
 
-// Statistics (for debugging/monitoring)
 static volatile uint32_t adxl355_sample_count = 0;
 static volatile uint32_t scl3300_sample_count = 0;
 static volatile uint32_t adt7420_sample_count = 0;
 
-// Sensor availability
 static bool s_temp_available = false;
 
-// External device handles
-// We'll need these for direct SPI/I2C access in the ISR
-extern spi_device_handle_t adxl355_spi_handle;  // You'll need to expose this from adxl355.c
-extern spi_device_handle_t scl3300_spi_handle;  // You'll need to expose this from scl3300.c
-extern i2c_master_dev_handle_t adt7420_i2c_handle; // You'll need to expose this from adt7420.c
+extern spi_device_handle_t adxl355_spi_handle;
+extern spi_device_handle_t scl3300_spi_handle;
+extern i2c_master_dev_handle_t adt7420_i2c_handle;
+
+/* SCL3300 rolling pipeline state */
+static bool s_scl_pipeline_primed = false;
+static bool s_scl_discard_first_sample = true;
 
 /******************************************************************************
  * ACCESS FUNCTIONS FOR ISR
- * 
- * These functions perform RAW register reads 
- * They are intentionally NOT factored out to separate functions to minimize ISR time.
  *****************************************************************************/
 
-/**
- * @brief Read raw ADXL355 acceleration data directly from SPI
- * 
- * ADXL355 raw data format:
- * - 3 axes, each 20-bit two's complement
- * - Registers: XDATA3, XDATA2, XDATA1 (and same for Y, Z)
- * - Total: 9 bytes burst read from XDATA3
- * 
- * @param raw_x Output for X-axis raw value
- * @param raw_y Output for Y-axis raw value
- * @param raw_z Output for Z-axis raw value
- */
 static inline void IRAM_ATTR read_adxl355_raw(int32_t *raw_x, int32_t *raw_y, int32_t *raw_z)
 {
-     // ADXL355 SPI command: (reg << 1) | 0x01 for read
-    // XDATA3 register = 0x08
     uint8_t tx[10] = {0};
     uint8_t rx[10] = {0};
-    
-    tx[0] = (0x08 << 1) | 0x01;  // Read command for XDATA3
-    
+
+    tx[0] = (0x08 << 1) | 0x01;  // XDATA3 burst read
+
     spi_transaction_t t;
     memset(&t, 0, sizeof(t));
-    t.length = 10 * 8;  // 10 bytes (1 cmd + 9 data)
+    t.length = 10 * 8;
     t.tx_buffer = tx;
     t.rx_buffer = rx;
-    
-    // Direct SPI transfer (blocking, but very fast ~10-20 microseconds)
+
+#ifdef SPI_CS_SCL3300_IO
+    /* Force the OTHER SPI device inactive. */
+    gpio_set_level(SPI_CS_SCL3300_IO, 1);
+#endif
+
+    /* Do NOT manually drive ADXL355 CS here.
+       ADXL355 uses automatic CS in its driver config. */
     spi_device_polling_transmit(adxl355_spi_handle, &t);
-    
-    // Extract 20-bit values
-    // Byte layout from ADXL355 datasheet:
-    // rx[1] = XDATA3 (bits 19-12)
-    // rx[2] = XDATA2 (bits 11-4)
-    // rx[3] = XDATA1 (bits 3-0)
+
     uint32_t x_u = ((uint32_t)rx[1] << 12) | ((uint32_t)rx[2] << 4) | ((uint32_t)rx[3] >> 4);
     uint32_t y_u = ((uint32_t)rx[4] << 12) | ((uint32_t)rx[5] << 4) | ((uint32_t)rx[6] >> 4);
     uint32_t z_u = ((uint32_t)rx[7] << 12) | ((uint32_t)rx[8] << 4) | ((uint32_t)rx[9] >> 4);
-    
-    // Sign extend 20-bit to 32-bit 
-    // If bit 19 is set, it's negative in two's complement
-    *raw_x = (x_u & 0x80000) ? (int32_t)(x_u | 0xFFF00000) : (int32_t)x_u;
-    *raw_y = (y_u & 0x80000) ? (int32_t)(y_u | 0xFFF00000) : (int32_t)y_u;
-    *raw_z = (z_u & 0x80000) ? (int32_t)(z_u | 0xFFF00000) : (int32_t)z_u;
+
+    *raw_x = (x_u & 0x80000u) ? (int32_t)(x_u | 0xFFF00000u) : (int32_t)x_u;
+    *raw_y = (y_u & 0x80000u) ? (int32_t)(y_u | 0xFFF00000u) : (int32_t)y_u;
+    *raw_z = (z_u & 0x80000u) ? (int32_t)(z_u | 0xFFF00000u) : (int32_t)z_u;
 }
 
-/**
- * @brief Perform one 32-bit SCL3300 SPI frame with manual CS control
- *
- * This mirrors the manual-CS behavior used in scl3300.c.
- */
 static inline void IRAM_ATTR scl3300_isr_transfer(uint32_t cmd, uint32_t *resp_out)
 {
     spi_transaction_t t;
@@ -205,14 +177,22 @@ static inline void IRAM_ATTR scl3300_isr_transfer(uint32_t cmd, uint32_t *resp_o
     t.flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
     t.length = 32;
     t.rxlength = 32;
+
     t.tx_data[0] = (uint8_t)((cmd >> 24) & 0xFF);
     t.tx_data[1] = (uint8_t)((cmd >> 16) & 0xFF);
     t.tx_data[2] = (uint8_t)((cmd >> 8) & 0xFF);
     t.tx_data[3] = (uint8_t)(cmd & 0xFF);
 
-    gpio_set_level(SPI_CS_SCL3300_IO, 0);
-    spi_device_polling_transmit(scl3300_spi_handle, &t);
+#ifdef SPI_CS_SCL3300_IO
     gpio_set_level(SPI_CS_SCL3300_IO, 1);
+    gpio_set_level(SPI_CS_SCL3300_IO, 0);
+#endif
+
+    spi_device_polling_transmit(scl3300_spi_handle, &t);
+
+#ifdef SPI_CS_SCL3300_IO
+    gpio_set_level(SPI_CS_SCL3300_IO, 1);
+#endif
 
     if (resp_out) {
         *resp_out = ((uint32_t)t.rx_data[0] << 24) |
@@ -222,224 +202,202 @@ static inline void IRAM_ATTR scl3300_isr_transfer(uint32_t cmd, uint32_t *resp_o
     }
 }
 
-/**
- * @brief Read raw SCL3300 angle/acceleration data directly from SPI
- * 
- * SCL3300 uses off-frame protocol:
- * - Send command, get previous command's response
- * - For ISR efficiency simplify reads 
- * - Commands from scl3300.h
- * 
- * @param raw_x Output for X-axis raw value
- * @param raw_y Output for Y-axis raw value
- * @param raw_z Output for Z-axis raw value
- */
-static inline void IRAM_ATTR read_scl3300_raw(int16_t *raw_x, int16_t *raw_y, int16_t *raw_z)
+static inline int16_t IRAM_ATTR scl3300_unpack_raw16(uint32_t resp)
 {
-    uint32_t resp;
-
-    // X-axis acceleration
-    scl3300_isr_transfer(0x040000F7u, NULL);   // prime
-    scl3300_isr_transfer(0x040000F7u, &resp);  // fetch
-    *raw_x = (int16_t)((resp >> 8) & 0xFFFF);
-
-    // Y-axis acceleration
-    scl3300_isr_transfer(0x080000FDu, NULL);   // prime
-    scl3300_isr_transfer(0x080000FDu, &resp);  // fetch
-    *raw_y = (int16_t)((resp >> 8) & 0xFFFF);
-
-    // Z-axis acceleration
-    scl3300_isr_transfer(0x0C0000FBu, NULL);   // prime
-    scl3300_isr_transfer(0x0C0000FBu, &resp);  // fetch
-    *raw_z = (int16_t)((resp >> 8) & 0xFFFF);
+    return (int16_t)((resp >> 8) & 0xFFFFu);
 }
 
-/**
- * @brief Read raw ADT7420 temperature data directly from I2C
- * 
- * ADT7420 temperature format:
- * - 13-bit resolution (default)
- * - 2 bytes read from TEMP_MSB register
- * 
- * @param raw_temp Output for raw temperature value
- */
+static inline void IRAM_ATTR scl3300_prime_pipeline_once(void)
+{
+    uint32_t dummy;
+    scl3300_isr_transfer(SCL3300_CMD_X, &dummy);
+    s_scl_pipeline_primed = true;
+    s_scl_discard_first_sample = true;
+}
+
+static inline bool IRAM_ATTR read_scl3300_raw(int16_t *raw_x, int16_t *raw_y, int16_t *raw_z)
+{
+    uint32_t resp_x;
+    uint32_t resp_y;
+    uint32_t resp_z;
+
+    if (!s_scl_pipeline_primed) {
+        scl3300_prime_pipeline_once();
+        return false;
+    }
+
+    /* Rolling off-frame sequence:
+       send Y -> receive X
+       send Z -> receive Y
+       send X -> receive Z */
+    scl3300_isr_transfer(SCL3300_CMD_Y, &resp_x);
+    scl3300_isr_transfer(SCL3300_CMD_Z, &resp_y);
+    scl3300_isr_transfer(SCL3300_CMD_X, &resp_z);
+
+    *raw_x = scl3300_unpack_raw16(resp_x);
+    *raw_y = scl3300_unpack_raw16(resp_y);
+    *raw_z = scl3300_unpack_raw16(resp_z);
+
+    if (s_scl_discard_first_sample) {
+        s_scl_discard_first_sample = false;
+        return false;
+    }
+
+    return true;
+}
+
 static inline void IRAM_ATTR read_adt7420_raw(uint16_t *raw_temp)
 {
-    // This function is not used - temperature read from processing task
+    /* Intentionally unused in ISR */
     *raw_temp = 0;
 }
 
 /******************************************************************************
- * ISR - TIMER INTERRUPT HANDLER
- * 
- * This is the ONLY place where sensor data is collected.
- * Called every 125 microseconds (8000 Hz)
-
+ * ISR
  *****************************************************************************/
 
 static bool IRAM_ATTR timer_isr_handler(gptimer_handle_t timer,
                                         const gptimer_alarm_event_data_t *edata,
                                         void *user_ctx)
 {
-    // Increment global tick counter
+    (void)timer;
+    (void)edata;
+    (void)user_ctx;
+
     tick_counter++;
-    
-    // Local variables for ring buffer operations
+
     uint32_t next_write_index;
     uint32_t current_read_index;
-    
-    //--------------------------------------------------------------------------
-    // ADXL355 Sampling (1000 Hz - every 8 ticks)
-    //--------------------------------------------------------------------------
-    if (((tick_counter - ADXL355_OFFSET) & (ADXL355_TICK_DIVISOR - 1)) == 0)
+
+    /* ADXL355 @ 1000 Hz */
+    if (((tick_counter - ADXL355_OFFSET) & (ADXL355_TICK_DIVISOR - 1u)) == 0u)
     {
-        // Calculate next write position
-        next_write_index = (adxl355_ring_buffer.write_index + 1) & (ADXL355_BUFFER_SIZE - 1);
-        
-        // Check for buffer overflow (write would overtake read)
+        next_write_index = (adxl355_ring_buffer.write_index + 1u) & (ADXL355_BUFFER_SIZE - 1u);
         current_read_index = adxl355_ring_buffer.read_index;
+
         if (next_write_index == current_read_index)
         {
-            // Buffer full - increment overflow counter and skip this sample
             adxl355_ring_buffer.overflow_count++;
         }
         else
         {
-            // Write timestamp
             adxl355_ring_buffer.buffer[adxl355_ring_buffer.write_index].tick = tick_counter;
-            
-            // Read raw sensor data directly (inline function, minimal overhead)
+
             read_adxl355_raw(
                 &adxl355_ring_buffer.buffer[adxl355_ring_buffer.write_index].raw_x,
                 &adxl355_ring_buffer.buffer[adxl355_ring_buffer.write_index].raw_y,
                 &adxl355_ring_buffer.buffer[adxl355_ring_buffer.write_index].raw_z
             );
-            
-            // Advance write index
+
             adxl355_ring_buffer.write_index = next_write_index;
-            
-            // Increment sample count
             adxl355_sample_count++;
         }
     }
-    
-    //--------------------------------------------------------------------------
-    // SCL3300 Sampling (20 Hz: every 400 ticks)
-    //--------------------------------------------------------------------------
-    if ((tick_counter - SCL3300_OFFSET) % SCL3300_TICK_DIVISOR == 0)
+
+    /* SCL3300 @ 20 Hz */
+    if (((tick_counter - SCL3300_OFFSET) % SCL3300_TICK_DIVISOR) == 0u)
     {
-        // Calculate next write position
-        next_write_index = (scl3300_ring_buffer.write_index + 1) & (SCL3300_BUFFER_SIZE - 1);
-        
-        // Check for buffer overflow
+        int16_t raw_x = 0;
+        int16_t raw_y = 0;
+        int16_t raw_z = 0;
+
+        next_write_index = (scl3300_ring_buffer.write_index + 1u) & (SCL3300_BUFFER_SIZE - 1u);
         current_read_index = scl3300_ring_buffer.read_index;
+
         if (next_write_index == current_read_index)
         {
             scl3300_ring_buffer.overflow_count++;
         }
         else
         {
-            // Write timestamp
-            scl3300_ring_buffer.buffer[scl3300_ring_buffer.write_index].tick = tick_counter;
-            
-            // Read raw sensor data directly
-            read_scl3300_raw(
-                &scl3300_ring_buffer.buffer[scl3300_ring_buffer.write_index].raw_x,
-                &scl3300_ring_buffer.buffer[scl3300_ring_buffer.write_index].raw_y,
-                &scl3300_ring_buffer.buffer[scl3300_ring_buffer.write_index].raw_z
-            );
-            
-            // Advance write index
-            scl3300_ring_buffer.write_index = next_write_index;
-            
-            // Increment sample count
-            scl3300_sample_count++;
+            bool valid = read_scl3300_raw(&raw_x, &raw_y, &raw_z);
+
+            if (valid)
+            {
+                scl3300_ring_buffer.buffer[scl3300_ring_buffer.write_index].tick = tick_counter;
+                scl3300_ring_buffer.buffer[scl3300_ring_buffer.write_index].raw_x = raw_x;
+                scl3300_ring_buffer.buffer[scl3300_ring_buffer.write_index].raw_y = raw_y;
+                scl3300_ring_buffer.buffer[scl3300_ring_buffer.write_index].raw_z = raw_z;
+
+                scl3300_ring_buffer.write_index = next_write_index;
+                scl3300_sample_count++;
+            }
         }
     }
-    
-    //Commented out since temperature reads were not working well within ISR. Will read temperature from processing task instead at 1 Hz rate.
-    //--------------------------------------------------------------------------
-    // ADT7420 Sampling (1 Hz - every 8000 ticks)
-    //--------------------------------------------------------------------------
+
     /*
-    if (s_temp_available && (tick_counter - ADT7420_OFFSET) % ADT7420_TICK_DIVISOR == 0)
+    // ADT7420 Sampling (1 Hz - every 8000 ticks)
+    // Intentionally left commented out.
+    if (s_temp_available && ((tick_counter - ADT7420_OFFSET) % ADT7420_TICK_DIVISOR) == 0u)
     {
-        // Calculate next write position
-        next_write_index = (adt7420_ring_buffer.write_index + 1) & (ADT7420_BUFFER_SIZE - 1);
-        
-        // Check for buffer overflow
+        next_write_index = (adt7420_ring_buffer.write_index + 1u) & (ADT7420_BUFFER_SIZE - 1u);
         current_read_index = adt7420_ring_buffer.read_index;
+
         if (next_write_index == current_read_index)
         {
             adt7420_ring_buffer.overflow_count++;
         }
         else
         {
-            // Write timestamp
             adt7420_ring_buffer.buffer[adt7420_ring_buffer.write_index].tick = tick_counter;
-            
-            // Read raw sensor data directly
-            read_adt7420_raw(
-                &adt7420_ring_buffer.buffer[adt7420_ring_buffer.write_index].raw_temp
-            );
-            
-            // Advance write index
+            read_adt7420_raw(&adt7420_ring_buffer.buffer[adt7420_ring_buffer.write_index].raw_temp);
             adt7420_ring_buffer.write_index = next_write_index;
-            
-            // Increment sample count
             adt7420_sample_count++;
         }
     }
     */
-    
-    // ISR complete: no context switch needed for pure data collection
+
     return false;
 }
 
 /******************************************************************************
- * INITIALIZATION FUNCTION
+ * INITIALIZATION
  *****************************************************************************/
 
 esp_err_t sensor_acquisition_init(bool temp_sensor_available)
 {
     esp_err_t ret;
-    
+
     s_temp_available = temp_sensor_available;
-    
+
     ESP_LOGI(TAG, "Initializing ISR-based sensor acquisition...");
     ESP_LOGI(TAG, "  Base timer: %d Hz (%d us period)", BASE_TIMER_FREQ_HZ, TIMER_PERIOD_US);
-    ESP_LOGI(TAG, "  ADXL355: %d Hz (every %d ticks, offset %d)", 
+    ESP_LOGI(TAG, "  ADXL355: %d Hz (every %d ticks, offset %d)",
              ADXL355_RATE_HZ, ADXL355_TICK_DIVISOR, ADXL355_OFFSET);
     ESP_LOGI(TAG, "  SCL3300: %d Hz (every %d ticks, offset %d)",
              SCL3300_RATE_HZ, SCL3300_TICK_DIVISOR, SCL3300_OFFSET);
     ESP_LOGI(TAG, "  ADT7420: %d Hz (every %d ticks, offset %d)",
              ADT7420_RATE_HZ, ADT7420_TICK_DIVISOR, ADT7420_OFFSET);
-    
-    // Initialize ring buffers
+
     memset(&adxl355_ring_buffer, 0, sizeof(adxl355_ring_buffer));
     memset(&scl3300_ring_buffer, 0, sizeof(scl3300_ring_buffer));
     memset(&adt7420_ring_buffer, 0, sizeof(adt7420_ring_buffer));
-    
-    // Reset tick counter and statistics
+
     tick_counter = 0;
     adxl355_sample_count = 0;
     scl3300_sample_count = 0;
     adt7420_sample_count = 0;
-    
-    // Configure GPTimer
+
+    s_scl_pipeline_primed = false;
+    s_scl_discard_first_sample = true;
+
+#ifdef SPI_CS_SCL3300_IO
+    gpio_set_direction(SPI_CS_SCL3300_IO, GPIO_MODE_OUTPUT);
+    gpio_set_level(SPI_CS_SCL3300_IO, 1);
+#endif
+
     gptimer_config_t timer_config = {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
         .direction = GPTIMER_COUNT_UP,
-        .resolution_hz = 1000000,  // 1 MHz = 1 tick per microsecond
+        .resolution_hz = 1000000,
     };
-    
+
     ret = gptimer_new_timer(&timer_config, &s_timer);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to create timer: %s", esp_err_to_name(ret));
         return ret;
     }
-    
-    // Register ISR handler
+
     gptimer_event_callbacks_t cbs = {
         .on_alarm = timer_isr_handler,
     };
@@ -450,11 +408,10 @@ esp_err_t sensor_acquisition_init(bool temp_sensor_available)
         s_timer = NULL;
         return ret;
     }
-    
-    // Configure periodic alarm at base sample rate
+
     gptimer_alarm_config_t alarm_config = {
         .reload_count = 0,
-        .alarm_count = TIMER_PERIOD_US,  // 125 microseconds
+        .alarm_count = TIMER_PERIOD_US,
         .flags.auto_reload_on_alarm = true,
     };
     ret = gptimer_set_alarm_action(s_timer, &alarm_config);
@@ -464,8 +421,7 @@ esp_err_t sensor_acquisition_init(bool temp_sensor_available)
         s_timer = NULL;
         return ret;
     }
-    
-    // Enable timer 
+
     ret = gptimer_enable(s_timer);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to enable timer: %s", esp_err_to_name(ret));
@@ -473,11 +429,11 @@ esp_err_t sensor_acquisition_init(bool temp_sensor_available)
         s_timer = NULL;
         return ret;
     }
-    
+
     ESP_LOGI(TAG, "Sensor acquisition initialized successfully");
     ESP_LOGI(TAG, "Ring buffer sizes: ADXL=%d, SCL=%d, ADT=%d",
              ADXL355_BUFFER_SIZE, SCL3300_BUFFER_SIZE, ADT7420_BUFFER_SIZE);
-    
+
     return ESP_OK;
 }
 
@@ -487,17 +443,15 @@ esp_err_t sensor_acquisition_start(void)
         ESP_LOGE(TAG, "Timer not initialized");
         return ESP_FAIL;
     }
-    
-    // Reset statistics
+
     sensor_acquisition_reset_stats();
-    
-    // Start timer
+
     esp_err_t ret = gptimer_start(s_timer);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start timer: %s", esp_err_to_name(ret));
         return ret;
     }
-    
+
     ESP_LOGI(TAG, "Sensor acquisition STARTED");
     return ESP_OK;
 }
@@ -505,54 +459,47 @@ esp_err_t sensor_acquisition_start(void)
 esp_err_t sensor_acquisition_stop(void)
 {
     if (s_timer == NULL) {
-        return ESP_OK;  // Already stopped
+        return ESP_OK;
     }
-    
+
     esp_err_t ret = gptimer_stop(s_timer);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to stop timer: %s", esp_err_to_name(ret));
         return ret;
     }
-    
+
     ESP_LOGI(TAG, "Sensor acquisition STOPPED");
     return ESP_OK;
 }
 
 /******************************************************************************
  * RING BUFFER ACCESS FUNCTIONS
- * (Called by separate processing tasks)
  *****************************************************************************/
 
-// Check if data is available in ADXL355 buffer
 bool adxl355_data_available(void)
 {
     return (adxl355_ring_buffer.write_index != adxl355_ring_buffer.read_index);
 }
 
-// Read one sample from ADXL355 buffer
 bool adxl355_read_sample(adxl355_raw_sample_t *sample)
 {
     if (!adxl355_data_available())
     {
-        return false;  // No data available
+        return false;
     }
-    
-    // Copy data from buffer
+
     *sample = adxl355_ring_buffer.buffer[adxl355_ring_buffer.read_index];
-    
-    // Advance read index
-    adxl355_ring_buffer.read_index = 
-        (adxl355_ring_buffer.read_index + 1) & (ADXL355_BUFFER_SIZE - 1);
-    
+    adxl355_ring_buffer.read_index =
+        (adxl355_ring_buffer.read_index + 1u) & (ADXL355_BUFFER_SIZE - 1u);
+
     return true;
 }
 
-// Get number of samples available in ADXL355 buffer
 uint32_t adxl355_samples_available(void)
 {
     uint32_t write = adxl355_ring_buffer.write_index;
     uint32_t read = adxl355_ring_buffer.read_index;
-    
+
     if (write >= read)
     {
         return write - read;
@@ -563,7 +510,6 @@ uint32_t adxl355_samples_available(void)
     }
 }
 
-// Similar functions for SCL3300
 bool scl3300_data_available(void)
 {
     return (scl3300_ring_buffer.write_index != scl3300_ring_buffer.read_index);
@@ -575,12 +521,11 @@ bool scl3300_read_sample(scl3300_raw_sample_t *sample)
     {
         return false;
     }
-    
+
     *sample = scl3300_ring_buffer.buffer[scl3300_ring_buffer.read_index];
-    
-    scl3300_ring_buffer.read_index = 
-        (scl3300_ring_buffer.read_index + 1) & (SCL3300_BUFFER_SIZE - 1);
-    
+    scl3300_ring_buffer.read_index =
+        (scl3300_ring_buffer.read_index + 1u) & (SCL3300_BUFFER_SIZE - 1u);
+
     return true;
 }
 
@@ -588,7 +533,7 @@ uint32_t scl3300_samples_available(void)
 {
     uint32_t write = scl3300_ring_buffer.write_index;
     uint32_t read = scl3300_ring_buffer.read_index;
-    
+
     if (write >= read)
     {
         return write - read;
@@ -599,7 +544,6 @@ uint32_t scl3300_samples_available(void)
     }
 }
 
-// Similar functions for ADT7420
 bool adt7420_data_available(void)
 {
     return (adt7420_ring_buffer.write_index != adt7420_ring_buffer.read_index);
@@ -611,12 +555,11 @@ bool adt7420_read_sample(adt7420_raw_sample_t *sample)
     {
         return false;
     }
-    
+
     *sample = adt7420_ring_buffer.buffer[adt7420_ring_buffer.read_index];
-    
-    adt7420_ring_buffer.read_index = 
-        (adt7420_ring_buffer.read_index + 1) & (ADT7420_BUFFER_SIZE - 1);
-    
+    adt7420_ring_buffer.read_index =
+        (adt7420_ring_buffer.read_index + 1u) & (ADT7420_BUFFER_SIZE - 1u);
+
     return true;
 }
 
@@ -624,7 +567,7 @@ uint32_t adt7420_samples_available(void)
 {
     uint32_t write = adt7420_ring_buffer.write_index;
     uint32_t read = adt7420_ring_buffer.read_index;
-    
+
     if (write >= read)
     {
         return write - read;
@@ -636,24 +579,22 @@ uint32_t adt7420_samples_available(void)
 }
 
 /******************************************************************************
- * DIAGNOSTIC FUNCTIONS
- * (For debugging/monitoring)
+ * DIAGNOSTICS
  *****************************************************************************/
 
 void sensor_acquisition_get_stats(uint32_t *samples_acquired,
-                                   uint32_t *samples_dropped,
-                                   uint32_t *max_acquisition_time_us)
+                                  uint32_t *samples_dropped,
+                                  uint32_t *max_acquisition_time_us)
 {
     if (samples_acquired) {
         *samples_acquired = adxl355_sample_count + scl3300_sample_count + adt7420_sample_count;
     }
     if (samples_dropped) {
-        *samples_dropped = adxl355_ring_buffer.overflow_count + 
-                           scl3300_ring_buffer.overflow_count + 
+        *samples_dropped = adxl355_ring_buffer.overflow_count +
+                           scl3300_ring_buffer.overflow_count +
                            adt7420_ring_buffer.overflow_count;
     }
     if (max_acquisition_time_us) {
-        // This would need to be implemented if you want to track ISR execution time
         *max_acquisition_time_us = 0;
     }
 }
@@ -663,13 +604,17 @@ void sensor_acquisition_reset_stats(void)
     adxl355_sample_count = 0;
     scl3300_sample_count = 0;
     adt7420_sample_count = 0;
+
     adxl355_ring_buffer.overflow_count = 0;
     scl3300_ring_buffer.overflow_count = 0;
     adt7420_ring_buffer.overflow_count = 0;
+
     tick_counter = 0;
+
+    s_scl_pipeline_primed = false;
+    s_scl_discard_first_sample = true;
 }
 
-// Get overflow counts (buffer overruns)
 uint32_t adxl355_get_overflow_count(void)
 {
     return adxl355_ring_buffer.overflow_count;
@@ -685,7 +630,6 @@ uint32_t adt7420_get_overflow_count(void)
     return adt7420_ring_buffer.overflow_count;
 }
 
-// Get total sample counts
 uint32_t adxl355_get_sample_count(void)
 {
     return adxl355_sample_count;
@@ -701,7 +645,6 @@ uint32_t adt7420_get_sample_count(void)
     return adt7420_sample_count;
 }
 
-// Get current tick count
 uint32_t get_tick_count(void)
 {
     return tick_counter;
