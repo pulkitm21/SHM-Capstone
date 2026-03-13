@@ -6,8 +6,10 @@ import NodeMap from "../../components/NodeMap/NodeMap";
 import {
   getNodes,
   getStorage,
+  getStorageStatus,
   type NodeRecord,
   type StorageResponse,
+  type StorageStatusResponse,
 } from "../../services/api";
 
 import "./Home.css";
@@ -28,6 +30,11 @@ export default function Home() {
   const [storageFree, setStorageFree] = useState<number>(0);
   const [storageTotal, setStorageTotal] = useState<number>(0);
   const [storagePercent, setStoragePercent] = useState<number>(0);
+
+  const [ssdMounted, setSsdMounted] = useState<boolean>(false);
+  const [ssdAvailable, setSsdAvailable] = useState<boolean>(false);
+  const [ssdStatusText, setSsdStatusText] = useState<string>("Loading…");
+  const [ssdMountPath, setSsdMountPath] = useState<string>("/mnt/ssd");
 
   useEffect(() => {
     let mounted = true;
@@ -124,13 +131,34 @@ export default function Home() {
       }
     }
 
+    async function pollStorageStatus() {
+      try {
+        const res: StorageStatusResponse = await getStorageStatus();
+        if (!mounted) return;
+
+        setSsdMounted(Boolean(res.mounted));
+        setSsdAvailable(Boolean(res.available));
+        setSsdStatusText(String(res.status ?? "unknown"));
+        setSsdMountPath(String(res.mount_path ?? "/mnt/ssd"));
+      } catch {
+        if (!mounted) return;
+
+        setSsdMounted(false);
+        setSsdAvailable(false);
+        setSsdStatusText("Status unavailable");
+        setSsdMountPath("/mnt/ssd");
+      }
+    }
+
     connectBackendStatusSSE();
     pollNodes();
     pollStorage();
+    pollStorageStatus();
 
     const id = window.setInterval(() => {
       pollNodes();
       pollStorage();
+      pollStorageStatus();
     }, 5000);
 
     return () => {
@@ -196,6 +224,30 @@ export default function Home() {
 
           <div className="storage-percent">
             {storagePercent.toFixed(1)}% used
+          </div>
+
+          <div style={{ marginTop: 12 }}>
+            <div style={{ marginBottom: 6, fontWeight: 600 }}>
+              SSD Mount Diagnostic
+            </div>
+
+            <div className="backend-status-row">
+              <span className={`status-pill ${ssdAvailable ? "info" : "high"}`}>
+                {ssdAvailable ? "Available" : "Unavailable"}
+              </span>
+            </div>
+
+            <div style={{ marginTop: 8 }}>
+              Mounted: <span className="mono">{ssdMounted ? "Yes" : "No"}</span>
+            </div>
+
+            <div style={{ marginTop: 4 }}>
+              Path: <span className="mono">{ssdMountPath}</span>
+            </div>
+
+            <div style={{ marginTop: 4 }}>
+              Status: <span className="mono">{ssdStatusText}</span>
+            </div>
           </div>
         </div>
       </div>
