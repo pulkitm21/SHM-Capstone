@@ -189,6 +189,8 @@ esp_err_t adxl355_init(void)
     }
 
     ESP_LOGI(TAG, "ADXL355 init OK (range code=0x%02X)", s_range_code);
+
+
     return ESP_OK;
 }
 

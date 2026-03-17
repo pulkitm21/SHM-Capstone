@@ -70,6 +70,18 @@
 // Fault logging
 #include "fault_log.h"
 
+// ============================================================
+// >>> TEST MODE: includes and defines for bench testing
+// >>> DELETE THIS ENTIRE BLOCK when done testing
+#include <math.h>
+#include "esp_timer.h"
+// Define BENCH_TEST_MODE to skip ethernet, PTP, and MQTT entirely.
+// Jumps straight to buses → sensors → acquisition → serial print.
+// Comment out this line to restore normal operation.
+#define BENCH_TEST_MODE
+// <<< END TEST MODE
+// ============================================================
+
 static const char *TAG = "main";
 
 // Timeouts
@@ -341,40 +353,10 @@ static esp_err_t init_network(void)
     return ESP_OK;
 }
 
-/**
- * @brief Start the PTP daemon and block until the clock is synchronized.
- *
- * SEQUENCE:
- *  1. Call ptpd_start("ETH_0") to spawn the PTP daemon task at
- *     tskIDLE_PRIORITY + 2 (lowest useful priority, below everything else).
- *  2. Wait for esp_eth_clock_gettime(CLOCK_PTP_SYSTEM, ...) to return 0
- *     (clock available), which can take a few seconds after first Sync packet.
- *  3. Poll ptpd_status() until clock_source_valid has been true for
- *     PTP_SYNC_STABLE_COUNT consecutive polls (500ms apart), confirming
- *     the PI controller has converged and the clock is locked to the Pi.
- *  4. Give up and continue after PTP_SYNC_TIMEOUT_MS with a warning.
- *     Sensor acquisition will start anyway but packets will have
- *     timestamp=0 until sync is achieved.
- *
- * IMPORTANT:
- *  - Must be called AFTER ethernet_init() and ethernet_wait_for_ip().
- *    The PTP daemon needs the Ethernet link up and L2TAP registered
- *    (L2TAP is registered inside ethernet_init()).
- *  - Must be called BEFORE init_acquisition() so that all published
- *    packets have valid PTP timestamps from the very first sample.
- *  - ptpd_status() dereferences s_state inside ptpd.c. We wait for
- *    esp_eth_clock_gettime() to succeed first as a proxy for the daemon
- *    having initialized s_state, avoiding a NULL dereference.
- *
- * @return ESP_OK if synced within timeout, ESP_ERR_TIMEOUT otherwise.
- */
 static esp_err_t ptp_init_and_sync(void)
 {
     ESP_LOGI(TAG, "--- Initializing PTP (Raspberry Pi grandmaster) ---");
 
-    /* Start the PTP daemon. It attaches to the existing "ETH_0" netif
-     * that ethernet_init() already created. Returns 1 on success, -1
-     * if another instance is already running. */
     s_ptp_pid = ptpd_start("ETH_0");
     if (s_ptp_pid < 0) {
         ESP_LOGE(TAG, "ptpd_start failed (another instance running?)");
@@ -382,28 +364,13 @@ static esp_err_t ptp_init_and_sync(void)
     }
     ESP_LOGI(TAG, "PTP daemon started (pid=%d, priority=tskIDLE_PRIORITY+2)", s_ptp_pid);
 
-    /* Step 1: On ESP32, clock_gettime(CLOCK_REALTIME) always succeeds
-         * immediately after boot (returns 0 = Unix epoch). There is no
-         * meaningful way to wait for the clock to "become available" here —
-         * the real readiness signal is clock_source_valid in step 2 below.
-         * We just give the ptpd task a moment to start up before polling. */
+    ESP_LOGI(TAG, "Waiting for PTP daemon to start up...");
+    struct timespec ts;
+    uint32_t elapsed_ms = 0;
+    vTaskDelay(pdMS_TO_TICKS(500));
+    elapsed_ms = 500;
+    ESP_LOGI(TAG, "PTP daemon startup delay complete, waiting for clock lock...");
 
-        ESP_LOGI(TAG, "Waiting for PTP daemon to start up...");
-        struct timespec ts;
-        uint32_t elapsed_ms = 0;
-        vTaskDelay(pdMS_TO_TICKS(500));
-        elapsed_ms = 500;
-        ESP_LOGI(TAG, "PTP daemon startup delay complete, waiting for clock lock...");
-
-    /* -----------------------------------------------------------------------
-     * Step 2: Wait for clock_source_valid to be stable.
-     *
-     * clock_source_valid becomes true when the PTP daemon has received
-     * Announce and Sync packets from the grandmaster (Raspberry Pi) and
-     * the PI controller has started converging. We require it to be true
-     * for PTP_SYNC_STABLE_COUNT consecutive polls (500ms apart) before
-     * considering the clock locked.
-     * ----------------------------------------------------------------------- */
     ESP_LOGI(TAG, "Waiting for PTP clock to lock to Raspberry Pi grandmaster...");
     ESP_LOGI(TAG, "(This typically takes 5-15 seconds on a local LAN)");
 
@@ -430,21 +397,17 @@ static esp_err_t ptp_init_and_sync(void)
                          (long)stable_count, PTP_SYNC_STABLE_COUNT,
                          (long long)status.last_delta_ns);
             } else {
-                /* Reset counter — require consecutive valid readings */
                 if (stable_count > 0) {
                     ESP_LOGD(TAG, "PTP clock_source_valid went false — resetting stable count");
                 }
                 stable_count = 0;
             }
         } else {
-            /* ptpd_status() timed out internally (1s timeout in ptpd.c).
-             * This can happen briefly during daemon startup. Just keep waiting. */
             stable_count = 0;
             ESP_LOGD(TAG, "ptpd_status() timed out — daemon still starting");
         }
     }
 
-    /* Log the current PTP time so we can verify it looks like real UTC */
     if (esp_eth_clock_gettime(CLOCK_PTP_SYSTEM, &ts) == 0) {
         ESP_LOGI(TAG, "PTP synchronized! Time: %llu.%09lu (Unix epoch)",
                  (unsigned long long)ts.tv_sec,
@@ -555,7 +518,7 @@ static esp_err_t init_acquisition(bool temp_available)
     return ESP_OK;
 }
 
-static esp_err_t init_data_processing(void)
+__attribute__((unused)) static esp_err_t init_data_processing(void)
 {
     ESP_LOGI(TAG, "--- Initializing Data Processing Task ---");
 
@@ -568,6 +531,268 @@ static esp_err_t init_data_processing(void)
     ESP_LOGI(TAG, "Data processing task started");
     return ESP_OK;
 }
+
+// ============================================================
+// >>> TEST TASK: prints accel, inclinometer, and temperature
+// >>> to the serial terminal every 50ms.
+// >>> DELETE this entire function when done testing,
+// >>> and uncomment the init_data_processing() call in app_main.
+// ============================================================
+static void sensor_print_task(void *pvParameters)
+{
+    adxl355_raw_sample_t adxl_sample;
+    scl3300_raw_sample_t scl_sample;
+
+    // Accelerometer decimation state
+    int decim_count = 0;
+    int64_t sum_x = 0, sum_y = 0, sum_z = 0;
+
+    // Latest inclinometer values
+    float incl_x = 0.0f, incl_y = 0.0f, incl_z = 0.0f;
+    bool incl_valid = false;
+
+    // Latest temperature
+    float temperature = 0.0f;
+    bool temp_valid = false;
+    uint32_t last_temp_ms = 0;
+
+    ESP_LOGI("SENSOR_TEST", "========================================");
+    ESP_LOGI("SENSOR_TEST", "  SENSOR TEST MODE — serial print only  ");
+    ESP_LOGI("SENSOR_TEST", "  Accel @ 200 Hz (decimated from 1000)  ");
+    ESP_LOGI("SENSOR_TEST", "  Incl  @ 20 Hz                         ");
+    ESP_LOGI("SENSOR_TEST", "  Temp  @ 1 Hz                          ");
+    ESP_LOGI("SENSOR_TEST", "========================================");
+
+    while (1) {
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+        // ---- Temperature (read directly every 1 second) ----
+        if ((now_ms - last_temp_ms) >= 1000) {
+            last_temp_ms = now_ms;
+            float t = 0.0f;
+            if (adt7420_read_temperature(&t) == ESP_OK) {
+                temperature = t;
+                temp_valid = true;
+            } else {
+                temp_valid = false;
+            }
+        }
+
+        // ---- Inclinometer (drain ring buffer, keep latest) ----
+        while (scl3300_data_available()) {
+            if (scl3300_read_sample(&scl_sample)) {
+                // Basic garbage check: all zeros = unplugged
+                if (scl_sample.raw_x == 0 && scl_sample.raw_y == 0 && scl_sample.raw_z == 0) {
+                    incl_valid = false;
+                } else {
+                    incl_x = (float)scl_sample.raw_x * 0.0055f;
+                    incl_y = (float)scl_sample.raw_y * 0.0055f;
+                    incl_z = (float)scl_sample.raw_z * 0.0055f;
+                    incl_valid = true;
+                }
+            }
+        }
+
+        // ---- Accelerometer (decimate 5:1, print each decimated sample) ----
+        while (adxl355_data_available()) {
+            adxl355_read_sample(&adxl_sample);
+
+            sum_x += adxl_sample.raw_x;
+            sum_y += adxl_sample.raw_y;
+            sum_z += adxl_sample.raw_z;
+            decim_count++;
+
+            if (decim_count >= 5) {
+                float ax = (float)(sum_x / 5) / 256000.0f;
+                float ay = (float)(sum_y / 5) / 256000.0f;
+                float az = (float)(sum_z / 5) / 256000.0f;
+
+                // Print all three sensors together each time we have
+                // a new decimated accel sample (200 Hz)
+                ESP_LOGI("SENSOR_TEST",
+                         "ACCEL: X=%7.4fg  Y=%7.4fg  Z=%7.4fg  |"
+                         "  INCL: X=%7.3fdeg  Y=%7.3fdeg  Z=%7.3fdeg  [%s]  |"
+                         "  TEMP: %.2f C  [%s]",
+                         ax, ay, az,
+                         incl_x, incl_y, incl_z,
+                         incl_valid ? "OK" : "NULL",
+                         temperature,
+                         temp_valid ? "OK" : "NULL");
+
+                decim_count = 0;
+                sum_x = 0; sum_y = 0; sum_z = 0;
+                break;  // one decimated sample per loop iteration
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+// <<< END TEST TASK — delete from here up to the >>> marker above
+// ============================================================
+
+// ============================================================
+// >>> DEBUG TASK: raw pipeline dump — shows exactly where zeros
+// >>> are coming from. Replace the xTaskCreate call in app_main
+// >>> step 7 with:
+// >>>   xTaskCreate(accel_debug_task, "accel_dbg", 4096, NULL, 5, NULL);
+// >>> DELETE this entire function when done debugging.
+// ============================================================
+static void accel_debug_task(void *pvParameters)
+{
+    adxl355_raw_sample_t sample;
+    uint32_t total_read = 0;
+    uint32_t zero_count = 0;
+
+    ESP_LOGI("ACCEL_DBG", "========================================");
+    ESP_LOGI("ACCEL_DBG", "  RAW PIPELINE DEBUG — watching ISR output");
+    ESP_LOGI("ACCEL_DBG", "  Will print first 10 raw samples, then");
+    ESP_LOGI("ACCEL_DBG", "  a summary every 1 second.");
+    ESP_LOGI("ACCEL_DBG", "========================================");
+
+    // Wait a moment for the ISR to produce some data
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    // >>> TEMP: check if SCL3300 is also returning garbage
+    scl3300_raw_sample_t scl_s;
+    if (scl3300_read_sample(&scl_s)) {
+        ESP_LOGI("ACCEL_DBG", "SCL3300 raw check: x=%d y=%d z=%d", scl_s.raw_x, scl_s.raw_y, scl_s.raw_z);
+    } else {
+        ESP_LOGI("ACCEL_DBG", "SCL3300 raw check: no data yet");
+    }
+    // <<< END TEMP
+
+    // Add this to accel_debug_task before Stage 1:
+    uint8_t tx2[2] = {(0x00 << 1) | 0x01, 0x00};
+    uint8_t rx2[2] = {0};
+    spi_transaction_t t2 = {.length=16, .tx_buffer=tx2, .rx_buffer=rx2};
+    spi_device_transmit(adxl355_spi_handle, &t2);
+    ESP_LOGI("ACCEL_DBG", "Runtime ID check: DEVID_AD=0x%02X (expect 0xAD)", rx2[1]);
+
+    // --- STAGE 1: check ring buffer is actually filling ---
+    uint32_t available = adxl355_samples_available();
+    ESP_LOGI("ACCEL_DBG", "STAGE 1 — Ring buffer samples available after 200ms: %lu",
+             (unsigned long)available);
+    if (available == 0) {
+        ESP_LOGE("ACCEL_DBG", "  *** PROBLEM: ring buffer is empty — ISR is not producing data");
+        ESP_LOGE("ACCEL_DBG", "  Check: adxl355_init() succeeded? SPI wiring? CS pin?");
+    } else {
+        ESP_LOGI("ACCEL_DBG", "  OK: ring buffer is filling (expected ~200 samples at 1000Hz)");
+    }
+
+    // --- STAGE 2: print first 20 raw samples straight from ring buffer ---
+    ESP_LOGI("ACCEL_DBG", "STAGE 2 — First 20 raw samples from ring buffer:");
+    int printed = 0;
+    while (printed < 20) {
+        if (adxl355_data_available()) {
+            adxl355_read_sample(&sample);
+            ESP_LOGI("ACCEL_DBG", "  [%2d] tick=%lu  raw_x=%ld  raw_y=%ld  raw_z=%ld",
+                     printed,
+                     (unsigned long)sample.tick,
+                     (long)sample.raw_x,
+                     (long)sample.raw_y,
+                     (long)sample.raw_z);
+            printed++;
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+    }
+
+    // --- STAGE 3: check for stuck-at-zero ---
+    ESP_LOGI("ACCEL_DBG", "STAGE 3 — Counting zeros over next 1000 samples...");
+    total_read = 0;
+    zero_count = 0;
+    while (total_read < 1000) {
+        if (adxl355_data_available()) {
+            adxl355_read_sample(&sample);
+            total_read++;
+            if (sample.raw_x == 0 && sample.raw_y == 0 && sample.raw_z == 0) {
+                zero_count++;
+            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+    }
+    ESP_LOGI("ACCEL_DBG", "  Zero samples: %lu / %lu (%.1f%%)",
+             (unsigned long)zero_count,
+             (unsigned long)total_read,
+             (float)zero_count * 100.0f / (float)total_read);
+    if (zero_count == total_read) {
+        ESP_LOGE("ACCEL_DBG", "  *** PROBLEM: ALL samples are zero — SPI reads returning 0x00");
+        ESP_LOGE("ACCEL_DBG", "  Likely cause: MISO line stuck low (wiring/power issue)");
+        ESP_LOGE("ACCEL_DBG", "  or adxl355_init() failed silently");
+    } else if (zero_count > total_read / 2) {
+        ESP_LOGW("ACCEL_DBG", "  WARNING: >50%% zeros — intermittent SPI issue");
+    } else {
+        ESP_LOGI("ACCEL_DBG", "  OK: non-zero data present in ring buffer");
+    }
+
+    // --- STAGE 4: check conversion ---
+    ESP_LOGI("ACCEL_DBG", "STAGE 4 — Conversion check (decimate 5, show g values):");
+    int decim_count = 0;
+    int64_t sum_x = 0, sum_y = 0, sum_z = 0;
+    int conv_printed = 0;
+    while (conv_printed < 10) {
+        if (adxl355_data_available()) {
+            adxl355_read_sample(&sample);
+            sum_x += sample.raw_x;
+            sum_y += sample.raw_y;
+            sum_z += sample.raw_z;
+            decim_count++;
+            if (decim_count >= 5) {
+                float gx = (float)(sum_x / 5) / 256000.0f;
+                float gy = (float)(sum_y / 5) / 256000.0f;
+                float gz = (float)(sum_z / 5) / 256000.0f;
+                ESP_LOGI("ACCEL_DBG", "  [%2d] avg_raw_x=%ld  avg_raw_y=%ld  avg_raw_z=%ld"
+                         "  =>  gx=%.4f  gy=%.4f  gz=%.4f",
+                         conv_printed,
+                         (long)(sum_x / 5),
+                         (long)(sum_y / 5),
+                         (long)(sum_z / 5),
+                         gx, gy, gz);
+                decim_count = 0;
+                sum_x = 0; sum_y = 0; sum_z = 0;
+                conv_printed++;
+            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+    }
+
+    ESP_LOGI("ACCEL_DBG", "========================================");
+    ESP_LOGI("ACCEL_DBG", "  DEBUG COMPLETE — check output above");
+    ESP_LOGI("ACCEL_DBG", "  Expected on flat surface: gz ~ 1.0g");
+    ESP_LOGI("ACCEL_DBG", "========================================");
+
+    // Keep printing a live summary every 2 seconds so you can
+    // move the sensor around and watch the values respond
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        decim_count = 0;
+        sum_x = 0; sum_y = 0; sum_z = 0;
+        int collected = 0;
+        while (collected < 200) {
+            if (adxl355_data_available()) {
+                adxl355_read_sample(&sample);
+                sum_x += sample.raw_x;
+                sum_y += sample.raw_y;
+                sum_z += sample.raw_z;
+                collected++;
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(1));
+            }
+        }
+        float gx = (float)(sum_x / 200) / 256000.0f;
+        float gy = (float)(sum_y / 200) / 256000.0f;
+        float gz = (float)(sum_z / 200) / 256000.0f;
+        ESP_LOGI("ACCEL_DBG", "LIVE (200-sample avg): gx=%7.4f  gy=%7.4f  gz=%7.4f"
+                 "  |  overflow=%lu",
+                 gx, gy, gz,
+                 (unsigned long)adxl355_get_overflow_count());
+    }
+}
+// <<< END DEBUG TASK
+// ============================================================
 
 /* -------------------------------------------------------------------------- */
 /* app_main                                                                   */
@@ -589,6 +814,10 @@ void app_main(void)
     //    L2TAP is registered inside ethernet_init()
     //    and is required by ptpd_start().
     // =========================================
+// ============================================================
+// >>> BENCH_TEST_MODE: skip ethernet, PTP, MQTT - no cable needed
+// >>> To restore normal operation: comment out #define BENCH_TEST_MODE at top
+#ifndef BENCH_TEST_MODE
     if (init_network() != ESP_OK) {
         ESP_LOGE(TAG, "Network init failed - continuing anyway");
     }
@@ -596,16 +825,12 @@ void app_main(void)
 
     // =========================================
     // 2. PTP Synchronization
-    //    Must come BEFORE sensor acquisition so
-    //    that all packets have valid timestamps.
-    //    Must come AFTER ethernet_init() and
-    //    ethernet_wait_for_ip() (link must be up).
     // =========================================
     esp_err_t ptp_ret = ptp_init_and_sync();
     if (ptp_ret == ESP_OK) {
         ESP_LOGI(TAG, "PTP synchronized to Raspberry Pi grandmaster");
     } else {
-        ESP_LOGW(TAG, "PTP sync incomplete — timestamps may be 0 initially");
+        ESP_LOGW(TAG, "PTP sync incomplete -- timestamps may be 0 initially");
         ESP_LOGW(TAG, "Continuing: PTP daemon is running and will sync in background");
     }
     ESP_LOGI(TAG, "");
@@ -617,6 +842,11 @@ void app_main(void)
         ESP_LOGE(TAG, "MQTT init failed - continuing anyway");
     }
     ESP_LOGI(TAG, "");
+#else
+    ESP_LOGW(TAG, "BENCH_TEST_MODE: skipping ethernet, PTP, and MQTT");
+#endif
+// <<< END BENCH_TEST_MODE
+
 
     // =========================================
     // 4. Initialize Communication Buses
@@ -636,8 +866,6 @@ void app_main(void)
 
     // =========================================
     // 6. Initialize ISR Acquisition
-    //    PTP is synced before this point, so
-    //    the first batch will have a valid timestamp.
     // =========================================
     if (init_acquisition(temp_sensor_available) != ESP_OK) {
         handle_critical_failure("ISR acquisition initialization failed");
@@ -647,9 +875,22 @@ void app_main(void)
     // =========================================
     // 7. Initialize Data Processing + MQTT Task
     // =========================================
-    if (init_data_processing() != ESP_OK) {
-        handle_critical_failure("Data processing task initialization failed");
-    }
+
+    // ============================================================
+    // >>> BENCH_TEST_MODE: swap which task runs here
+    // >>> Currently running: accel_debug_task (raw pipeline dump)
+    // >>> To switch to normal sensor print: swap the xTaskCreate line
+    // >>> To restore full MQTT operation: comment both out and
+    // >>>   uncomment the init_data_processing() block below
+    // ============================================================
+    xTaskCreate(accel_debug_task, "accel_dbg", 4096, NULL, 5, NULL);
+    // xTaskCreate(sensor_print_task, "sensor_test", 4096, NULL, 5, NULL);
+    // <<< END BENCH_TEST_MODE
+
+    // if (init_data_processing() != ESP_OK) {
+    //     handle_critical_failure("Data processing task initialization failed");
+    // }
+
     ESP_LOGI(TAG, "");
 
     clear_reboot_counter();
