@@ -39,7 +39,7 @@ import paho.mqtt.client as mqtt
 # ── Defaults ──────────────────────────────────────────────────────
 DEFAULT_BROKER    = "192.168.2.2"
 DEFAULT_PORT      = 1883
-DEFAULT_NODES     = ["node1"]
+DEFAULT_NODES     = ["node2"]
 DEFAULT_ACCEL_HZ  = 1      # accelerometer publish rate
 DEFAULT_SLOW_HZ   = 1       # inclinometer + temperature publish rate
 DEFAULT_ACCEL_SPB = 100       # accel samples per MQTT packet (burst)

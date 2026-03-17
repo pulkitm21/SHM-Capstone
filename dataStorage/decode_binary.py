@@ -62,7 +62,7 @@ def decode_first_record(f, state: dict) -> dict:
     (ts_us,)  = read_fmt(f, "<q", "absolute timestamp")
 
     ts_s = ts_us / TS_SCALE
-    state["ts_prev"]       = ts_s
+    state["ts_us"]         = ts_us
     state["ts_delta_prev"] = 0
 
     record = {
@@ -79,19 +79,18 @@ def decode_first_record(f, state: dict) -> dict:
         samples = []
         for _ in range(n):
             x, y, z = read_fmt(f, "<iii", "accel abs sample")
-            samples.append((x / ACCEL_SCALE, y / ACCEL_SCALE, z / ACCEL_SCALE))
-        state["accel_prev"] = list(samples[-1]) if samples else [0.0, 0.0, 0.0]
-        record["accel_samples"] = samples
+            samples.append([x, y, z])  # store raw ints
+        state["accel_prev"] = samples[-1] if samples else [0, 0, 0]
+        record["accel_samples"] = [(x/ACCEL_SCALE, y/ACCEL_SCALE, z/ACCEL_SCALE) for x,y,z in samples] if samples else None
 
     if header & FLAG_INCLIN:
         r, p, y = read_fmt(f, "<iii", "inclin abs")
-        iv = [r / INCLIN_SCALE, p / INCLIN_SCALE, y / INCLIN_SCALE]
-        state["inclin_prev"] = iv
-        record["inclin"] = tuple(iv)
+        state["inclin_prev"] = [r, p, y]
+        record["inclin"] = (r/INCLIN_SCALE, p/INCLIN_SCALE, y/INCLIN_SCALE)
 
     if header & FLAG_TEMP:
         (t,) = read_fmt(f, "<i", "temp abs")
-        state["temp_prev"] = t / TEMP_SCALE
+        state["temp_prev"] = t
         record["temp"] = t / TEMP_SCALE
 
     return record
@@ -108,12 +107,12 @@ def decode_delta_record(f, state: dict) -> dict:
     (dod_us,) = read_fmt(f, "<i", "delta-of-delta timestamp")
 
     # Reconstruct timestamp
-    delta_us         = state["ts_delta_prev"] + dod_us
-    ts_us            = int(state["ts_prev"] * TS_SCALE) + delta_us
-    ts_s             = ts_us / TS_SCALE
+    delta_us = state["ts_delta_prev"] + dod_us
+    ts_us    = state["ts_us"] + delta_us
+    ts_s     = ts_us / TS_SCALE
 
     state["ts_delta_prev"] = delta_us
-    state["ts_prev"]       = ts_s
+    state["ts_us"]         = ts_us
 
     record = {
         "timestamp": ts_s,
@@ -127,33 +126,26 @@ def decode_delta_record(f, state: dict) -> dict:
     if header & FLAG_ACCEL:
         (n,) = read_fmt(f, "<B", "accel sample count")
         samples = []
-        prev = state["accel_prev"]
+        cur = state["accel_prev"][:]
+        samples_int = []
         for _ in range(n):
             dx, dy, dz = read_fmt(f, "<hhh", "accel delta sample")
-            x = prev[0] + dx / ACCEL_SCALE
-            y = prev[1] + dy / ACCEL_SCALE
-            z = prev[2] + dz / ACCEL_SCALE
-            samples.append((x, y, z))
-            prev = [x, y, z]
-        state["accel_prev"] = list(samples[-1])
-        record["accel_samples"] = samples
+            cur = [cur[0]+dx, cur[1]+dy, cur[2]+dz]
+            samples_int.append(cur[:])
+        if samples_int:
+            state["accel_prev"] = samples_int[-1]
+        record["accel_samples"] = [(x/ACCEL_SCALE, y/ACCEL_SCALE, z/ACCEL_SCALE) for x,y,z in samples_int] if samples_int else None
 
     if header & FLAG_INCLIN:
         dr, dp, dy = read_fmt(f, "<hhh", "inclin delta")
         prev = state["inclin_prev"]
-        iv = [
-            prev[0] + dr / INCLIN_SCALE,
-            prev[1] + dp / INCLIN_SCALE,
-            prev[2] + dy / INCLIN_SCALE,
-        ]
-        state["inclin_prev"] = iv
-        record["inclin"] = tuple(iv)
+        state["inclin_prev"] = [prev[0]+dr, prev[1]+dp, prev[2]+dy]
+        record["inclin"] = tuple(v/INCLIN_SCALE for v in state["inclin_prev"])
 
     if header & FLAG_TEMP:
         (dt,) = read_fmt(f, "<h", "temp delta")
-        t = state["temp_prev"] + dt / TEMP_SCALE
-        state["temp_prev"] = t
-        record["temp"] = t
+        state["temp_prev"] = state["temp_prev"] + dt
+        record["temp"] = state["temp_prev"] / TEMP_SCALE
 
     return record
 
@@ -165,12 +157,13 @@ def decode_delta_record(f, state: dict) -> dict:
 def decode_file(filepath: str, verbose: bool = False):
     """Decode all records from a binary file.  Returns list of record dicts."""
     records = []
+    # State stored as integer scaled units — no float accumulation.
     state = {
-        "ts_prev":       0.0,
+        "ts_us":         0,
         "ts_delta_prev": 0,
-        "accel_prev":    [0.0, 0.0, 0.0],
-        "inclin_prev":   [0.0, 0.0, 0.0],
-        "temp_prev":     0.0,
+        "accel_prev":    [0, 0, 0],
+        "inclin_prev":   [0, 0, 0],
+        "temp_prev":     0,
     }
 
     filesize = os.path.getsize(filepath)
@@ -217,12 +210,12 @@ def _decode_delta_with_header(f, state: dict, header: int) -> dict:
     """Delta record where we already consumed the header byte."""
     (dod_us,) = read_fmt(f, "<i", "delta-of-delta timestamp")
 
-    delta_us        = state["ts_delta_prev"] + dod_us
-    ts_us           = int(state["ts_prev"] * TS_SCALE) + delta_us
-    ts_s            = ts_us / TS_SCALE
+    delta_us = state["ts_delta_prev"] + dod_us
+    ts_us    = state["ts_us"] + delta_us
+    ts_s     = ts_us / TS_SCALE
 
     state["ts_delta_prev"] = delta_us
-    state["ts_prev"]       = ts_s
+    state["ts_us"]         = ts_us
 
     record = {
         "timestamp": ts_s,
@@ -235,34 +228,27 @@ def _decode_delta_with_header(f, state: dict, header: int) -> dict:
 
     if header & FLAG_ACCEL:
         (n,) = read_fmt(f, "<B", "accel sample count")
-        samples = []
-        prev = state["accel_prev"]
+        cur = state["accel_prev"][:]
+        samples_int = []
         for _ in range(n):
             dx, dy, dz = read_fmt(f, "<hhh", "accel delta sample")
-            x = prev[0] + dx / ACCEL_SCALE
-            y = prev[1] + dy / ACCEL_SCALE
-            z = prev[2] + dz / ACCEL_SCALE
-            samples.append((x, y, z))
-            prev = [x, y, z]
-        state["accel_prev"] = list(samples[-1])
-        record["accel_samples"] = samples
+            cur = [cur[0]+dx, cur[1]+dy, cur[2]+dz]
+            samples_int.append(cur[:])
+        if samples_int:
+            state["accel_prev"] = samples_int[-1]
+        record["accel_samples"] = [(x/ACCEL_SCALE, y/ACCEL_SCALE, z/ACCEL_SCALE)
+                                   for x,y,z in samples_int] if samples_int else None
 
     if header & FLAG_INCLIN:
         dr, dp, dy_ = read_fmt(f, "<hhh", "inclin delta")
         prev = state["inclin_prev"]
-        iv = [
-            prev[0] + dr / INCLIN_SCALE,
-            prev[1] + dp / INCLIN_SCALE,
-            prev[2] + dy_ / INCLIN_SCALE,
-        ]
-        state["inclin_prev"] = iv
-        record["inclin"] = tuple(iv)
+        state["inclin_prev"] = [prev[0]+dr, prev[1]+dp, prev[2]+dy_]
+        record["inclin"] = tuple(v/INCLIN_SCALE for v in state["inclin_prev"])
 
     if header & FLAG_TEMP:
         (dt,) = read_fmt(f, "<h", "temp delta")
-        t = state["temp_prev"] + dt / TEMP_SCALE
-        state["temp_prev"] = t
-        record["temp"] = t
+        state["temp_prev"] = state["temp_prev"] + dt
+        record["temp"] = state["temp_prev"] / TEMP_SCALE
 
     return record
 
