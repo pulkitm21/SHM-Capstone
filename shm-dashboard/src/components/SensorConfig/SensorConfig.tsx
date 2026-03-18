@@ -20,6 +20,7 @@ const DEFAULT_CONFIG: SensorConfig = {
   lastAckAt: null,
 };
 
+// Apply safe defaults so the card always renders predictable values.
 function withDefaults(cfg: Partial<SensorConfig> | undefined | null): SensorConfig {
   return {
     highPassFilterDesired: cfg?.highPassFilterDesired ?? DEFAULT_CONFIG.highPassFilterDesired,
@@ -30,11 +31,13 @@ function withDefaults(cfg: Partial<SensorConfig> | undefined | null): SensorConf
   };
 }
 
+// Convert HPF values into user-facing labels.
 function prettyHpf(value: HpfValue | null) {
   if (value === null) return "Unknown";
   return value === "none" ? "Off" : "On";
 }
 
+// Convert sync states into readable UI labels.
 function prettyStatus(value: ConfigSyncStatus) {
   switch (value) {
     case "synced":
@@ -49,10 +52,12 @@ function prettyStatus(value: ConfigSyncStatus) {
 }
 
 export default function SensorConfigCard({
+  title = "Accelerometer Configuration",
   config,
   onSave,
   disabled = false,
 }: {
+  title?: string;
   config: SensorConfig;
   onSave: (updatedDesired: HpfValue) => void;
   disabled?: boolean;
@@ -79,7 +84,7 @@ export default function SensorConfigCard({
   return (
     <div className="sc-card">
       <div className="sc-card-title sc-card-title-row">
-        <span>Accelerometer Configuration</span>
+        <span>{title}</span>
 
         {!isEditing ? (
           <button
