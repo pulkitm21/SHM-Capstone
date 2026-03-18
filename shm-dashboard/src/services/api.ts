@@ -31,9 +31,20 @@ export type ApiResponse = {
 };
 
 export type SettingsResponse = {
+  site_name?: string;
   meta: Record<string, unknown>;
   config: Record<string, unknown>;
   [key: string]: unknown;
+};
+
+export type SiteNameResponse = {
+  site_name: string;
+  ok?: boolean;
+  [key: string]: unknown;
+};
+
+export type UpdateSiteNameRequest = {
+  site_name: string;
 };
 
 export type HealthResponse = {
@@ -154,6 +165,22 @@ export function getSettings(signal?: AbortSignal) {
 
 export function putSettings(body: SettingsResponse, signal?: AbortSignal) {
   return request<SettingsResponse>("/api/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+}
+
+export function getSiteName(signal?: AbortSignal) {
+  return request<SiteNameResponse>("/api/settings/site-name", { signal });
+}
+
+export function putSiteName(
+  body: UpdateSiteNameRequest,
+  signal?: AbortSignal
+) {
+  return request<SiteNameResponse>("/api/settings/site-name", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),

@@ -31,12 +31,26 @@ def load_settings():
         parsed = validate_model(SettingsModel, raw)
 
         merged = copy_deep(DEFAULT_SETTINGS)
+        merged.site_name = parsed.site_name
         merged.meta.update(parsed.meta)
         merged.config.update(parsed.config)
         return merged
     except Exception:
         save_settings(DEFAULT_SETTINGS)
         return copy_deep(DEFAULT_SETTINGS)
+
+
+def get_site_name() -> str:
+    settings = load_settings()
+    return settings.site_name or DEFAULT_SETTINGS.site_name
+
+
+def update_site_name(site_name: str) -> str:
+    settings = load_settings()
+    cleaned_name = site_name.strip() or DEFAULT_SETTINGS.site_name
+    settings.site_name = cleaned_name
+    save_settings(settings)
+    return settings.site_name
 
 
 def ensure_node_defaults(node_id: int):

@@ -30,6 +30,7 @@ class SensorConfigModel(BaseModel):
 
 
 class SettingsModel(BaseModel):
+    site_name: str = "Cape Scott, BC"
     meta: Dict[str, Dict[str, SensorMetaModel]] = Field(default_factory=dict)
     config: Dict[str, Dict[str, SensorConfigModel]] = Field(default_factory=dict)
 
@@ -107,4 +108,8 @@ def build_default_node_config():
     }
 
 
-DEFAULT_SETTINGS = SettingsModel(meta={}, config={})
+DEFAULT_SETTINGS = SettingsModel(
+    site_name="Cape Scott, BC",
+    meta={},
+    config={},
+)

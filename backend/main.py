@@ -18,6 +18,8 @@ from settings_store import (
     save_settings,
     ensure_node_defaults,
     update_accelerometer_hpf_request,
+    get_site_name,
+    update_site_name,
 )
 from node_registry import list_nodes, get_node_by_id, update_node_position
 
@@ -61,6 +63,10 @@ class NodePositionUpdate(BaseModel):
 
 class AccelerometerHpfUpdate(BaseModel):
     highPassFilterDesired: str = Field(..., pattern="^(none|on)$")
+
+
+class SiteNameUpdate(BaseModel):
+    site_name: str = Field(..., min_length=1, max_length=60)
 
 
 def _read_tail_bytes(path: Path, record_size: int, max_records: int) -> bytes:
@@ -282,6 +288,8 @@ def get_settings():
 def put_settings(payload: SettingsModel):
     merged = copy_deep(load_settings())
 
+    merged.site_name = payload.site_name
+
     for node_id, per_sensor_meta in payload.meta.items():
         if node_id not in merged.meta:
             merged.meta[node_id] = {}
@@ -294,6 +302,17 @@ def put_settings(payload: SettingsModel):
 
     save_settings(merged)
     return {"ok": True, "settings": to_dict(merged)}
+
+
+@app.get("/api/settings/site-name")
+def api_get_site_name():
+    return {"site_name": get_site_name()}
+
+
+@app.put("/api/settings/site-name")
+def api_put_site_name(payload: SiteNameUpdate):
+    updated_name = update_site_name(payload.site_name)
+    return {"ok": True, "site_name": updated_name}
 
 
 @app.put("/api/nodes/{node_id}/config/accelerometer/hpf")
