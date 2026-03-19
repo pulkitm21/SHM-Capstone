@@ -4,15 +4,21 @@ import { useNavigate } from "react-router-dom";
 import FaultLog from "../../components/FaultLog/Log";
 import NodeMap from "../../components/NodeMap/NodeMap";
 import {
+  getFaults,
   getNodes,
   getStorage,
   getStorageStatus,
+  type FaultRow,
   type NodeRecord,
   type StorageResponse,
   type StorageStatusResponse,
 } from "../../services/api";
 
 import "./Home.css";
+
+function isActiveFault(fault: FaultRow) {
+  return String(fault.fault_status ?? "").toLowerCase() !== "resolved";
+}
 
 export default function Home() {
   const navigate = useNavigate();
@@ -32,6 +38,8 @@ export default function Home() {
   const [ssdMounted, setSsdMounted] = useState<boolean>(false);
   const [ssdAvailable, setSsdAvailable] = useState<boolean>(false);
   const [ssdMountPath, setSsdMountPath] = useState<string>("/mnt/ssd");
+
+  const [warningSerials, setWarningSerials] = useState<string[]>([]);
 
   useEffect(() => {
     let mounted = true;
@@ -139,15 +147,38 @@ export default function Home() {
       }
     }
 
+    async function pollFaultWarnings() {
+      try {
+        const res = await getFaults({ limit: 5000 });
+        if (!mounted) return;
+
+        const activeWarningSerials = Array.from(
+          new Set(
+            (res.faults ?? [])
+              .filter(isActiveFault)
+              .map((fault) => String(fault.serial_number))
+              .filter(Boolean)
+          )
+        );
+
+        setWarningSerials(activeWarningSerials);
+      } catch {
+        if (!mounted) return;
+        setWarningSerials([]);
+      }
+    }
+
     connectBackendStatusSSE();
     pollNodes();
     pollStorage();
     pollStorageStatus();
+    pollFaultWarnings();
 
     const id = window.setInterval(() => {
       pollNodes();
       pollStorage();
       pollStorageStatus();
+      pollFaultWarnings();
     }, 5000);
 
     return () => {
@@ -180,7 +211,6 @@ export default function Home() {
         <section className="sc-card home-card">
           <div className="home-card-header">
             <div>
-              <p className="home-card-kicker">Connectivity</p>
               <div className="sc-card-title">Backend Status</div>
             </div>
 
@@ -218,7 +248,6 @@ export default function Home() {
         <section className="sc-card home-card">
           <div className="home-card-header">
             <div>
-              <p className="home-card-kicker">Storage</p>
               <div className="sc-card-title">SSD Health</div>
             </div>
 
@@ -273,11 +302,8 @@ export default function Home() {
         <section className="sc-card home-card node-health-card">
           <div className="home-card-header">
             <div>
-              <p className="home-card-kicker">Nodes</p>
               <div className="sc-card-title">Node Placement</div>
             </div>
-
-            <span className="home-map-hint">Drag to reposition</span>
           </div>
 
           <div className="sc-card-body home-card-body node-map-card-body">
@@ -286,6 +312,7 @@ export default function Home() {
             ) : (
               <NodeMap
                 nodes={nodes}
+                warningSerials={warningSerials}
                 onNodeClick={(node) =>
                   navigate(`/sensor-management?serial=${encodeURIComponent(node.serial)}`)
                 }

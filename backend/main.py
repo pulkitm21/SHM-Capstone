@@ -274,6 +274,45 @@ def put_node_position(node_id: int, payload: NodePositionUpdate):
         raise HTTPException(status_code=404, detail="Node not found")
     return {"ok": True, "node": updated}
 
+# =========================
+# Bulk node position update endpoint
+# Allows frontend to save all node positions in a single request
+# Used for "Edit → Move → Save" workflow in NodeMap
+# =========================
+
+class BulkNodePositionItem(BaseModel):
+    node_id: int
+    x: float = Field(..., ge=0.0, le=1.0)
+    y: float = Field(..., ge=0.0, le=1.0)
+
+
+class BulkNodePositionUpdate(BaseModel):
+    positions: List[BulkNodePositionItem]
+
+
+@app.put("/api/nodes/positions")
+def put_node_positions(payload: BulkNodePositionUpdate):
+    updated_nodes = []
+
+    for item in payload.positions:
+        updated = update_node_position(
+            node_id=item.node_id,
+            x=item.x,
+            y=item.y,
+        )
+
+        if updated is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Node {item.node_id} not found",
+            )
+
+        updated_nodes.append(updated)
+
+    return {
+        "ok": True,
+        "nodes": updated_nodes,
+    }
 
 @app.get("/api/settings")
 def get_settings():

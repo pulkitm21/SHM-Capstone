@@ -15,10 +15,73 @@
   content: "";
   position: absolute;
   inset: 0;
-  background-image: linear-gradient(rgba(17, 33, 45, 0.03) 1px, transparent 1px),
+  background-image:
+    linear-gradient(rgba(17, 33, 45, 0.03) 1px, transparent 1px),
     linear-gradient(90deg, rgba(17, 33, 45, 0.03) 1px, transparent 1px);
   background-size: 28px 28px;
   pointer-events: none;
+}
+
+/* Toolbar controls for locked/edit/save/reset state */
+.node-map-toolbar {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+
+.node-map-toolbar-hint {
+  display: inline-flex;
+  align-items: center;
+  padding: 7px 10px;
+  border-radius: 999px;
+  background: rgba(240, 246, 250, 0.96);
+  color: #4c6678;
+  font-size: 12px;
+  font-weight: 700;
+  border: 1px solid rgba(17, 33, 45, 0.06);
+}
+
+.node-map-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 2px 2px 0;
+}
+
+.node-map-text-btn {
+  border: none;
+  background: transparent;
+  padding: 0;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+  color: #305266;
+  cursor: pointer;
+  transition: color 0.18s ease, transform 0.18s ease, opacity 0.18s ease;
+}
+
+.node-map-text-btn:hover:not(:disabled) {
+  color: #173140;
+  transform: translateY(-1px);
+}
+
+.node-map-text-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.node-map-toolbar-error {
+  font-size: 12px;
+  font-weight: 600;
+  color: #b54747;
+  background: rgba(255, 255, 255, 0.94);
+  padding: 4px 8px;
+  border-radius: 10px;
 }
 
 .node-map-svg {
@@ -46,7 +109,6 @@
   border: 1px solid rgba(17, 33, 45, 0.16);
   background: rgba(255, 255, 255, 0.95);
   box-shadow: 0 8px 18px rgba(17, 33, 45, 0.12);
-  cursor: grab;
   user-select: none;
   font-size: 12px;
   font-weight: 800;
@@ -66,16 +128,26 @@
   box-shadow: 0 14px 28px rgba(17, 33, 45, 0.18);
 }
 
+.node-marker.locked {
+  cursor: pointer;
+}
+
+.node-marker.editable {
+  cursor: grab;
+}
+
 .node-marker.offline {
   opacity: 0.72;
 }
 
-.node-marker.online {
+.node-marker.online,
+.node-marker.warning {
   opacity: 1;
 }
 
 .node-marker.online::before,
-.node-marker.offline::before {
+.node-marker.offline::before,
+.node-marker.warning::before {
   content: "";
   display: inline-block;
   width: 8px;
@@ -93,4 +165,44 @@
 .node-marker.offline::before {
   background: #c74f4f;
   box-shadow: 0 0 0 4px rgba(199, 79, 79, 0.12);
+}
+
+.node-marker.warning::before {
+  background: #f59e0b;
+  box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.15);
+}
+
+/* === STATUS PILLS (Backend + SSD) === */
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+/* GOOD / ONLINE */
+.status-pill.info {
+  background: #edf9f0;
+  color: #1e6b36;
+}
+
+/* BAD / OFFLINE */
+.status-pill.high {
+  background: #f8eef0;
+  color: #9b2f45;
+}
+
+.status-pill.info {
+  background: #eafaf2;
+  color: #1f7a45;
+}
+
+.status-pill.high {
+  background: #fdecee;
+  color: #b4232c;
 }

@@ -82,6 +82,7 @@ export type NodeRecord = {
   online: boolean;
   x?: number;
   y?: number;
+  position_zone?: string;
   [key: string]: unknown;
 };
 
@@ -103,6 +104,22 @@ export type UpdateNodePositionRequest = {
 export type UpdateNodePositionResponse = {
   ok: boolean;
   node: NodeRecord;
+  [key: string]: unknown;
+};
+
+export type BulkNodePositionItem = {
+  node_id: number;
+  x: number;
+  y: number;
+};
+
+export type BulkNodePositionsRequest = {
+  positions: BulkNodePositionItem[];
+};
+
+export type BulkNodePositionsResponse = {
+  ok: boolean;
+  nodes: NodeRecord[];
   [key: string]: unknown;
 };
 
@@ -152,6 +169,18 @@ export function putNodePosition(
   signal?: AbortSignal
 ) {
   return request<UpdateNodePositionResponse>(`/api/nodes/${nodeId}/position`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+}
+
+export function putNodePositions(
+  body: BulkNodePositionsRequest,
+  signal?: AbortSignal
+) {
+  return request<BulkNodePositionsResponse>("/api/nodes/positions", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
