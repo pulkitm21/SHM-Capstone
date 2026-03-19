@@ -1,13 +1,11 @@
 import type { SensorMeta } from "../../components/SensorInfo/SensorInfo";
-import type { SensorConfig } from "../../components/SensorConfig/SensorConfig";
 import type { ApiResponse, FaultRow, NodeRecord } from "../../services/api";
+import type { SensorConfig } from "../../components/SensorConfig/SensorConfig";
 
 export type SensorValue = "accelerometer" | "inclinometer" | "temperature";
 
-// TESTCODE: Toggle this on for frontend-only UI testing without backend connectivity.
 export const UI_PREVIEW_MODE = true;
 
-// TESTCODE: Mock nodes shown while backend node loading is disabled.
 export const PREVIEW_NODES: NodeRecord[] = [
   {
     node_id: 1,
@@ -35,8 +33,6 @@ export const PREVIEW_NODES: NodeRecord[] = [
   },
 ];
 
-// TESTCODE: Mock metadata shown while backend settings loading is disabled.
-// UPDATED: Removed "location" field (now handled by NodeTable via position_zone)
 export const PREVIEW_META_BY_NODE: Record<number, Record<SensorValue, SensorMeta>> = {
   1: {
     accelerometer: {
@@ -100,80 +96,80 @@ export const PREVIEW_META_BY_NODE: Record<number, Record<SensorValue, SensorMeta
   },
 };
 
-// TESTCODE: Mock configuration shown while backend config loading is disabled.
+function baseConfig(overrides?: Partial<SensorConfig>): SensorConfig {
+  return {
+    odr_index: 2,
+    range: 1,
+    hpf_corner: 0,
+    desired_odr_index: 2,
+    desired_range: 1,
+    desired_hpf_corner: 0,
+    applied_odr_index: 2,
+    applied_range: 1,
+    applied_hpf_corner: 0,
+    current_state: "configured",
+    pending_seq: null,
+    applied_seq: 12,
+    last_ack_at: "2026-03-18T21:01:30Z",
+    sync_status: "synced",
+    ...overrides,
+  };
+}
+
 export const PREVIEW_CONFIG_BY_NODE: Record<number, Record<SensorValue, SensorConfig>> = {
   1: {
-    accelerometer: {
-      highPassFilterDesired: "on",
-      highPassFilterApplied: "on",
-      highPassFilterStatus: "synced",
-      lastRequestId: "preview-req-001",
-      lastAckAt: "2026-03-18T21:01:30Z",
-    },
-    inclinometer: {
-      highPassFilterDesired: "none",
-      highPassFilterApplied: "none",
-      highPassFilterStatus: "synced",
-      lastRequestId: "preview-req-002",
-      lastAckAt: "2026-03-18T20:45:10Z",
-    },
-    temperature: {
-      highPassFilterDesired: "none",
-      highPassFilterApplied: "none",
-      highPassFilterStatus: "synced",
-      lastRequestId: "preview-req-003",
-      lastAckAt: "2026-03-18T20:15:00Z",
-    },
+    accelerometer: baseConfig({
+      desired_odr_index: 2,
+      desired_range: 1,
+      desired_hpf_corner: 0,
+      applied_odr_index: 2,
+      applied_range: 1,
+      applied_hpf_corner: 0,
+      sync_status: "synced",
+      current_state: "configured",
+      applied_seq: 18,
+      pending_seq: null,
+      last_ack_at: "2026-03-18T21:01:30Z",
+    }),
+    inclinometer: baseConfig(),
+    temperature: baseConfig(),
   },
   2: {
-    accelerometer: {
-      highPassFilterDesired: "on",
-      highPassFilterApplied: null,
-      highPassFilterStatus: "failed",
-      lastRequestId: "preview-req-004",
-      lastAckAt: null,
-    },
-    inclinometer: {
-      highPassFilterDesired: "none",
-      highPassFilterApplied: "none",
-      highPassFilterStatus: "pending",
-      lastRequestId: "preview-req-005",
-      lastAckAt: null,
-    },
-    temperature: {
-      highPassFilterDesired: "none",
-      highPassFilterApplied: "none",
-      highPassFilterStatus: "synced",
-      lastRequestId: "preview-req-006",
-      lastAckAt: "2026-03-18T18:20:00Z",
-    },
+    accelerometer: baseConfig({
+      desired_odr_index: 0,
+      desired_range: 3,
+      desired_hpf_corner: 4,
+      applied_odr_index: 2,
+      applied_range: 1,
+      applied_hpf_corner: 0,
+      sync_status: "pending",
+      current_state: "reconfig",
+      pending_seq: 27,
+      applied_seq: 21,
+      last_ack_at: "2026-03-18T18:05:00Z",
+    }),
+    inclinometer: baseConfig(),
+    temperature: baseConfig(),
   },
   3: {
-    accelerometer: {
-      highPassFilterDesired: "none",
-      highPassFilterApplied: "none",
-      highPassFilterStatus: "synced",
-      lastRequestId: "preview-req-007",
-      lastAckAt: "2026-03-18T20:56:00Z",
-    },
-    inclinometer: {
-      highPassFilterDesired: "none",
-      highPassFilterApplied: "none",
-      highPassFilterStatus: "synced",
-      lastRequestId: "preview-req-008",
-      lastAckAt: "2026-03-18T20:40:00Z",
-    },
-    temperature: {
-      highPassFilterDesired: "none",
-      highPassFilterApplied: "none",
-      highPassFilterStatus: "synced",
-      lastRequestId: "preview-req-009",
-      lastAckAt: "2026-03-18T20:30:00Z",
-    },
+    accelerometer: baseConfig({
+      desired_odr_index: 1,
+      desired_range: 2,
+      desired_hpf_corner: 2,
+      applied_odr_index: 1,
+      applied_range: 2,
+      applied_hpf_corner: 2,
+      sync_status: "synced",
+      current_state: "recording",
+      pending_seq: null,
+      applied_seq: 31,
+      last_ack_at: "2026-03-18T20:56:00Z",
+    }),
+    inclinometer: baseConfig(),
+    temperature: baseConfig(),
   },
 };
 
-// TESTCODE: Mock faults shown while backend fault loading is disabled.
 export const PREVIEW_FAULTS_BY_SERIAL: Record<string, FaultRow[]> = {
   NODE001: [
     {
@@ -212,7 +208,6 @@ export const PREVIEW_FAULTS_BY_SERIAL: Record<string, FaultRow[]> = {
   NODE003: [],
 };
 
-// TESTCODE: Build chart data so the plot renders without backend responses.
 export function buildPreviewPlotData(sensor: SensorValue): ApiResponse {
   const now = Date.now();
 
