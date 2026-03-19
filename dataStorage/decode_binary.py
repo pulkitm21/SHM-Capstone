@@ -40,39 +40,18 @@ SENTINEL    = 0xFF
 
 def open_decompressed(filepath: str) -> io.BytesIO:
     """
-    Read a .zst file and return a BytesIO of the fully decompressed
-    binary content, ready to be passed to the record decoders.
+    Return a BytesIO of the file contents ready for the record decoders.
 
-    File layout written by delta_encoder.py:
-        [ chunk_size(uint32 LE) | zstd_compressed_chunk ] × N
-    Each chunk decompresses independently and is concatenated in order.
-    Plain uncompressed files (no .zst extension) are returned as-is
-    for backwards compatibility.
+    .zst  — decompressed from a standard single-frame Zstd file
+            (written by compress_and_replace() at hour boundary).
+    .bin  — returned as-is (current hour file, still being written).
     """
-    raw = open(filepath, "rb").read()
-
+    with open(filepath, "rb") as f:
+        raw = f.read()
     if not filepath.endswith(".zst"):
         return io.BytesIO(raw)
-
-    decompressor = zstd.ZstdDecompressor()
-    buf = bytearray()
-    pos = 0
-    chunk_num = 0
-    while pos < len(raw):
-        if pos + 4 > len(raw):
-            raise ValueError(f"Truncated chunk header at byte {pos}")
-        (chunk_size,) = struct.unpack_from("<I", raw, pos)
-        pos += 4
-        if pos + chunk_size > len(raw):
-            raise ValueError(
-                f"Chunk {chunk_num} claims {chunk_size} bytes but only "
-                f"{len(raw)-pos} remain (file truncated?)")
-        compressed_chunk = raw[pos:pos + chunk_size]
-        buf += decompressor.decompress(compressed_chunk)
-        pos += chunk_size
-        chunk_num += 1
-
-    return io.BytesIO(bytes(buf))
+    dctx = zstd.ZstdDecompressor()
+    return io.BytesIO(dctx.decompress(raw))
 
 # ── Low-level helpers ─────────────────────────────────────────────
 

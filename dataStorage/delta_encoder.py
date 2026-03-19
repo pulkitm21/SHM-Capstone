@@ -7,37 +7,35 @@ import paho.mqtt.client as mqtt
 import queue
 import threading
 
+import zstandard as zstd
+
 ## Addition for ACK
 from backend.node_registry import register_serial, serial_from_topic, get_node_by_serial
 from backend.settings_store import (
     apply_accelerometer_config_ack,
     update_accelerometer_runtime_state,
 )
-import zstandard as zstd
 
 BROKER_IP = "localhost"
 PORT = 1883
 TOPIC = "wind_turbine/+/data"
-STATUS_TOPIC = "wind_turbine/+/status" ## ADDITION FOR ACK
 DATA_DIR = "/mnt/ssd/data"
+STATUS_TOPIC = "wind_turbine/+/status" ## ADDITION FOR ACK
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # -------------------------------------------------------------------
 # Zstandard compression settings
 #
-# Records are buffered in memory and flushed to a .zst file either:
-#   a) when the hourly file boundary is crossed, or
-#   b) when the in-memory buffer reaches FLUSH_EVERY_N_RECORDS records.
+# Each hourly .bin file is written as plain binary while the hour is
+# active (simple append, zero compression overhead on the hot path).
+# When the hour rolls over the file is closed, compressed to .zst in
+# one pass (best ratio — full file context), and the .bin is deleted.
 #
-# ZSTD_LEVEL  : 1 (fastest) … 22 (smallest).  Level 3 is a good
-#               balance: ~3× smaller than raw binary, negligible CPU.
-# FLUSH_EVERY_N_RECORDS : upper bound on data loss if the process
-#               crashes between flushes.  100 records ≈ 10 s at 10 Hz.
+# ZSTD_LEVEL : 1 (fastest) … 22 (smallest).
+#              Level 3 is a good balance for sensor data.
 # -------------------------------------------------------------------
-ZSTD_LEVEL          = 3
-FLUSH_EVERY_N_RECORDS = 100
-_zstd_compressor    = zstd.ZstdCompressor(level=ZSTD_LEVEL)
+ZSTD_LEVEL = 3
 
 # -------------------------------------------------------------------
 # Packet format (JSON input):
@@ -154,16 +152,14 @@ def _fresh_state() -> dict:
         "accel":  {"ts_us": 0, "ts_delta_prev": 0, "xyz_prev": [0, 0, 0]},
         "inclin": {"ts_us": 0, "ts_delta_prev": 0, "xyz_prev": [0, 0, 0]},
         "temp":   {"ts_us": 0, "ts_delta_prev": 0, "val_prev": 0},
-        "file_hour":   None,
-        "is_first":    True,
-        "record_buf":  bytearray(),   # in-memory buffer of raw binary records
-        "buf_count":   0,             # number of records in buffer
+        "file_hour": None,
+        "is_first":  True,
     }
 
 
 def get_hourly_filepath(node_id: str) -> tuple[str, str]:
     hour_str = datetime.now().strftime("%Y%m%d_%H")
-    return hour_str, os.path.join(DATA_DIR, f"data_{node_id}_{hour_str}.zst")
+    return hour_str, os.path.join(DATA_DIR, f"data_{node_id}_{hour_str}.bin")
 
 
 # -------------------------------------------------------------------
@@ -334,20 +330,26 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
 # Write record
 # -------------------------------------------------------------------
 
-def _flush_buffer(node_id: str, state: dict, filepath: str):
-    """Compress the in-memory record buffer and append it to the .zst file."""
-    if not state["record_buf"]:
-        return
-    compressed = _zstd_compressor.compress(bytes(state["record_buf"]))
-    with open(filepath, "ab") as f:
-        # Each flush is stored as: chunk_size(uint32 LE) | compressed_bytes
-        # This allows the decoder to read independent chunks sequentially.
-        f.write(struct.pack("<I", len(compressed)))
-        f.write(compressed)
-    flushed = state["buf_count"]
-    state["record_buf"] = bytearray()
-    state["buf_count"]  = 0
-    print(f"[{node_id}] Flushed {flushed} records → {os.path.basename(filepath)}")
+def compress_and_replace(node_id: str, bin_path: str):
+    """
+    Compress a closed .bin file to .zst (single Zstd frame, best ratio)
+    and delete the original.  Called only after the file is fully written.
+    """
+    zst_path = bin_path[:-4] + ".zst"   # strip ".bin", add ".zst"
+    try:
+        cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
+        with open(bin_path, "rb") as f_in, open(zst_path, "wb") as f_out:
+            cctx.copy_stream(f_in, f_out)
+        original_size   = os.path.getsize(bin_path)
+        compressed_size = os.path.getsize(zst_path)
+        ratio = compressed_size / original_size * 100 if original_size else 0
+        os.remove(bin_path)
+        print(f"[{node_id}] Compressed {os.path.basename(bin_path)} → "
+              f"{os.path.basename(zst_path)} "
+              f"({original_size:,} → {compressed_size:,} bytes, {ratio:.1f}%)")
+    except Exception as e:
+        print(f"[{node_id}] WARNING: compression failed for {bin_path}: {e}")
+        # Leave .bin intact so data is not lost
 
 
 def write_record(node_id: str, data: dict):
@@ -358,11 +360,12 @@ def write_record(node_id: str, data: dict):
     state = node_state[node_id]
 
     if state["file_hour"] != hour_str:
-        # Hour boundary: flush current buffer to old file, then start fresh
+        # Hour boundary: compress the just-closed .bin file, then start fresh
         if state["file_hour"] is not None:
-            old_filepath = os.path.join(
-                DATA_DIR, f"data_{node_id}_{state['file_hour']}.zst")
-            _flush_buffer(node_id, state, old_filepath)
+            old_bin = os.path.join(
+                DATA_DIR, f"data_{node_id}_{state['file_hour']}.bin")
+            if os.path.exists(old_bin):
+                compress_and_replace(node_id, old_bin)
         state["file_hour"] = hour_str
         state["is_first"]  = True
         print(f"[{node_id}] New hourly file: {filepath}")
@@ -379,13 +382,9 @@ def write_record(node_id: str, data: dict):
     else:
         record = encode_delta_record(data, state)
 
-    # Accumulate into in-memory buffer
-    state["record_buf"] += record
-    state["buf_count"]  += 1
-
-    # Flush when buffer reaches threshold
-    if state["buf_count"] >= FLUSH_EVERY_N_RECORDS:
-        _flush_buffer(node_id, state, filepath)
+    # Append directly to .bin — no buffering needed
+    with open(filepath, "ab") as f:
+        f.write(record)
 
 
 # -------------------------------------------------------------------
@@ -480,7 +479,7 @@ def on_message(client, userdata, msg):
 
         if not msg.topic.endswith("/data"):
             return
-
+        
         topic_parts = msg.topic.split("/")
         node_id = topic_parts[1]
         register_serial(node_id)
@@ -495,6 +494,7 @@ def on_message(client, userdata, msg):
 
     except Exception as e:
         print(f"Failed to process MQTT message on {msg.topic}: {e}")
+
 
 # -------------------------------------------------------------------
 # Main
