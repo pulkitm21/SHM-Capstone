@@ -192,7 +192,10 @@ export function getSettings(signal?: AbortSignal) {
   return request<SettingsResponse>("/api/settings", { signal });
 }
 
-export function putSettings(body: SettingsResponse, signal?: AbortSignal) {
+export function putSettings(
+  body: SettingsResponse,
+  signal?: AbortSignal
+) {
   return request<SettingsResponse>("/api/settings", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
@@ -255,18 +258,49 @@ export type FaultRow = {
   [key: string]: unknown;
 };
 
+export type FaultFilterOptions = {
+  sensor_types: string[];
+  fault_types: string[];
+  severities: number[];
+  statuses: string[];
+};
+
 export type FaultsResponse = {
   faults: FaultRow[];
+  page: number;
+  page_size: number;
+  total_items: number;
+  total_pages: number;
+  filter_options?: FaultFilterOptions;
   [key: string]: unknown;
 };
 
+export type FaultsQueryParams = {
+  serial_number?: string;
+  sensor_type?: string;
+  fault_type?: string;
+  severity?: number;
+  fault_status?: string;
+  description?: string;
+  page?: number;
+  page_size?: number;
+  limit?: number;
+};
+
 export function getFaults(
-  params?: { serial_number?: string; limit?: number },
+  params?: FaultsQueryParams,
   signal?: AbortSignal
 ) {
   const qs = new URLSearchParams();
 
   if (params?.serial_number) qs.set("serial_number", params.serial_number);
+  if (params?.sensor_type) qs.set("sensor_type", params.sensor_type);
+  if (params?.fault_type) qs.set("fault_type", params.fault_type);
+  if (params?.severity !== undefined) qs.set("severity", String(params.severity));
+  if (params?.fault_status) qs.set("fault_status", params.fault_status);
+  if (params?.description) qs.set("description", params.description);
+  if (params?.page !== undefined) qs.set("page", String(params.page));
+  if (params?.page_size !== undefined) qs.set("page_size", String(params.page_size));
   if (params?.limit !== undefined) qs.set("limit", String(params.limit));
 
   const suffix = qs.toString() ? `?${qs.toString()}` : "";

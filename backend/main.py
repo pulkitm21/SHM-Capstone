@@ -274,6 +274,7 @@ def put_node_position(node_id: int, payload: NodePositionUpdate):
         raise HTTPException(status_code=404, detail="Node not found")
     return {"ok": True, "node": updated}
 
+
 # =========================
 # Bulk node position update endpoint
 # Allows frontend to save all node positions in a single request
@@ -313,6 +314,7 @@ def put_node_positions(payload: BulkNodePositionUpdate):
         "ok": True,
         "nodes": updated_nodes,
     }
+
 
 @app.get("/api/settings")
 def get_settings():
@@ -383,48 +385,235 @@ def put_accelerometer_hpf(node_id: int, payload: AccelerometerHpfUpdate):
     }
 
 
-def read_fault_rows(serial_number: Optional[str], limit: int) -> List[Dict[str, Any]]:
+def _normalize_fault_text(value: Optional[str]) -> str:
+    return str(value or "").strip()
+
+
+def _build_fault_where_clauses(
+    serial_number: Optional[str] = None,
+    sensor_type: Optional[str] = None,
+    fault_type: Optional[str] = None,
+    severity: Optional[int] = None,
+    fault_status: Optional[str] = None,
+    description: Optional[str] = None,
+) -> tuple[list[str], list[Any]]:
+    where_clauses: list[str] = []
+    params: list[Any] = []
+
+    serial_number_value = _normalize_fault_text(serial_number)
+    sensor_type_value = _normalize_fault_text(sensor_type)
+    fault_type_value = _normalize_fault_text(fault_type)
+    fault_status_value = _normalize_fault_text(fault_status)
+    description_value = _normalize_fault_text(description)
+
+    if serial_number_value:
+        where_clauses.append("serial_number LIKE ?")
+        params.append(f"%{serial_number_value}%")
+
+    if sensor_type_value:
+        where_clauses.append("LOWER(sensor_type) = LOWER(?)")
+        params.append(sensor_type_value)
+
+    if fault_type_value:
+        where_clauses.append("LOWER(fault_type) = LOWER(?)")
+        params.append(fault_type_value)
+
+    if severity is not None:
+        where_clauses.append("severity = ?")
+        params.append(severity)
+
+    if fault_status_value:
+        where_clauses.append("LOWER(fault_status) = LOWER(?)")
+        params.append(fault_status_value)
+
+    if description_value:
+        where_clauses.append("description LIKE ?")
+        params.append(f"%{description_value}%")
+
+    return where_clauses, params
+
+
+def _build_fault_where_sql(where_clauses: list[str]) -> str:
+    if not where_clauses:
+        return ""
+    return "WHERE " + " AND ".join(where_clauses)
+
+
+def _get_fault_filter_options(
+    con: sqlite3.Connection,
+    serial_number: Optional[str] = None,
+) -> Dict[str, List[Any]]:
+    serial_number_value = _normalize_fault_text(serial_number)
+
+    if serial_number_value:
+        serial_number_where_sql = "WHERE serial_number LIKE ?"
+        serial_number_params: list[Any] = [f"%{serial_number_value}%"]
+    else:
+        serial_number_where_sql = ""
+        serial_number_params = []
+
+    cur = con.cursor()
+
+    cur.execute(
+        f"""
+        SELECT DISTINCT sensor_type
+        FROM faults
+        {serial_number_where_sql}
+        ORDER BY sensor_type COLLATE NOCASE ASC
+        """,
+        serial_number_params,
+    )
+    sensor_types = [row[0] for row in cur.fetchall() if row[0] not in (None, "")]
+
+    cur.execute(
+        f"""
+        SELECT DISTINCT fault_type
+        FROM faults
+        {serial_number_where_sql}
+        ORDER BY fault_type COLLATE NOCASE ASC
+        """,
+        serial_number_params,
+    )
+    fault_types = [row[0] for row in cur.fetchall() if row[0] not in (None, "")]
+
+    cur.execute(
+        f"""
+        SELECT DISTINCT severity
+        FROM faults
+        {serial_number_where_sql}
+        ORDER BY severity ASC
+        """,
+        serial_number_params,
+    )
+    severities = [row[0] for row in cur.fetchall() if row[0] is not None]
+
+    cur.execute(
+        f"""
+        SELECT DISTINCT fault_status
+        FROM faults
+        {serial_number_where_sql}
+        ORDER BY fault_status COLLATE NOCASE ASC
+        """,
+        serial_number_params,
+    )
+    statuses = [row[0] for row in cur.fetchall() if row[0] not in (None, "")]
+
+    return {
+        "sensor_types": sensor_types,
+        "fault_types": fault_types,
+        "severities": severities,
+        "statuses": statuses,
+    }
+
+
+def read_fault_rows(
+    serial_number: Optional[str],
+    limit: int,
+    page: int = 1,
+    page_size: Optional[int] = None,
+    sensor_type: Optional[str] = None,
+    fault_type: Optional[str] = None,
+    severity: Optional[int] = None,
+    fault_status: Optional[str] = None,
+    description: Optional[str] = None,
+) -> Dict[str, Any]:
     if not FAULTS_DB.exists():
-        return []
+        effective_page_size = page_size if page_size is not None else limit
+        return {
+            "faults": [],
+            "page": page,
+            "page_size": effective_page_size,
+            "total_items": 0,
+            "total_pages": 1,
+            "filter_options": {
+                "sensor_types": [],
+                "fault_types": [],
+                "severities": [],
+                "statuses": [],
+            },
+        }
+
+    effective_page_size = page_size if page_size is not None else limit
+    safe_page = max(1, page)
+    safe_page_size = max(1, effective_page_size)
+    offset = (safe_page - 1) * safe_page_size
 
     con = sqlite3.connect(str(FAULTS_DB))
     con.row_factory = sqlite3.Row
     cur = con.cursor()
 
-    if serial_number is None:
-        cur.execute(
-            """
-            SELECT id, serial_number, sensor_type, fault_type, severity, fault_status, description, ts
-            FROM faults
-            ORDER BY ts DESC
-            LIMIT ?
-            """,
-            (limit,),
-        )
-    else:
-        cur.execute(
-            """
-            SELECT id, serial_number, sensor_type, fault_type, severity, fault_status, description, ts
-            FROM faults
-            WHERE serial_number = ?
-            ORDER BY ts DESC
-            LIMIT ?
-            """,
-            (serial_number, limit),
-        )
+    where_clauses, where_params = _build_fault_where_clauses(
+        serial_number=serial_number,
+        sensor_type=sensor_type,
+        fault_type=fault_type,
+        severity=severity,
+        fault_status=fault_status,
+        description=description,
+    )
+    where_sql = _build_fault_where_sql(where_clauses)
 
+    cur.execute(
+        f"""
+        SELECT COUNT(*) AS count
+        FROM faults
+        {where_sql}
+        """,
+        where_params,
+    )
+    total_items = int(cur.fetchone()["count"])
+    total_pages = max(1, (total_items + safe_page_size - 1) // safe_page_size)
+
+    cur.execute(
+        f"""
+        SELECT id, serial_number, sensor_type, fault_type, severity, fault_status, description, ts
+        FROM faults
+        {where_sql}
+        ORDER BY ts DESC
+        LIMIT ? OFFSET ?
+        """,
+        [*where_params, safe_page_size, offset],
+    )
     rows = [dict(r) for r in cur.fetchall()]
+
+    # These dropdown options are read from SQLite, so the frontend does not need
+    # to scan a huge in-memory dataset just to build filter choices.
+    filter_options = _get_fault_filter_options(con=con, serial_number=serial_number)
     con.close()
-    return rows
+
+    return {
+        "faults": rows,
+        "page": safe_page,
+        "page_size": safe_page_size,
+        "total_items": total_items,
+        "total_pages": total_pages,
+        "filter_options": filter_options,
+    }
 
 
 @app.get("/api/faults")
 def get_faults(
     serial_number: Optional[str] = Query(default=None),
+    sensor_type: Optional[str] = Query(default=None),
+    fault_type: Optional[str] = Query(default=None),
+    severity: Optional[int] = Query(default=None),
+    fault_status: Optional[str] = Query(default=None),
+    description: Optional[str] = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=15, ge=1, le=200),
     limit: int = Query(default=200, ge=1, le=5000),
 ):
-    # Testing/manual fault log endpoint only. SSE is used for live fault log updates in the dashboard.
-    return {"faults": read_fault_rows(serial_number=serial_number, limit=limit)}
+    # Full fault log endpoint with backend filtering and pagination.
+    return read_fault_rows(
+        serial_number=serial_number,
+        sensor_type=sensor_type,
+        fault_type=fault_type,
+        severity=severity,
+        fault_status=fault_status,
+        description=description,
+        page=page,
+        page_size=page_size,
+        limit=limit,
+    )
 
 
 @app.get("/api/events/faults")
@@ -440,7 +629,7 @@ async def fault_events(
                 break
 
             payload = {
-                "faults": read_fault_rows(serial_number=serial_number, limit=limit),
+                "faults": read_fault_rows(serial_number=serial_number, limit=limit)["faults"],
                 "time": datetime.now(timezone.utc).isoformat(),
             }
 
