@@ -23,6 +23,17 @@ function countUnresolvedFaultsForSerial(faults: FaultRow[], serial: string) {
   ).length;
 }
 
+// Determine the simple node health state for the table.
+// This matches the same UI rule used elsewhere:
+// - offline => red
+// - online with unresolved faults => warning (orange)
+// - online without unresolved faults => green
+function getNodeHealthState(node: NodeRecord, unresolvedFaults: number) {
+  if (!node.online) return "offline";
+  if (unresolvedFaults > 0) return "warning";
+  return "online";
+}
+
 export default function NodeTable({
   nodes,
   selectedNodeLabel,
@@ -42,6 +53,7 @@ export default function NodeTable({
             <tr>
               <th>Node</th>
               <th>Status</th>
+              <th>Location</th>
               <th>First Seen</th>
               <th>Last Seen</th>
               <th>Unresolved Faults</th>
@@ -52,16 +64,25 @@ export default function NodeTable({
           <tbody>
             {nodes.length === 0 && (
               <tr>
-                <td colSpan={6}>No nodes discovered</td>
+                <td colSpan={7}>No nodes discovered</td>
               </tr>
             )}
 
             {nodes.map((node) => {
               const selected = node.label === selectedNodeLabel;
+
               const unresolvedFaults = countUnresolvedFaultsForSerial(
                 faultsBySerial[node.serial] ?? [],
                 node.serial
               );
+
+              const healthState = getNodeHealthState(node, unresolvedFaults);
+              const statusLabel =
+                healthState === "warning"
+                  ? "Warning"
+                  : node.online
+                    ? "Online"
+                    : "Offline";
 
               return (
                 <tr key={node.serial} className={selected ? "selected" : ""}>
@@ -71,10 +92,13 @@ export default function NodeTable({
                   </td>
 
                   <td>
-                    <span className={`sm-health-pill ${node.online ? "online" : "offline"}`}>
-                      {node.online ? "Online" : "Offline"}
+                    <span className={`sm-health-pill ${healthState}`}>
+                      {statusLabel}
                     </span>
                   </td>
+
+                  {/* Location now comes from node position on the map via backend position_zone */}
+                  <td>{node.position_zone || "—"}</td>
 
                   <td>{formatTimestamp(node.first_seen)}</td>
                   <td>{formatTimestamp(node.last_seen)}</td>
@@ -84,6 +108,7 @@ export default function NodeTable({
                     <button
                       className={`sm-select-btn ${selected ? "active" : ""}`}
                       onClick={() => onSelectNode(node.label)}
+                      type="button"
                     >
                       {selected ? "Selected" : "Select"}
                     </button>

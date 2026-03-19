@@ -5,7 +5,6 @@ export type SensorMeta = {
   model: string;
   serial: string;
   installationDate: string;
-  location: string;
   orientation: string;
 };
 
@@ -59,7 +58,11 @@ export default function SensorInfoCard({
         <div className="sc-row">
           <span className="sc-muted">Model:</span>
           {isEditing ? (
-            <input className="sc-input" value={draft.model} onChange={(e) => setDraft((d) => ({ ...d, model: e.target.value }))} />
+            <input
+              className="sc-input"
+              value={draft.model}
+              onChange={(e) => setDraft((d) => ({ ...d, model: e.target.value }))}
+            />
           ) : (
             <span>{meta.model}</span>
           )}
@@ -68,7 +71,11 @@ export default function SensorInfoCard({
         <div className="sc-row">
           <span className="sc-muted">Serial number:</span>
           {isEditing ? (
-            <input className="sc-input" value={draft.serial} onChange={(e) => setDraft((d) => ({ ...d, serial: e.target.value }))} />
+            <input
+              className="sc-input"
+              value={draft.serial}
+              onChange={(e) => setDraft((d) => ({ ...d, serial: e.target.value }))}
+            />
           ) : (
             <span>{meta.serial}</span>
           )}
@@ -81,26 +88,27 @@ export default function SensorInfoCard({
               className="sc-input"
               type="date"
               value={draft.installationDate || ""}
-              onChange={(e) => setDraft((d) => ({ ...d, installationDate: e.target.value }))}
+              onChange={(e) =>
+                setDraft((d) => ({ ...d, installationDate: e.target.value }))
+              }
             />
           ) : (
             <span>{meta.installationDate}</span>
           )}
         </div>
 
-        <div className="sc-row">
-          <span className="sc-muted">Location:</span>
-          {isEditing ? (
-            <input className="sc-input" value={draft.location} onChange={(e) => setDraft((d) => ({ ...d, location: e.target.value }))} />
-          ) : (
-            <span>{meta.location}</span>
-          )}
-        </div>
+        {/* REMOVED: Location (now shown in NodeTable) */}
 
         <div className="sc-row">
           <span className="sc-muted">Orientation:</span>
           {isEditing ? (
-            <input className="sc-input" value={draft.orientation} onChange={(e) => setDraft((d) => ({ ...d, orientation: e.target.value }))} />
+            <input
+              className="sc-input"
+              value={draft.orientation}
+              onChange={(e) =>
+                setDraft((d) => ({ ...d, orientation: e.target.value }))
+              }
+            />
           ) : (
             <span>{meta.orientation}</span>
           )}

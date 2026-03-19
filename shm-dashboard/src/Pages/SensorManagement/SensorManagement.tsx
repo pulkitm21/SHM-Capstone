@@ -101,21 +101,18 @@ const FALLBACK_META: Record<SensorValue, SensorMeta> = {
     model: "ADXL355",
     serial: "—",
     installationDate: "—",
-    location: "Tower",
     orientation: "+X +Y +Z",
   },
   inclinometer: {
     model: "SCL3300",
     serial: "—",
     installationDate: "—",
-    location: "Foundation",
     orientation: "Pitch / Roll",
   },
   temperature: {
     model: "ADT7420",
     serial: "—",
     installationDate: "—",
-    location: "Tower",
     orientation: "N/A",
   },
 };
@@ -711,10 +708,11 @@ export default function SensorManagement() {
     void loadPlot();
   }, [nodeId, nodeKey, sensor, channel, timeframeMin]);
 
-  const metaForNode = nodeId ? (metaByNode[nodeId] ?? FALLBACK_META) : FALLBACK_META;
-  const configForNode = nodeId ? (configByNode[nodeId] ?? FALLBACK_CONFIG) : FALLBACK_CONFIG;
-  const meta = metaForNode[sensor];
-  const config = configForNode[sensor];
+const metaForNode = nodeId ? (metaByNode[nodeId] ?? FALLBACK_META) : FALLBACK_META;
+const configForNode = nodeId ? (configByNode[nodeId] ?? FALLBACK_CONFIG) : FALLBACK_CONFIG;
+
+const meta = metaForNode[sensor];
+const config = configForNode[sensor];
 
   const nodeFaultSummary = useMemo(() => getNodeFaultSummary(nodeFaults), [nodeFaults]);
 

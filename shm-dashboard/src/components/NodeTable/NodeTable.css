@@ -12,7 +12,7 @@
 .sm-node-table {
   width: 100%;
   border-collapse: collapse;
-  min-width: 900px;
+  min-width: 1000px;
 }
 
 .sm-node-table th,
