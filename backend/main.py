@@ -13,15 +13,18 @@ import os
 from pathlib import Path
 
 from settings_schema import SettingsModel, to_dict, copy_deep
+# Import config ACK helpers and MQTT command publishers for Phase 2.
 from settings_store import (
     load_settings,
     save_settings,
     ensure_node_defaults,
     update_accelerometer_config_request,
+    mark_accelerometer_config_failed,
     get_site_name,
     update_site_name,
 )
 from node_registry import list_nodes, get_node_by_id, update_node_position
+from mqtt_commands import publish_accelerometer_config, publish_node_control
 
 app = FastAPI()
 
@@ -362,6 +365,7 @@ def api_put_site_name(payload: SiteNameUpdate):
     return {"ok": True, "site_name": updated_name}
 
 
+# Store desired config, publish MQTT command, and return pending sync state.
 @app.post("/api/nodes/{node_id}/config/accelerometer/apply")
 def apply_accelerometer_config(node_id: int, payload: AccelerometerConfigApplyRequest):
     node = get_node_by_id(node_id, timeout_seconds=60)
@@ -380,8 +384,21 @@ def apply_accelerometer_config(node_id: int, payload: AccelerometerConfigApplyRe
         seq=seq,
     )
 
-    # Phase 1 only: store the request and return it.
-    # MQTT publish will be added in Phase 2.
+    try:
+        publish_accelerometer_config(
+            serial=node["serial"],
+            odr_index=payload.odr_index,
+            range_value=payload.range,
+            hpf_corner=payload.hpf_corner,
+            seq=seq,
+        )
+    except Exception as exc:
+        mark_accelerometer_config_failed(node_id)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to publish configure command: {exc}",
+        )
+
     return {
         "ok": True,
         "node_id": node["node_id"],
@@ -403,14 +420,28 @@ def apply_accelerometer_config(node_id: int, payload: AccelerometerConfigApplyRe
         "sync_status": updated.sync_status,
         "acked_at": updated.last_ack_at,
     }
+
+
+# Publish runtime control commands to the node through MQTT.
 @app.post("/api/nodes/{node_id}/control")
 def control_node(node_id: int, payload: NodeControlRequest):
     node = get_node_by_id(node_id, timeout_seconds=60)
     if node is None:
         raise HTTPException(status_code=404, detail="Node not found")
 
-    # Phase 1 only: backend accepts the request shape.
-    # MQTT control publish will be added in Phase 2.
+    ensure_node_defaults(node_id)
+
+    try:
+        publish_node_control(
+            serial=node["serial"],
+            cmd=payload.cmd,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to publish control command: {exc}",
+        )
+
     return {
         "ok": True,
         "node_id": node["node_id"],

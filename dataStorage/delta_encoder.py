@@ -7,11 +7,17 @@ import paho.mqtt.client as mqtt
 import queue
 import threading
 
-from node_registry import register_serial, serial_from_topic
+## Addition for ACK
+from backend.node_registry import register_serial, serial_from_topic, get_node_by_serial
+from backend.settings_store import (
+    apply_accelerometer_config_ack,
+    update_accelerometer_runtime_state,
+)
 
 BROKER_IP = "localhost"
 PORT = 1883
 TOPIC = "wind_turbine/+/data"
+STATUS_TOPIC = "wind_turbine/+/status" ## ADDITION FOR ACK
 DATA_DIR = "/mnt/ssd/data"
 
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -355,6 +361,61 @@ def consumer_worker():
 consumer_thread = threading.Thread(target=consumer_worker, daemon=True)
 consumer_thread.start()
 
+# -------------------------------------------------------------------
+# Additional MQTT handling for status messages and ACKs
+# -------------------------------------------------------------------
+
+# Build a UTC ISO timestamp for ACK bookkeeping
+def now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
+# Process node status messages and update backend config/runtime state.
+def handle_status_message(topic: str, payload_bytes: bytes) -> None:
+    try:
+        serial = serial_from_topic(topic)
+        register_serial(serial)
+
+        node = get_node_by_serial(serial, timeout_seconds=60)
+        if node is None:
+            print(f"[status] Node not found for serial {serial}")
+            return
+
+        payload = json.loads(payload_bytes.decode())
+        current_state = str(payload.get("state") or "unknown")
+        acked_at = now_iso()
+
+        seq_ack = payload.get("seq_ack")
+        applied = bool(payload.get("applied"))
+
+        has_full_config = all(
+            key in payload for key in ("odr_index", "range", "hpf_corner")
+        )
+
+        # Full config ACK from the ESP32
+        if applied and seq_ack is not None and has_full_config:
+            apply_accelerometer_config_ack(
+                node_id=node["node_id"],
+                odr_index=int(payload["odr_index"]),
+                range_value=int(payload["range"]),
+                hpf_corner=int(payload["hpf_corner"]),
+                seq_ack=int(seq_ack),
+                acked_at=acked_at,
+                current_state=current_state,
+            )
+            print(f"[status] Applied config ACK for {serial} seq={seq_ack}")
+            return
+
+        # State-only ACK, e.g. { "state": "recording" }
+        update_accelerometer_runtime_state(
+            node_id=node["node_id"],
+            current_state=current_state,
+            acked_at=acked_at,
+        )
+        print(f"[status] Updated runtime state for {serial}: {current_state}")
+
+    except Exception as e:
+        print(f"Failed to process status message on {topic}: {e}")
 
 # -------------------------------------------------------------------
 # MQTT callbacks
@@ -363,10 +424,18 @@ consumer_thread.start()
 def on_connect(client, userdata, flags, reason_code, properties):
     print("Connected with result code", reason_code)
     client.subscribe(TOPIC)
+    client.subscribe(STATUS_TOPIC) # Subscribe to status topic for ACKs
 
 
 def on_message(client, userdata, msg):
     try:
+        if msg.topic.endswith("/status"): ## Handle status messages separately for ACKs and state updates
+            handle_status_message(msg.topic, msg.payload) 
+            return
+
+        if not msg.topic.endswith("/data"):
+            return
+
         topic_parts = msg.topic.split("/")
         node_id = topic_parts[1]
         register_serial(node_id)
@@ -381,7 +450,6 @@ def on_message(client, userdata, msg):
 
     except Exception as e:
         print(f"Failed to process MQTT message on {msg.topic}: {e}")
-
 
 # -------------------------------------------------------------------
 # Main
