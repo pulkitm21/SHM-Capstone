@@ -840,41 +840,13 @@ export default function SensorManagement() {
                 )}
               </div>
             </div>
-
-            <div className="sm-panel sm-full-width-panel">
-              <div className="sm-panel-header">
-                <h2 className="sm-panel-title">Node Fault Log</h2>
-                <span className="sm-panel-count">{nodeFaultSummary.total}</span>
-              </div>
-
-              {UI_PREVIEW_MODE ? (
-                <div className="sm-preview-fault-list">
-                  {(PREVIEW_FAULTS_BY_SERIAL[selectedNode.serial] ?? []).length === 0 ? (
-                    <div className="sm-plot-empty">No preview faults for this node.</div>
-                  ) : (
-                    (PREVIEW_FAULTS_BY_SERIAL[selectedNode.serial] ?? []).map((fault) => (
-                      <div key={fault.id} className="sm-preview-fault-item">
-                        <div className="sm-preview-fault-top">
-                          <strong>{fault.fault_type}</strong>
-                          <span className="sm-health-pill warning">
-                            Severity {fault.severity}
-                          </span>
-                        </div>
-
-                        <div className="sm-panel-subtitle">
-                          {fault.sensor_type} · {fault.fault_status} ·{" "}
-                          {new Date(fault.ts).toLocaleString()}
-                        </div>
-
-                        <div className="sm-preview-fault-desc">{fault.description}</div>
-                      </div>
-                    ))
-                  )}
-                </div>
-              ) : (
-                <FaultLog serial_number={selectedNode.serial} limit={10} />
-              )}
-            </div>
+<FaultLog
+  variant="node"
+  serial_number={selectedNode.serial}
+  limit={5}
+  previewMode={UI_PREVIEW_MODE}
+  previewFaults={PREVIEW_FAULTS_BY_SERIAL[selectedNode.serial] ?? []}
+/>
           </section>
         </div>
       )}

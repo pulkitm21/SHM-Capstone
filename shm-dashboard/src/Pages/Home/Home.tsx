@@ -297,13 +297,12 @@ export default function Home() {
         <section className="sc-card home-card home-faults-card">
           <div className="home-card-header">
             <div>
-              <p className="home-card-kicker">Events</p>
               <div className="sc-card-title">Recent Faults</div>
             </div>
           </div>
 
           <div className="sc-card-body home-card-body">
-            <FaultLog limit={10} />
+            <FaultLog variant="recent" limit={5} />
           </div>
 
           <div className="home-faults-footer">

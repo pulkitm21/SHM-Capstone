@@ -1,69 +1,274 @@
-.fault-log {
-  width: 100%;
+.faultlog-panel {
+  background: #ffffff;
+  border-radius: 18px;
+  padding: 16px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.08);
 }
 
-.fault-table {
-  width: 100%;
-  border-collapse: separate;
-  border-spacing: 0;
-  font-size: 13px;
+.faultlog-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
 }
 
-.fault-table thead th {
-  text-align: left;
+.faultlog-title {
+  margin: 0;
+  font-size: 18px;
   font-weight: 800;
-  padding: 10px 8px 12px;
-  border-bottom: 1px solid rgba(17, 33, 45, 0.1);
-  color: #576c7b;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  font-size: 11px;
 }
 
-.fault-table tbody td {
-  padding: 12px 8px;
-  border-bottom: 1px solid rgba(17, 33, 45, 0.08);
-  vertical-align: middle;
-  color: #213743;
-}
-
-.fault-table tbody tr:last-child td {
-  border-bottom: none;
-}
-
-.fault-table tbody tr:hover td {
-  background: rgba(22, 137, 186, 0.03);
-}
-
-.mono {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-
-.status-pill {
+.faultlog-count {
+  min-width: 32px;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: #eef2f7;
+  color: #223042;
   display: inline-flex;
   align-items: center;
-  padding: 5px 10px;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.faultlog-empty {
+  min-height: 160px;
+  border-radius: 14px;
+  border: 1px dashed #d6dde6;
+  background: #fafbfd;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #6f7c8d;
+  font-size: 14px;
+  text-align: center;
+  padding: 20px;
+}
+
+.faultlog-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 28px;
+  padding: 0 10px;
   border-radius: 999px;
+  font-size: 12px;
   font-weight: 800;
-  font-size: 11px;
-  border: 1px solid transparent;
-  letter-spacing: 0.02em;
+  white-space: nowrap;
 }
 
-.status-pill.high {
-  background: #fdecec;
-  color: #9c2f2f;
-  border-color: #f2c8c8;
+.faultlog-pill.severity.info {
+  background: #eef2f7;
+  color: #526070;
 }
 
-.status-pill.warning {
-  background: #fff5dc;
-  color: #8a6200;
-  border-color: #f1dda2;
+.faultlog-pill.severity.warning {
+  background: #fff7e8;
+  color: #a05c00;
 }
 
-.status-pill.info {
-  background: #e4f5fb;
-  color: #0c617f;
-  border-color: #bfe5f3;
+.faultlog-pill.severity.critical {
+  background: #fdecef;
+  color: #b4233c;
+}
+
+.faultlog-pill.status.active {
+  background: #fdecef;
+  color: #b4233c;
+}
+
+.faultlog-pill.status.resolved {
+  background: #edf9f0;
+  color: #1e6b36;
+}
+
+.faultlog-pill.status.acknowledged {
+  background: #eef2f7;
+  color: #223042;
+}
+
+.faultlog-pill.status.unknown {
+  background: #f4f6f8;
+  color: #687585;
+}
+
+/* recent */
+.faultlog-recent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.faultlog-recent-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  border: 1px solid #e6ebf1;
+  border-radius: 14px;
+  padding: 14px;
+  background: #f9fbfd;
+}
+
+.faultlog-recent-main {
+  min-width: 0;
+}
+
+.faultlog-recent-title {
+  font-size: 16px;
+  font-weight: 800;
+  color: #1f2a37;
+}
+
+.faultlog-recent-meta {
+  margin-top: 6px;
+  font-size: 13px;
+  color: #5f6b7a;
+}
+
+.faultlog-recent-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.faultlog-recent-relative {
+  font-size: 12px;
+  color: #6f7c8d;
+}
+
+/* node */
+.faultlog-summary-row {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(120px, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.faultlog-summary-card {
+  background: #f7f9fc;
+  border: 1px solid #e6ebf1;
+  border-radius: 14px;
+  padding: 12px;
+}
+
+.faultlog-summary-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: #6f7c8d;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.faultlog-summary-value {
+  margin-top: 6px;
+  font-size: 15px;
+  font-weight: 700;
+  color: #1f2a37;
+}
+
+.faultlog-summary-truncate {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.faultlog-node-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.faultlog-node-card {
+  border: 1px solid #e6ebf1;
+  border-radius: 14px;
+  padding: 14px;
+  background: #f9fbfd;
+}
+
+.faultlog-node-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.faultlog-node-title {
+  font-size: 16px;
+  font-weight: 800;
+  color: #1f2a37;
+}
+
+.faultlog-node-badges {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.faultlog-node-meta {
+  margin-top: 12px;
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: #5f6b7a;
+}
+
+.faultlog-node-description {
+  margin-top: 12px;
+  font-size: 14px;
+  color: #334155;
+  line-height: 1.5;
+}
+
+/* full table */
+.faultlog-table-wrap {
+  overflow-x: auto;
+}
+
+.faultlog-table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 1100px;
+}
+
+.faultlog-table th,
+.faultlog-table td {
+  padding: 12px 10px;
+  border-bottom: 1px solid #e8edf3;
+  text-align: left;
+  vertical-align: middle;
+  font-size: 14px;
+}
+
+.faultlog-table th {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #6f7c8d;
+}
+
+.faultlog-description-cell {
+  min-width: 280px;
+  color: #334155;
+}
+
+@media (max-width: 900px) {
+  .faultlog-header,
+  .faultlog-node-top,
+  .faultlog-recent-item {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .faultlog-recent-side {
+    align-items: flex-start;
+  }
+
+  .faultlog-summary-row {
+    grid-template-columns: 1fr 1fr;
+  }
 }
