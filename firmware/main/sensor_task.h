@@ -265,6 +265,20 @@ void sensor_acquisition_reset_stats(void);
  */
 uint32_t get_tick_count(void);
 
+/**
+ * @brief Get SCL3300 ISR diagnostics
+ *
+ * Use these to determine whether the SCL3300 ISR block is firing and
+ * what read_scl3300_raw() is returning, without needing a logic analyser.
+ *
+ * @param[out] calls    Total times read_scl3300_raw() was called
+ * @param[out] valid    Times it returned true (sample written to ring buffer)
+ * @param[out] primes   Times the pipeline was (re)primed
+ * @param[out] discards Times the first-sample discard fired
+ */
+void scl3300_get_isr_diagnostics(uint32_t *calls, uint32_t *valid,
+                                  uint32_t *primes, uint32_t *discards);
+
 /******************************************************************************
  * CONVERSION HELPER MACROS
  * 
