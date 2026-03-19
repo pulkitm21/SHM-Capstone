@@ -1,377 +1,336 @@
 """
-debug_binary.py
----------------
-Diagnostic tool for investigating encoder / decoder mismatches in
-binary files written by multiple_nodes_test.py.
+debug_binary.py  — per-sensor-timestamp edition
+------------------------------------------------
+Three-pass diagnostic tool for binary files from delta_encoder.py.
 
-Runs three analysis passes:
-
-  Pass 1 — Structural scan
-      Walks the file byte-by-byte using the format rules and reports
-      every record header, field flags, sample counts, and raw bytes.
-      Does NOT apply delta reconstruction — shows raw stored values.
-
-  Pass 2 — Delta reconstruction trace
-      Re-decodes with full delta reconstruction and prints every field
-      alongside the running state so you can see exactly where values
-      diverge.
-
-  Pass 3 — Consistency checks
-      Flags specific anomalies:
-        • Multiple ABSOLUTE records (encoder reset mid-file)
-        • Timestamp going backwards or jumping > 10 s
-        • Delta-of-delta overflow (value near ±2^31)
-        • Accel/inclin/temp values outside plausible physical ranges
-        • Mismatched record count vs file size estimate
+  Pass 1 — Structural scan    (raw bytes, no reconstruction)
+  Pass 2 — Delta trace        (full reconstruction, state printed per record)
+  Pass 3 — Anomaly report     (root-cause hints)
 
 Usage:
     python debug_binary.py <file.bin>
-    python debug_binary.py <file.bin> --pass 1        # structural only
-    python debug_binary.py <file.bin> --pass 2        # delta trace only
-    python debug_binary.py <file.bin> --pass 3        # anomaly report only
-    python debug_binary.py <file.bin> --record 5      # zoom into record #5 ±2
+    python debug_binary.py <file.bin> --pass 1
+    python debug_binary.py <file.bin> --pass 2
+    python debug_binary.py <file.bin> --pass 3
+    python debug_binary.py <file.bin> --record 5     # zoom into record #5 ±2
 """
 
-import struct
-import sys
-import os
-import argparse
+import struct, sys, os, argparse
 from datetime import datetime, timezone
 
-# ── Scale factors — must match encoder ────────────────────────────
-TEMP_SCALE   = 100
-ACCEL_SCALE  = 1000
-INCLIN_SCALE = 1000
-TS_SCALE     = 1_000_000   # µs → s
+TEMP_SCALE    = 100
+ACCEL_SCALE   = 1000
+INCLIN_SCALE  = 1000
+TS_SCALE      = 1_000_000
 
 FLAG_ACCEL  = 0x01
 FLAG_INCLIN = 0x02
 FLAG_TEMP   = 0x04
 SENTINEL    = 0xFF
 
-# ── Physical plausibility limits ──────────────────────────────────
-MAX_ACCEL_G     = 50.0      # g
-MAX_INCLIN_DEG  = 360.0     # °
-MAX_TEMP_C      = 200.0
-MIN_TEMP_C      = -50.0
-MAX_TS_JUMP_S   = 10.0      # seconds between records
-DOD_WARN_THRESH = 2**30     # int32 near overflow
-
-# Must match encoder
-TS_MIN = 1_577_836_800.0   # 2020-01-01
-TS_MAX = 4_102_444_800.0   # 2100-01-01
+MAX_TS_JUMP_S   = 10.0
+DOD_WARN_THRESH = 2**30
+TS_MIN          = 1_577_836_800.0
+TS_MAX          = 4_102_444_800.0
+TS_MS_THRESHOLD = 1e11
 
 
-# ──────────────────────────────────────────────────────────────────
-# Low-level helpers
-# ──────────────────────────────────────────────────────────────────
-
-class ParseError(Exception):
-    pass
+def read_bytes(f, n, label=""):
+    d = f.read(n)
+    if len(d) < n:
+        raise EOFError(f"EOF reading {label!r}: got {len(d)}/{n} bytes")
+    return d
 
 def read_fmt(f, fmt, label=""):
-    n    = struct.calcsize(fmt)
-    raw  = f.read(n)
-    if len(raw) < n:
-        raise EOFError(f"EOF reading {label!r}: got {len(raw)}/{n} bytes at offset {f.tell()}")
-    return struct.unpack(fmt, raw), raw
+    raw = read_bytes(f, struct.calcsize(fmt), label)
+    return struct.unpack(fmt, raw)
 
-def flag_str(header):
-    parts = []
-    if header & FLAG_ACCEL:  parts.append("ACCEL")
-    if header & FLAG_INCLIN: parts.append("INCLIN")
-    if header & FLAG_TEMP:   parts.append("TEMP")
-    return "|".join(parts) if parts else "NONE"
+def flag_str(h):
+    p = []
+    if h & FLAG_ACCEL:  p.append("ACCEL")
+    if h & FLAG_INCLIN: p.append("INCLIN")
+    if h & FLAG_TEMP:   p.append("TEMP")
+    return "|".join(p) or "NONE"
 
 def ts_str(ts_s):
     try:
         return datetime.fromtimestamp(ts_s, tz=timezone.utc).strftime("%H:%M:%S.%f")
     except Exception:
-        return f"<invalid {ts_s:.3f}>"
+        return f"<invalid {ts_s:.1f}>"
+
+def _date_str(ts_s):
+    try:
+        return datetime.utcfromtimestamp(max(0, int(ts_s))).strftime("%Y-%m-%d")
+    except Exception:
+        return "?"
+
+def _check_ts(ts_us, rec_idx, label, issues):
+    ts_s = ts_us / TS_SCALE
+    if ts_s > TS_MS_THRESHOLD:
+        issues.append((rec_idx, label,
+            f"Timestamp is milliseconds not seconds: {ts_us} µs → "
+            f"{ts_s/1000:.3f} s ({_date_str(ts_s/1000)})"))
+    elif not (TS_MIN <= ts_s <= TS_MAX):
+        issues.append((rec_idx, label,
+            f"Timestamp out of plausible range: {ts_s:.0f} s ({_date_str(ts_s)}) "
+            f"— likely clock-not-synced"))
 
 
-# ──────────────────────────────────────────────────────────────────
-# PASS 1 — Structural scan (raw values, no delta reconstruction)
-# ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# PASS 1 — Structural scan
+# ══════════════════════════════════════════════════════════════════
 
 def pass1_structural(filepath, focus_record=None):
     print(f"\n{'─'*70}")
-    print(f"  PASS 1 — Structural scan: {os.path.basename(filepath)}")
+    print(f"  PASS 1 — Structural scan (raw values, no reconstruction)")
     print(f"{'─'*70}")
-
     issues = []
 
     with open(filepath, "rb") as f:
-        rec_idx = 0
+        idx = 0
         while True:
             offset = f.tell()
             b = f.read(1)
-            if not b:
-                break
-
+            if not b: break
             sentinel = b[0]
-            show = focus_record is None or abs(rec_idx - focus_record) <= 2
+            show = focus_record is None or abs(idx - focus_record) <= 2
 
             try:
                 if sentinel == SENTINEL:
-                    # ── ABSOLUTE record ───────────────────────────
-                    (header,), _ = read_fmt(f, "<B",  "abs header")
-                    (ts_us,),  _ = read_fmt(f, "<q",  "abs timestamp")
-                    ts_s = ts_us / TS_SCALE
-
+                    (header,) = read_fmt(f, "<B", "abs header")
                     if show:
-                        print(f"\n  ┌─ Record #{rec_idx}  [ABSOLUTE]  offset=0x{offset:06X}")
-                        print(f"  │  header   = 0x{header:02X}  flags={flag_str(header)}")
-                        print(f"  │  ts_us    = {ts_us}  →  {ts_s:.6f} s  ({ts_str(ts_s)})")
-
-                    if not (TS_MIN <= ts_s <= TS_MAX):
-                        try:
-                            date_str = datetime.utcfromtimestamp(max(0, int(ts_s))).strftime("%Y-%m-%d")
-                        except Exception:
-                            date_str = "?"
-                        issues.append((rec_idx, "ABSOLUTE",
-                            f"Timestamp out of plausible range: {ts_s:.0f} s ({date_str}) — "
-                            f"likely clock-not-synced on sensor node"))
+                        print(f"\n  ┌─ Record #{idx}  [ABSOLUTE]  offset=0x{offset:06X}")
+                        print(f"  │  header = 0x{header:02X}  flags={flag_str(header)}")
 
                     if header & FLAG_ACCEL:
-                        (n,), _ = read_fmt(f, "<B", "abs accel n")
-                        if show: print(f"  │  accel n  = {n}")
+                        (n,) = read_fmt(f, "<B", "accel n")
+                        if show: print(f"  │  accel n={n}")
                         for i in range(n):
-                            (x, y, z), raw = read_fmt(f, "<iii", f"abs accel[{i}]")
-                            xf, yf, zf = x/ACCEL_SCALE, y/ACCEL_SCALE, z/ACCEL_SCALE
+                            (ts_us,) = read_fmt(f, "<q", f"accel[{i}] ts")
+                            x, y, z  = read_fmt(f, "<iii", f"accel[{i}] xyz")
+                            _check_ts(ts_us, idx, "ABSOLUTE/accel", issues)
                             if show:
-                                print(f"  │    accel[{i}] raw=({x},{y},{z})  →  ({xf:+.4f},{yf:+.4f},{zf:+.4f}) g")
-                            for v, name in [(abs(xf),"ax"),(abs(yf),"ay"),(abs(zf),"az")]:
-                                if v > MAX_ACCEL_G:
-                                    issues.append((rec_idx, "ABSOLUTE", f"{name} = {v:.3f} g exceeds {MAX_ACCEL_G} g"))
+                                ts_s = ts_us / TS_SCALE
+                                print(f"  │    [{i}] ts={ts_us}µs ({ts_str(ts_s)})  "
+                                      f"x={x/ACCEL_SCALE:+.3f}  y={y/ACCEL_SCALE:+.3f}  z={z/ACCEL_SCALE:+.3f} g")
 
                     if header & FLAG_INCLIN:
-                        (r, p, y), _ = read_fmt(f, "<iii", "abs inclin")
-                        rf, pf, yf = r/INCLIN_SCALE, p/INCLIN_SCALE, y/INCLIN_SCALE
+                        (ts_us,) = read_fmt(f, "<q", "inclin ts")
+                        r, p, y  = read_fmt(f, "<iii", "inclin xyz")
+                        _check_ts(ts_us, idx, "ABSOLUTE/inclin", issues)
                         if show:
-                            print(f"  │  inclin   raw=({r},{p},{y})  →  ({rf:+.4f},{pf:+.4f},{yf:+.4f}) °")
+                            ts_s = ts_us / TS_SCALE
+                            print(f"  │  inclin ts={ts_us}µs ({ts_str(ts_s)})  "
+                                  f"r={r/INCLIN_SCALE:+.3f}  p={p/INCLIN_SCALE:+.3f}  y={y/INCLIN_SCALE:+.3f} °")
 
                     if header & FLAG_TEMP:
-                        (t,), _ = read_fmt(f, "<i", "abs temp")
-                        tf = t / TEMP_SCALE
+                        (ts_us,) = read_fmt(f, "<q", "temp ts")
+                        (val,)   = read_fmt(f, "<i", "temp val")
+                        _check_ts(ts_us, idx, "ABSOLUTE/temp", issues)
                         if show:
-                            print(f"  │  temp     raw={t}  →  {tf:.2f} °C")
-                        if not (MIN_TEMP_C <= tf <= MAX_TEMP_C):
-                            issues.append((rec_idx, "ABSOLUTE", f"Temp = {tf:.2f} °C out of range"))
+                            ts_s = ts_us / TS_SCALE
+                            print(f"  │  temp ts={ts_us}µs ({ts_str(ts_s)})  val={val/TEMP_SCALE:.2f} °C")
 
                     if show: print(f"  └─")
 
                 else:
-                    # ── DELTA record ──────────────────────────────
-                    header  = sentinel
-                    (dod,), _ = read_fmt(f, "<i", "delta dod_ts")
-
+                    header = sentinel
                     if show:
-                        print(f"\n  ┌─ Record #{rec_idx}  [DELTA]     offset=0x{offset:06X}")
-                        print(f"  │  header   = 0x{header:02X}  flags={flag_str(header)}")
-                        print(f"  │  dod_ts   = {dod} µs", end="")
-                        if abs(dod) > DOD_WARN_THRESH:
-                            print(f"  ← ⚠ NEAR int32 OVERFLOW", end="")
-                            issues.append((rec_idx, "DELTA", f"dod_ts={dod} near int32 overflow"))
-                        print()
+                        print(f"\n  ┌─ Record #{idx}  [DELTA]  offset=0x{offset:06X}")
+                        print(f"  │  header = 0x{header:02X}  flags={flag_str(header)}")
 
                     if header & FLAG_ACCEL:
-                        (n,), _ = read_fmt(f, "<B", "delta accel n")
-                        if show: print(f"  │  accel n  = {n}")
+                        (n,) = read_fmt(f, "<B", "accel n")
+                        if show: print(f"  │  accel n={n}")
                         for i in range(n):
-                            (dx, dy, dz), _ = read_fmt(f, "<hhh", f"delta accel[{i}]")
+                            (dod,)       = read_fmt(f, "<i", f"accel[{i}] dod_ts")
+                            dx, dy, dz   = read_fmt(f, "<hhh", f"accel[{i}] deltas")
+                            if abs(dod) > DOD_WARN_THRESH:
+                                issues.append((idx, "DELTA/accel", f"dod_ts={dod} near int32 overflow"))
                             if show:
-                                print(f"  │    Δaccel[{i}] = ({dx},{dy},{dz})"
-                                      f"  →  ({dx/ACCEL_SCALE:+.4f},{dy/ACCEL_SCALE:+.4f},{dz/ACCEL_SCALE:+.4f}) g-delta")
+                                print(f"  │    [{i}] dod_ts={dod}µs  "
+                                      f"Δx={dx/ACCEL_SCALE:+.3f}  Δy={dy/ACCEL_SCALE:+.3f}  Δz={dz/ACCEL_SCALE:+.3f} g")
+                                if abs(dod) > DOD_WARN_THRESH:
+                                    print(f"  │        ⚠ dod_ts near int32 overflow")
 
                     if header & FLAG_INCLIN:
-                        (dr, dp, dy), _ = read_fmt(f, "<hhh", "delta inclin")
-                        if show:
-                            print(f"  │  Δinclin  = ({dr},{dp},{dy})"
-                                  f"  →  ({dr/INCLIN_SCALE:+.4f},{dp/INCLIN_SCALE:+.4f},{dy/INCLIN_SCALE:+.4f}) °-delta")
+                        (dod,)     = read_fmt(f, "<i", "inclin dod_ts")
+                        dr, dp, dy = read_fmt(f, "<hhh", "inclin deltas")
+                        if abs(dod) > DOD_WARN_THRESH:
+                            issues.append((idx, "DELTA/inclin", f"dod_ts={dod} near int32 overflow"))
                         for v, name in [(abs(dr),"dr"),(abs(dp),"dp"),(abs(dy),"dy")]:
                             if v == 32767:
-                                issues.append((rec_idx, "DELTA", f"{name} hit int16 max (32767) — likely clipped"))
+                                issues.append((idx, "DELTA/inclin", f"{name} hit int16 max — likely clipped"))
+                        if show:
+                            print(f"  │  inclin dod_ts={dod}µs  "
+                                  f"Δr={dr/INCLIN_SCALE:+.3f}  Δp={dp/INCLIN_SCALE:+.3f}  Δy={dy/INCLIN_SCALE:+.3f} °")
 
                     if header & FLAG_TEMP:
-                        (dt,), _ = read_fmt(f, "<h", "delta temp")
-                        if show:
-                            print(f"  │  Δtemp    = {dt}  →  {dt/TEMP_SCALE:+.4f} °C-delta")
+                        (dod,) = read_fmt(f, "<i", "temp dod_ts")
+                        (dt,)  = read_fmt(f, "<h", "temp delta")
+                        if abs(dod) > DOD_WARN_THRESH:
+                            issues.append((idx, "DELTA/temp", f"dod_ts={dod} near int32 overflow"))
                         if abs(dt) == 32767:
-                            issues.append((rec_idx, "DELTA", f"Δtemp={dt} hit int16 max — likely clipped"))
+                            issues.append((idx, "DELTA/temp", f"Δtemp={dt} hit int16 max — likely clipped"))
+                        if show:
+                            print(f"  │  temp  dod_ts={dod}µs  Δval={dt/TEMP_SCALE:+.4f} °C")
 
                     if show: print(f"  └─")
 
-                rec_idx += 1
+                idx += 1
 
             except EOFError as e:
-                print(f"\n  ⚠ Truncated at record #{rec_idx}: {e}")
-                issues.append((rec_idx, "TRUNCATED", str(e)))
+                print(f"\n  ⚠ Truncated at record #{idx}: {e}")
+                issues.append((idx, "TRUNCATED", str(e)))
                 break
             except struct.error as e:
-                print(f"\n  ⚠ Struct error at record #{rec_idx}: {e}")
-                issues.append((rec_idx, "STRUCT_ERROR", str(e)))
+                print(f"\n  ⚠ Struct error at record #{idx}: {e}")
                 break
 
-    print(f"\n  Total records parsed: {rec_idx}")
+    print(f"\n  Total records parsed: {idx}")
     return issues
 
 
-# ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
 # PASS 2 — Delta reconstruction trace
-# ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+
+def _fresh_sensor_state():
+    return {"ts_us": 0, "ts_delta_prev": 0, "xyz_prev": [0, 0, 0], "val_prev": 0}
 
 def pass2_delta_trace(filepath, focus_record=None):
     print(f"\n{'─'*70}")
     print(f"  PASS 2 — Delta reconstruction trace")
-    print(f"  (state kept as integer scaled units to avoid float accumulation)")
+    print(f"  (integer state accumulation — no float drift)")
     print(f"{'─'*70}")
 
-    # State stored as raw integer scaled units — NO floating point accumulation.
-    # Convert to physical units only at print time.
-    # accel: int * (1/ACCEL_SCALE) g
-    # inclin: int * (1/INCLIN_SCALE) degrees
-    # temp:   int * (1/TEMP_SCALE) °C
-    # ts:     int µs
     state = {
-        "ts_us":         0,       # int µs
-        "ts_delta_prev": 0,       # int µs (previous first-delta, for dod)
-        "accel_prev":    [0, 0, 0],   # int scaled units
-        "inclin_prev":   [0, 0, 0],   # int scaled units
-        "temp_prev":     0,            # int scaled units
+        "accel":  _fresh_sensor_state(),
+        "inclin": _fresh_sensor_state(),
+        "temp":   _fresh_sensor_state(),
     }
-
-    def fmt_accel(v): return f"{v / ACCEL_SCALE:+.3f}"
-    def fmt_inclin(v): return f"{v / INCLIN_SCALE:+.3f}"
-    def fmt_temp(v):  return f"{v / TEMP_SCALE:.2f}"
-
     issues = []
 
-    with open(filepath, "rb") as f:
-        rec_idx = 0
-        prev_ts_us = None
+    def fmt_a(v): return f"{v/ACCEL_SCALE:+.3f}"
+    def fmt_i(v): return f"{v/INCLIN_SCALE:+.3f}"
+    def fmt_t(v): return f"{v/TEMP_SCALE:.2f}"
 
+    def _abs_ts(f, ss, label):
+        (ts_us,) = read_fmt(f, "<q", label)
+        ss["ts_us"] = ts_us; ss["ts_delta_prev"] = 0
+        return ts_us
+
+    def _dod_ts(f, ss, label, show, rec_idx):
+        (dod,)   = read_fmt(f, "<i", label)
+        delta_us = ss["ts_delta_prev"] + dod
+        ts_us    = ss["ts_us"] + delta_us
+        if show:
+            print(f"    {label}: dod={dod}µs  delta={delta_us}µs  "
+                  f"ts_us={ts_us}  ({ts_str(ts_us/TS_SCALE)})")
+        prev_ts = ss["ts_us"]
+        jump_s  = (ts_us - prev_ts) / TS_SCALE
+        if abs(jump_s) > MAX_TS_JUMP_S or jump_s < 0:
+            msg = f"{label} jump {jump_s:+.3f} s"
+            issues.append((rec_idx, "DELTA", msg))
+            if show: print(f"    ⚠ {msg}")
+        ss["ts_us"] = ts_us; ss["ts_delta_prev"] = delta_us
+        return ts_us
+
+    with open(filepath, "rb") as f:
+        idx = 0
         while True:
             b = f.read(1)
-            if not b:
-                break
-
+            if not b: break
             sentinel = b[0]
-            show = focus_record is None or abs(rec_idx - focus_record) <= 2
+            show = focus_record is None or abs(idx - focus_record) <= 2
 
             try:
                 if sentinel == SENTINEL:
-                    (header,), _ = read_fmt(f, "<B", "header")
-                    (ts_us,),  _ = read_fmt(f, "<q", "abs ts")
-                    ts_s = ts_us / TS_SCALE
-
-                    state["ts_us"]         = ts_us
-                    state["ts_delta_prev"] = 0
-
+                    (header,) = read_fmt(f, "<B", "abs header")
                     if show:
-                        print(f"\n  Record #{rec_idx} [ABSOLUTE]")
-                        print(f"    ts = {ts_us} µs  →  {ts_s:.6f} s  ({ts_str(ts_s)})")
-                        print(f"    state.ts_us         ← {ts_us}")
-                        print(f"    state.ts_delta_prev ← 0")
+                        print(f"\n  Record #{idx} [ABSOLUTE]")
 
                     if header & FLAG_ACCEL:
-                        (n,), _ = read_fmt(f, "<B", "n")
-                        samples_int = []
-                        for _ in range(n):
-                            (x,y,z), _ = read_fmt(f, "<iii", "abs accel")
-                            samples_int.append([x, y, z])
-                        if samples_int:
-                            state["accel_prev"] = samples_int[-1]
-                        if show:
-                            disp = [f"{fmt_accel(v)} g" for v in state["accel_prev"]]
-                            print(f"    state.accel_prev    ← {state['accel_prev']}  ({disp})")
+                        (n,) = read_fmt(f, "<B", "accel n")
+                        for i in range(n):
+                            ts_us = _abs_ts(f, state["accel"], f"accel[{i}].ts")
+                            x, y, z = read_fmt(f, "<iii", f"accel[{i}]")
+                            state["accel"]["xyz_prev"] = [x, y, z]
+                            if show:
+                                print(f"    accel[{i}] ts={ts_us}µs ({ts_str(ts_us/TS_SCALE)})  "
+                                      f"x={fmt_a(x)}  y={fmt_a(y)}  z={fmt_a(z)} g")
+                                print(f"    state.accel.xyz_prev ← {[x,y,z]}  ({[fmt_a(v) for v in [x,y,z]]})")
 
                     if header & FLAG_INCLIN:
-                        (r,p,y), _ = read_fmt(f, "<iii", "abs inclin")
-                        state["inclin_prev"] = [r, p, y]
+                        ts_us = _abs_ts(f, state["inclin"], "inclin.ts")
+                        r, p, y = read_fmt(f, "<iii", "inclin")
+                        state["inclin"]["xyz_prev"] = [r, p, y]
                         if show:
-                            disp = [f"{fmt_inclin(v)} °" for v in state["inclin_prev"]]
-                            print(f"    state.inclin_prev   ← {state['inclin_prev']}  ({disp})")
+                            print(f"    inclin ts={ts_us}µs ({ts_str(ts_us/TS_SCALE)})  "
+                                  f"r={fmt_i(r)}  p={fmt_i(p)}  y={fmt_i(y)} °")
+                            print(f"    state.inclin.xyz_prev ← {[r,p,y]}")
 
                     if header & FLAG_TEMP:
-                        (t,), _ = read_fmt(f, "<i", "abs temp")
-                        state["temp_prev"] = t
+                        ts_us = _abs_ts(f, state["temp"], "temp.ts")
+                        (val,) = read_fmt(f, "<i", "temp")
+                        state["temp"]["val_prev"] = val
                         if show:
-                            print(f"    state.temp_prev     ← {t}  ({fmt_temp(t)} °C)")
+                            print(f"    temp ts={ts_us}µs ({ts_str(ts_us/TS_SCALE)})  "
+                                  f"val={fmt_t(val)} °C")
+                            print(f"    state.temp.val_prev ← {val}")
 
                 else:
                     header = sentinel
-                    (dod,), _ = read_fmt(f, "<i", "dod_ts")
-
-                    delta_us    = state["ts_delta_prev"] + dod
-                    ts_us_recon = state["ts_us"] + delta_us
-                    ts_s        = ts_us_recon / TS_SCALE
-
                     if show:
-                        print(f"\n  Record #{rec_idx} [DELTA]")
-                        print(f"    dod_ts             = {dod} µs")
-                        print(f"    delta_us           = ts_delta_prev({state['ts_delta_prev']}) + dod({dod}) = {delta_us}")
-                        print(f"    ts_us_recon        = ts_us({state['ts_us']}) + delta({delta_us}) = {ts_us_recon}")
-                        print(f"    ts_s               = {ts_s:.6f}  ({ts_str(ts_s)})")
-
-                    if prev_ts_us is not None:
-                        jump_s = (ts_us_recon - prev_ts_us) / TS_SCALE
-                        if abs(jump_s) > MAX_TS_JUMP_S or jump_s < 0:
-                            msg = f"Timestamp jump: {jump_s:+.3f} s (prev={prev_ts_us/TS_SCALE:.3f}, curr={ts_s:.3f})"
-                            issues.append((rec_idx, "DELTA", msg))
-                            if show:
-                                print(f"    ⚠ {msg}")
-
-                    state["ts_delta_prev"] = delta_us
-                    state["ts_us"]         = ts_us_recon
+                        print(f"\n  Record #{idx} [DELTA]")
 
                     if header & FLAG_ACCEL:
-                        (n,), _ = read_fmt(f, "<B", "n")
-                        prev = state["accel_prev"][:]
-                        cur  = prev[:]
-                        samples_int = []
+                        (n,) = read_fmt(f, "<B", "accel n")
+                        prev = state["accel"]["xyz_prev"]
                         for i in range(n):
-                            (dx,dy,dz), _ = read_fmt(f, "<hhh", "accel delta")
-                            cur = [cur[0]+dx, cur[1]+dy, cur[2]+dz]
-                            samples_int.append(cur[:])
-                        if samples_int:
-                            state["accel_prev"] = samples_int[-1]
-                        if show:
-                            prev_disp = [fmt_accel(v) for v in prev]
-                            now_disp  = [fmt_accel(v) for v in state["accel_prev"]]
-                            print(f"    accel_prev was {prev} ({prev_disp})  →  now {state['accel_prev']} ({now_disp}) g")
+                            ts_us = _dod_ts(f, state["accel"], f"accel[{i}].ts", show, idx)
+                            dx, dy, dz = read_fmt(f, "<hhh", f"accel[{i}] Δxyz")
+                            cur = [prev[0]+dx, prev[1]+dy, prev[2]+dz]
+                            if show:
+                                print(f"    accel[{i}] Δ=({dx},{dy},{dz})  "
+                                      f"prev={[fmt_a(v) for v in prev]}  "
+                                      f"→ now={[fmt_a(v) for v in cur]} g")
+                            prev = cur
+                        state["accel"]["xyz_prev"] = prev
 
                     if header & FLAG_INCLIN:
-                        (dr,dp,dy_), _ = read_fmt(f, "<hhh", "inclin delta")
-                        prev = state["inclin_prev"][:]
-                        state["inclin_prev"] = [prev[0]+dr, prev[1]+dp, prev[2]+dy_]
+                        ts_us = _dod_ts(f, state["inclin"], "inclin.ts", show, idx)
+                        dr, dp, dy = read_fmt(f, "<hhh", "inclin Δ")
+                        prev = state["inclin"]["xyz_prev"]
+                        cur  = [prev[0]+dr, prev[1]+dp, prev[2]+dy]
+                        state["inclin"]["xyz_prev"] = cur
                         if show:
-                            prev_disp = [fmt_inclin(v) for v in prev]
-                            now_disp  = [fmt_inclin(v) for v in state["inclin_prev"]]
-                            print(f"    inclin_prev was {prev} ({prev_disp})  →  now {state['inclin_prev']} ({now_disp}) °")
+                            print(f"    inclin Δ=({dr},{dp},{dy})  "
+                                  f"prev={[fmt_i(v) for v in prev]}  "
+                                  f"→ now={[fmt_i(v) for v in cur]} °")
 
                     if header & FLAG_TEMP:
-                        (dt,), _ = read_fmt(f, "<h", "temp delta")
-                        prev_t = state["temp_prev"]
-                        state["temp_prev"] = prev_t + dt
+                        ts_us = _dod_ts(f, state["temp"], "temp.ts", show, idx)
+                        (dt,) = read_fmt(f, "<h", "temp Δ")
+                        prev  = state["temp"]["val_prev"]
+                        cur   = prev + dt
+                        state["temp"]["val_prev"] = cur
                         if show:
-                            print(f"    temp_prev was {prev_t} ({fmt_temp(prev_t)} °C)"
-                                  f"  +  Δ{dt} ({dt/TEMP_SCALE:+.2f} °C)"
-                                  f"  →  {state['temp_prev']} ({fmt_temp(state['temp_prev'])} °C)")
+                            print(f"    temp Δ={dt} ({dt/TEMP_SCALE:+.2f} °C)  "
+                                  f"prev={fmt_t(prev)}  → now={fmt_t(cur)} °C")
 
-                prev_ts_us = ts_us if sentinel == SENTINEL else ts_us_recon
-                rec_idx += 1
+                idx += 1
 
             except EOFError as e:
-                print(f"\n  ⚠ Truncated at record #{rec_idx}: {e}")
+                print(f"\n  ⚠ Truncated at record #{idx}: {e}")
                 break
 
     return issues
 
 
-# ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
 # PASS 3 — Anomaly report
-# ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
 
 def pass3_anomalies(issues_p1, issues_p2):
     print(f"\n{'─'*70}")
@@ -383,13 +342,11 @@ def pass3_anomalies(issues_p1, issues_p2):
         print("\n  ✓ No anomalies detected.")
         return
 
-    # Deduplicate and group by category
-    seen = set()
+    seen       = set()
     categories = {}
     for rec, kind, msg in all_issues:
         key = (rec, msg)
-        if key in seen:
-            continue
+        if key in seen: continue
         seen.add(key)
         categories.setdefault(kind, []).append((rec, msg))
 
@@ -400,94 +357,79 @@ def pass3_anomalies(issues_p1, issues_p2):
 
     print(f"\n  Total unique issues: {len(seen)}")
 
-    # Root cause hints
     print(f"\n{'─'*70}")
-    print("  LIKELY ROOT CAUSES")
+    print("  ROOT CAUSE HINTS")
     print(f"{'─'*70}")
 
     msgs = " ".join(m for _,_,m in all_issues)
 
-    abs_count = len(categories.get("ABSOLUTE", []))
+    abs_count = len(categories.get("ABSOLUTE", [])) + len(categories.get("ABSOLUTE/accel", [])) \
+              + len(categories.get("ABSOLUTE/inclin", [])) + len(categories.get("ABSOLUTE/temp", []))
     if abs_count > 1:
         print(f"""
-  \u2139  {abs_count} ABSOLUTE records in this file.
-      With the fixed encoder this is expected whenever:
-        \u2022 Hour boundary crossed (1 anchor per file).
-        \u2022 Gap > MAX_DELTA_S (60 s) detected — encoder auto-emitted ABSOLUTE
-          to prevent dod_ts int32 overflow.
-        \u2022 Subscriber process was restarted mid-hour.
-      If the count is unexpectedly high, check the encoder console for
-      "Forcing ABSOLUTE record:" lines to see exact reasons.
+  ℹ  Multiple ABSOLUTE records ({abs_count} issues flagged).
+      Normal causes: hour boundary, gap > MAX_DELTA_S (60 s), process restart.
+      Check encoder console for "Forcing ABSOLUTE record:" lines.
 """)
 
-    if any("near int32 overflow" in m for _,_,m in all_issues):
+    if any("milliseconds not seconds" in m for _,_,m in all_issues):
         print("""
-  \u26a0 dod_ts near int32 overflow detected in this file:
-      This file was likely recorded with the OLD encoder before the fix.
-      The fixed encoder (MAX_DELTA_S = 60 s) prevents this by emitting
-      an ABSOLUTE record on any gap that would cause overflow.
-      \u2192 Re-record data with the updated multiple_nodes_test.py.
-""")
-
-    if any("clipped" in m for _,_,m in all_issues):
-        print("""
-  \u26a0 int16 delta clipping detected in this file:
-      This file was likely recorded with the OLD encoder before the fix.
-      The fixed encoder's needs_absolute_record() detects impending clips
-      and falls back to ABSOLUTE before they occur.
-      \u2192 Re-record data with the updated multiple_nodes_test.py.
+  ⚠ Sensor sending milliseconds instead of seconds:
+      e.g. 1704084600000 ms  →  correct is 1704084600 s.
+      delta_encoder.py auto-converts via normalise_timestamp().
+      Long-term: fix sensor firmware to send Unix seconds.
 """)
 
     if any("out of plausible range" in m for _,_,m in all_issues):
         print("""
-  ⚠ Implausible timestamp (clock not synced):
-      The sensor node published packets before its system clock was
-      set correctly (common on Pi boards with no RTC battery).
-      The fixed encoder now drops these packets in on_message().
-      To also fix it on the node side, either:
-        1. Add a systemd service dependency: After=time-sync.target
-        2. Have the node firmware wait until its own clock reads > TS_MIN
-           before starting to publish.
-        3. Fit a DS3231 RTC module so the Pi has a valid time at boot.
+  ⚠ Implausible timestamp (clock not synced at boot):
+      Fix: add After=time-sync.target to systemd service,
+           or fit a DS3231 RTC module to the Pi.
 """)
 
-    if any("Timestamp jump" in m for _,_,m in all_issues):
+    if any("near int32 overflow" in m for _,_,m in all_issues):
         print("""
-  \u26a0 Timestamp jumped backwards or > 10 s:
-      Possible causes even with the fixed encoder:
-        1. NTP clock step on the Pi mid-session.
-        2. MQTT QoS 0 out-of-order delivery.
-        3. File recorded with old encoder before the overflow fix.
-      Check encoder console for "Forcing ABSOLUTE" lines around the
-      affected record index.
+  ⚠ dod_ts near int32 overflow:
+      File recorded before the MAX_DELTA_S gap-detection fix.
+      Re-record with updated delta_encoder.py.
+""")
+
+    if any("clipped" in m for _,_,m in all_issues):
+        print("""
+  ⚠ int16 delta clipping:
+      A sensor value jumped more than int16 can hold in one step.
+      The fixed encoder detects this and emits ABSOLUTE instead.
+      Re-record with updated delta_encoder.py.
+""")
+
+    if any("jump" in m for _,_,m in all_issues):
+        print("""
+  ⚠ Timestamp jump detected (per-sensor):
+      Possible causes: NTP step, MQTT QoS-0 reorder, broker restart,
+      or gap before the overflow fix was applied.
 """)
 
 
-# ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
 # CLI
-# ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Diagnose encoder/decoder mismatches in sensor binary files"
-    )
-    parser.add_argument("file",      help="Path to .bin file")
-    parser.add_argument("--pass",    type=int, choices=[1,2,3], dest="only_pass",
-                        metavar="N", help="Run only pass N (default: all)")
-    parser.add_argument("--record",  type=int, default=None, metavar="N",
-                        help="Zoom into record N ± 2 (suppresses all other records)")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Debug sensor binary files")
+    p.add_argument("file")
+    p.add_argument("--pass",   type=int, choices=[1,2,3], dest="only_pass", metavar="N")
+    p.add_argument("--record", type=int, default=None, metavar="N",
+                   help="Zoom into record N ± 2")
+    args = p.parse_args()
 
     if not os.path.isfile(args.file):
-        print(f"[ERROR] File not found: {args.file}", file=sys.stderr)
-        sys.exit(1)
+        print(f"[ERROR] Not found: {args.file}", file=sys.stderr); sys.exit(1)
 
     print(f"Debug target : {args.file}  ({os.path.getsize(args.file):,} bytes)")
     if args.record is not None:
         print(f"Focusing on  : record #{args.record} ± 2")
 
-    issues_p1 = []
-    issues_p2 = []
+    issues_p1 = issues_p2 = []
 
     if args.only_pass in (None, 1):
         issues_p1 = pass1_structural(args.file, focus_record=args.record)
