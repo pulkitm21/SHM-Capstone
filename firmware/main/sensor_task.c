@@ -134,6 +134,18 @@ extern i2c_master_dev_handle_t adt7420_i2c_handle;
 static bool s_scl_pipeline_primed = false;
 static bool s_scl_discard_first_sample = true;
 
+/*
+ * ISR-safe diagnostic counters for SCL3300 pipeline.
+ * Written only from ISR; read from task context for logging.
+ * volatile is sufficient - monotonically increasing debug counters only.
+ */
+static volatile uint32_t s_scl_isr_fired    = 0; // SCL3300 ISR block entered
+static volatile uint32_t s_scl_prime_count  = 0; // pipeline priming calls
+static volatile uint32_t s_scl_discard_count= 0; // first-sample discards
+static volatile uint32_t s_scl_valid_count  = 0; // read returned true -> pushed to ring buf
+static volatile uint32_t s_scl_invalid_count= 0; // read returned false (not prime, not discard)
+static volatile uint32_t s_scl_overflow_dbg = 0; // ring buffer full at ISR time
+
 /******************************************************************************
  * ACCESS FUNCTIONS FOR ISR
  *****************************************************************************/
@@ -213,6 +225,7 @@ static inline void IRAM_ATTR scl3300_prime_pipeline_once(void)
     scl3300_isr_transfer(SCL3300_CMD_X, &dummy);
     s_scl_pipeline_primed = true;
     s_scl_discard_first_sample = true;
+    s_scl_prime_count++;
 }
 
 static inline bool IRAM_ATTR read_scl3300_raw(int16_t *raw_x, int16_t *raw_y, int16_t *raw_z)
@@ -240,9 +253,11 @@ static inline bool IRAM_ATTR read_scl3300_raw(int16_t *raw_x, int16_t *raw_y, in
 
     if (s_scl_discard_first_sample) {
         s_scl_discard_first_sample = false;
+        s_scl_discard_count++;
         return false;
     }
 
+    s_scl_valid_count++;
     return true;
 }
 
@@ -297,6 +312,8 @@ static bool IRAM_ATTR timer_isr_handler(gptimer_handle_t timer,
     /* SCL3300 @ 20 Hz */
     if (((tick_counter - SCL3300_OFFSET) % SCL3300_TICK_DIVISOR) == 0u)
     {
+        s_scl_isr_fired++;
+
         int16_t raw_x = 0;
         int16_t raw_y = 0;
         int16_t raw_z = 0;
@@ -307,6 +324,7 @@ static bool IRAM_ATTR timer_isr_handler(gptimer_handle_t timer,
         if (next_write_index == current_read_index)
         {
             scl3300_ring_buffer.overflow_count++;
+            s_scl_overflow_dbg++;
         }
         else
         {
@@ -611,8 +629,14 @@ void sensor_acquisition_reset_stats(void)
 
     tick_counter = 0;
 
-    s_scl_pipeline_primed = false;
-    s_scl_discard_first_sample = true;
+    /*
+     * Do NOT reset s_scl_pipeline_primed or s_scl_discard_first_sample here.
+     * Those are set once during sensor_acquisition_init() and must survive the
+     * call to sensor_acquisition_start() (which calls this function).
+     * Resetting them here would force the ISR to re-prime and discard the first
+     * two SCL3300 samples on every start, causing "null" inclinometer readings
+     * if startup is delayed (e.g. by network timeouts).
+     */
 }
 
 uint32_t adxl355_get_overflow_count(void)
@@ -648,4 +672,19 @@ uint32_t adt7420_get_sample_count(void)
 uint32_t get_tick_count(void)
 {
     return tick_counter;
+}
+
+void scl3300_get_isr_diag(uint32_t *isr_fired,
+                           uint32_t *prime_count,
+                           uint32_t *discard_count,
+                           uint32_t *valid_count,
+                           uint32_t *invalid_count,
+                           uint32_t *overflow_dbg)
+{
+    if (isr_fired)     *isr_fired     = s_scl_isr_fired;
+    if (prime_count)   *prime_count   = s_scl_prime_count;
+    if (discard_count) *discard_count = s_scl_discard_count;
+    if (valid_count)   *valid_count   = s_scl_valid_count;
+    if (invalid_count) *invalid_count = s_scl_invalid_count;
+    if (overflow_dbg)  *overflow_dbg  = s_scl_overflow_dbg;
 }

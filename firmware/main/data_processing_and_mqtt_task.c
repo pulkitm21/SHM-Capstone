@@ -29,6 +29,8 @@
 #include <string.h>
 #include <math.h>
 
+/* sensor_task.c public API used here */
+
 static const char *TAG = "DATA_PROC";
 
 static TaskHandle_t s_task_handle = NULL;
@@ -126,9 +128,7 @@ static void data_processing_task(void *pvParameters)
     float current_incl_z = 0.0f;
     bool  incl_valid     = false;
 
-    // PTP delta tracking
-    uint32_t last_packet_ts_us = 0;
-    bool     first_packet      = true;
+    // PTP delta tracking removed - timestamps still present in each packet
 
     while (s_task_running) {
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
@@ -174,8 +174,14 @@ static void data_processing_task(void *pvParameters)
         }
 
         if (!new_incl_this_cycle && !incl_valid) {
-            // Only warn while we have never received any inclinometer data yet
-            ESP_LOGW(TAG, "No inclinometer data received yet");
+            // Warn only on the very first processing cycle where we still have
+            // no inclinometer data.  After that, the sticky value takes over
+            // and repeated warnings would just spam the console.
+            static bool s_incl_warned = false;
+            if (!s_incl_warned) {
+                ESP_LOGW(TAG, "No inclinometer data received yet (will retry)");
+                s_incl_warned = true;
+            }
         }
 
         // =====================================================================
@@ -218,6 +224,26 @@ static void data_processing_task(void *pvParameters)
 
                     if (accel_batch_count >= ACCEL_SAMPLES_PER_BATCH) {
                         // ---------------------------------------------------------
+                        // Flush SCL3300 ring buffer before building the packet.
+                        //
+                        // The outer loop drains SCL3300 once per task iteration,
+                        // but the ADXL355 while-loop can build multiple packets
+                        // without returning to the outer loop.  Without this flush,
+                        // incl_valid stays false for the entire first batch (the
+                        // ISR starts producing SCL3300 samples ~100 us after start,
+                        // but the task hasn't looped back yet to pick them up).
+                        // ---------------------------------------------------------
+                        while (scl3300_data_available()) {
+                            if (scl3300_read_sample(&scl_sample)) {
+                                current_incl_x = convert_scl3300_to_deg(scl_sample.raw_x);
+                                current_incl_y = convert_scl3300_to_deg(scl_sample.raw_y);
+                                current_incl_z = convert_scl3300_to_deg(scl_sample.raw_z);
+                                incl_valid     = true;
+                                new_incl_this_cycle = true;
+                            }
+                        }
+
+                        // ---------------------------------------------------------
                         // Build packet
                         // ---------------------------------------------------------
                         mqtt_sensor_packet_t packet = {0};
@@ -245,69 +271,32 @@ static void data_processing_task(void *pvParameters)
                         }
 
                         // ---------------------------------------------------------
-                        // PTP / timing delta
+                        // Publish via MQTT
                         // ---------------------------------------------------------
-                        uint32_t delta_us = 0;
-                        if (!first_packet) {
-                            delta_us = packet.timestamp - last_packet_ts_us;
-                        }
-                        last_packet_ts_us = packet.timestamp;
-                        first_packet      = false;
+                        esp_err_t pub_ret = mqtt_publish_sensor_data(&packet);
 
-                        // ---------------------------------------------------------
-                        // Console dump
-                        // ---------------------------------------------------------
-                        ESP_LOGI(TAG, "===== PACKET #%lu =====",
-                                 (unsigned long)s_packets_sent);
-
-                        // Timestamp and inter-packet delta
-                        if (s_packets_sent == 0) {
-                            ESP_LOGI(TAG, "  ts = %lu us  (first packet)",
-                                     (unsigned long)packet.timestamp);
-                        } else {
-                            int32_t jitter = (int32_t)delta_us
-                                             - (int32_t)EXPECTED_PACKET_INTERVAL_US;
-                            ESP_LOGI(TAG, "  ts = %lu us  |  delta = %lu us  "
-                                         "(expected %lu us, jitter %+ld us)",
+                        if (pub_ret == ESP_OK) {
+                            s_samples_published += accel_batch_count;
+                            // Compact one-line log per published packet
+                            ESP_LOGD(TAG, "pkt#%lu ts=%luus incl=%s temp=%s",
+                                     (unsigned long)s_packets_sent,
                                      (unsigned long)packet.timestamp,
-                                     (unsigned long)delta_us,
-                                     (unsigned long)EXPECTED_PACKET_INTERVAL_US,
-                                     (long)jitter);
-                        }
-
-                        // Accelerometer
-                        ESP_LOGI(TAG, "  Accel (%d samples @ %d Hz):",
-                                 packet.accel_count,
-                                 ACCEL_RAW_RATE_HZ / ACCEL_DECIM_FACTOR);
-                        for (int i = 0; i < packet.accel_count; i++) {
-                            ESP_LOGI(TAG, "    [%2d]  X=%8.5f g  Y=%8.5f g  Z=%8.5f g",
-                                     i,
-                                     (double)packet.accel[i].x,
-                                     (double)packet.accel[i].y,
-                                     (double)packet.accel[i].z);
-                        }
-
-                        // Inclinometer
-                        if (!packet.angle_valid) {
-                            ESP_LOGW(TAG, "  Incl:  null (no valid sample yet)");
+                                     packet.angle_valid ? "ok" : "null",
+                                     packet.temp_valid  ? "ok" : "null");
                         } else {
-                            ESP_LOGI(TAG, "  Incl:  X=%7.4f deg  Y=%7.4f deg  Z=%7.4f deg%s",
-                                     (double)packet.angle_x,
-                                     (double)packet.angle_y,
-                                     (double)packet.angle_z,
-                                     new_incl_this_cycle ? "  [fresh]" : "  [held]");
+                            // MQTT not connected yet — count dropped packets and
+                            // log a warning at most once per second to avoid spam.
+                            s_samples_dropped += accel_batch_count;
+                            static uint32_t s_last_drop_warn_ms = 0;
+                            uint32_t now_warn_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                            if ((now_warn_ms - s_last_drop_warn_ms) >= 1000) {
+                                s_last_drop_warn_ms = now_warn_ms;
+                                ESP_LOGW(TAG, "MQTT not connected - packets dropping "
+                                         "(dropped so far: %lu samples)",
+                                         (unsigned long)s_samples_dropped);
+                            }
                         }
 
-                        // Temperature
-                        if (!packet.temp_valid) {
-                            ESP_LOGW(TAG, "  Temp:  null (no valid read yet)");
-                        } else {
-                            ESP_LOGI(TAG, "  Temp:  %.3f C", (double)packet.temperature);
-                        }
-
-                        ESP_LOGI(TAG, "==========================================");
-
-                        s_samples_published += accel_batch_count;
                         s_packets_sent++;
                         accel_batch_count = 0;
                     }

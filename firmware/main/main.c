@@ -261,20 +261,28 @@ static esp_err_t init_network(void)
     ESP_LOGI(TAG, "--- Initializing Network ---");
 
     if (ethernet_init() != ESP_OK) {
-        ESP_LOGE(TAG, "Ethernet init failed");
+        ESP_LOGE(TAG, "Ethernet driver init failed (check PHY wiring / SPI bus)");
         return ESP_FAIL;
     }
 
     ESP_LOGI(TAG, "Waiting for IP address (timeout: %d sec)...", ETH_IP_TIMEOUT_MS / 1000);
 
     if (ethernet_wait_for_ip(ETH_IP_TIMEOUT_MS) != ESP_OK) {
-        ESP_LOGW(TAG, "No IP address yet - will retry in background");
-    } else {
-        esp_netif_ip_info_t ip_info;
-        ethernet_get_ip_info(&ip_info);
-        ESP_LOGI(TAG, "Network ready: " IPSTR, IP2STR(&ip_info.ip));
+        // Hard failure — no point trying MQTT without an IP.
+        // Common causes:
+        //   - Cable not plugged in
+        //   - Switch/router not providing DHCP
+        //   - PHY reset GPIO wrong (check PHY_RESET_GPIO in ethernet.c)
+        //   - ethernet_init() called before SPI bus was ready (should be fixed
+        //     by the current main.c init order: buses -> sensors -> network)
+        ESP_LOGE(TAG, "No IP address obtained after %d sec", ETH_IP_TIMEOUT_MS / 1000);
+        ESP_LOGE(TAG, "Check: cable, DHCP server, PHY reset GPIO, SPI bus init order");
+        return ESP_FAIL;
     }
 
+    esp_netif_ip_info_t ip_info;
+    ethernet_get_ip_info(&ip_info);
+    ESP_LOGI(TAG, "Network ready: " IPSTR, IP2STR(&ip_info.ip));
     return ESP_OK;
 }
 
@@ -282,24 +290,47 @@ static esp_err_t init_mqtt(void)
 {
     ESP_LOGI(TAG, "--- Initializing MQTT ---");
 
-    esp_err_t mdns_ret = mqtt_mdns_init(ethernet_get_netif());
-    if (mdns_ret != ESP_OK) {
-        ESP_LOGW(TAG, "mDNS init failed (broker hostname resolution may fail): %s",
-                 esp_err_to_name(mdns_ret));
-    }
-
-    if (mqtt_init() != ESP_OK) {
-        ESP_LOGE(TAG, "MQTT init failed");
+    // mDNS must be initialized AFTER we have an IP so the stack is bound to
+    // a live netif.  We guard on ethernet_is_connected() which is only true
+    // once ETH_GOT_IP_BIT is set (i.e. init_network() succeeded).
+    if (!ethernet_is_connected()) {
+        ESP_LOGE(TAG, "Cannot init MQTT - no IP address (ethernet not connected)");
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Waiting for MQTT connection (timeout: %d sec)...", MQTT_CONNECT_TIMEOUT_MS / 1000);
+    // mqtt_mdns_init also calls build_identity_strings() to resolve the NVS
+    // serial number.  mqtt_init() calls it again harmlessly, but mDNS must
+    // come first so the hostname is advertised before the broker connection
+    // is attempted.
+    esp_err_t ret = mqtt_mdns_init(ethernet_get_netif());
+    if (ret != ESP_OK) {
+        // Non-fatal: mDNS failing means "raspberrypi.local" won't resolve.
+        // If the broker is reachable by IP this will still work, but log
+        // clearly so the user knows hostname resolution is broken.
+        ESP_LOGW(TAG, "mDNS init failed - broker hostname may not resolve: %s",
+                 esp_err_to_name(ret));
+        ESP_LOGW(TAG, "If MQTT fails, set MQTT_BROKER_URI to a static IP in mqtt.h");
+    }
+
+    if (mqtt_init() != ESP_OK) {
+        ESP_LOGE(TAG, "MQTT client init failed");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Waiting for MQTT broker connection (timeout: %d sec)...",
+             MQTT_CONNECT_TIMEOUT_MS / 1000);
 
     if (mqtt_wait_for_connection(MQTT_CONNECT_TIMEOUT_MS) == ESP_OK) {
-        ESP_LOGI(TAG, "MQTT connected!");
+        ESP_LOGI(TAG, "MQTT connected to broker");
         mqtt_publish_status("Wind Turbine Monitor Online");
     } else {
-        ESP_LOGW(TAG, "MQTT connection timeout - will retry in background");
+        // Non-fatal: the MQTT client will keep retrying in the background
+        // (reconnect_timeout_ms = 5000 in mqtt.c).  Data will be published
+        // once the connection is established.
+        ESP_LOGW(TAG, "MQTT broker connection timeout after %d sec",
+                 MQTT_CONNECT_TIMEOUT_MS / 1000);
+        ESP_LOGW(TAG, "Check: broker running on Pi? 'raspberrypi.local' resolves?");
+        ESP_LOGW(TAG, "MQTT client will keep retrying automatically in the background");
     }
 
     return ESP_OK;
@@ -418,13 +449,27 @@ void app_main(void)
 
     print_banner();
 
-    if (init_network() != ESP_OK) {
-        ESP_LOGE(TAG, "Network init failed - continuing anyway");
-    }
+    // -------------------------------------------------------------------------
+    // Init order:
+    //   1. Network + MQTT  -- blocking waits here in app_main with no competing
+    //                         tasks, so they always complete reliably.
+    //   2. Buses + Sensors -- SPI/I2C must be up before ISR starts.
+    //   3. ISR acquisition -- starts last; ring buffers fill immediately.
+    //   4. Data processing -- task created last; SCL3300 null-on-first-packet is
+    //                         handled by inline drain before each packet build.
+    //
+    // Network-first is safe because the SCL3300 null issue is now fixed in
+    // data_processing_and_mqtt_task.c (inline SCL3300 drain inside ADXL loop).
+    // -------------------------------------------------------------------------
+
+    bool network_ok = (init_network() == ESP_OK);
     ESP_LOGI(TAG, "");
 
-    if (init_mqtt() != ESP_OK) {
-        ESP_LOGE(TAG, "MQTT init failed - continuing anyway");
+    bool mqtt_ok = false;
+    if (network_ok) {
+        mqtt_ok = (init_mqtt() == ESP_OK);
+    } else {
+        ESP_LOGW(TAG, "Skipping MQTT init - no network");
     }
     ESP_LOGI(TAG, "");
 
@@ -465,18 +510,33 @@ void app_main(void)
     ESP_LOGI(TAG, "==============================================");
     ESP_LOGI(TAG, "  SYSTEM RUNNING");
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "  Node identity: %s", mqtt_get_serial_no());
-    ESP_LOGI(TAG, "  Data topic:    %s", mqtt_get_topic_data());
+    ESP_LOGI(TAG, "  Sensors:  ISR running at 8000 Hz");
+    ESP_LOGI(TAG, "  Network:  %s", network_ok ? "Connected" : "OFFLINE (sensor-only mode)");
+    ESP_LOGI(TAG, "  MQTT:     %s", mqtt_ok    ? "Connected" : (network_ok ? "Connecting (retrying)..." : "Disabled"));
+    if (network_ok) {
+        esp_netif_ip_info_t ip;
+        ethernet_get_ip_info(&ip);
+        ESP_LOGI(TAG, "  IP:       " IPSTR, IP2STR(&ip.ip));
+        ESP_LOGI(TAG, "  Node ID:  %s", mqtt_get_serial_no());
+        ESP_LOGI(TAG, "  Topic:    %s", mqtt_get_topic_data());
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "  Subscribe on Raspberry Pi:");
+        ESP_LOGI(TAG, "  mosquitto_sub -t \"wind_turbine/#\" -v");
+        if (!mqtt_ok) {
+            ESP_LOGW(TAG, "");
+            ESP_LOGW(TAG, "  MQTT not connected yet. Possible causes:");
+            ESP_LOGW(TAG, "    - mosquitto not running: sudo systemctl start mosquitto");
+            ESP_LOGW(TAG, "    - hostname not resolving: check mDNS / use static IP");
+            ESP_LOGW(TAG, "    - firewall blocking port 1883");
+            ESP_LOGW(TAG, "  Client will keep retrying every 5 sec automatically.");
+        }
+    }
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "  Data Flow:");
-    ESP_LOGI(TAG, "  Sensors -> ISR -> Ring Buffers -> Task -> MQTT");
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "  Subscribe on Raspberry Pi:");
-    ESP_LOGI(TAG, "  mosquitto_sub -t \"wind_turbine/#\" -v");
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "  NOTE: If identity shows MAC-XXXXXXXXXXXX, this");
-    ESP_LOGI(TAG, "  node has no serial number provisioned yet.");
-    ESP_LOGI(TAG, "  See mqtt.h for NVS flashing instructions.");
+    if (network_ok) {
+        ESP_LOGI(TAG, "  NOTE: If Node ID shows MAC-XXXXXXXXXXXX,");
+        ESP_LOGI(TAG, "  this node has no serial number provisioned.");
+        ESP_LOGI(TAG, "  See mqtt.h for NVS flashing instructions.");
+    }
     ESP_LOGI(TAG, "==============================================");
     ESP_LOGI(TAG, "");
 }
