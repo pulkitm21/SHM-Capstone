@@ -13,20 +13,50 @@ if not NODES_JSON.exists():
 
 TOPIC_PREFIX = "wind_turbine"
 
-# this is for testing purposes. remove after tests
+# TESTCODE: Temporary node used for frontend and backend testing.
 TEST_SERIAL = "TEST123"
 
+# Node map X/Y boundaries used by the frontend node map.
+MIN_X = 0.06
+MAX_X = 0.94
+MIN_Y = 0.08
+MAX_Y = 0.94
 
+# Tower section boundaries used to determine the node location label.
+TOP_SECTION_MAX_Y = 0.33
+MIDDLE_SECTION_MAX_Y = 0.66
+
+
+# Return the current UTC time in ISO format.
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _clamp_position(value: float) -> float:
-    return max(0.0, min(1.0, float(value)))
+# Clamp the normalized X position to the valid node map range.
+def _clamp_x(value: float) -> float:
+    return max(MIN_X, min(MAX_X, float(value)))
 
 
+# Clamp the normalized Y position to the valid node map range.
+def _clamp_y(value: float) -> float:
+    return max(MIN_Y, min(MAX_Y, float(value)))
+
+
+# Determine the tower section label from the node Y position.
+def _position_zone_for(y: float) -> str:
+    y = _clamp_y(y)
+
+    if y <= TOP_SECTION_MAX_Y:
+        return "Top"
+
+    if y <= MIDDLE_SECTION_MAX_Y:
+        return "Middle"
+
+    return "Bottom"
+
+
+# Return a default map position for newly discovered nodes.
 def _default_position(node_id: int) -> tuple[float, float]:
-    # Give each new node a simple default position on the map
     defaults = [
         (0.50, 0.18),
         (0.50, 0.32),
@@ -37,13 +67,14 @@ def _default_position(node_id: int) -> tuple[float, float]:
     return defaults[(node_id - 1) % len(defaults)]
 
 
+# Save the registry atomically to avoid partial writes.
 def _save_registry_raw(data: dict) -> None:
-    # Write to a temp file first, then replace the real file
     tmp_path = NODES_JSON.with_suffix(".tmp")
     tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     tmp_path.replace(NODES_JSON)
 
 
+# Load and sanitize the raw node registry from disk.
 def _load_registry_raw() -> dict:
     if not NODES_JSON.exists():
         return {"nodes": []}
@@ -77,8 +108,8 @@ def _load_registry_raw() -> dict:
                     x, y = _default_position(node_id)
                     changed = True
                 else:
-                    x = _clamp_position(x)
-                    y = _clamp_position(y)
+                    x = _clamp_x(x)
+                    y = _clamp_y(y)
 
                 cleaned.append(
                     {
@@ -105,10 +136,12 @@ def _load_registry_raw() -> dict:
         return {"nodes": []}
 
 
+# Build the display label used by the frontend.
 def _label_for(node_id: int, serial: str) -> str:
     return f"Node {node_id} - {serial}"
 
 
+# Parse ISO timestamps safely.
 def _parse_iso(ts: str) -> Optional[datetime]:
     try:
         return datetime.fromisoformat(ts.replace("Z", "+00:00"))
@@ -116,6 +149,7 @@ def _parse_iso(ts: str) -> Optional[datetime]:
         return None
 
 
+# Determine whether a node is online from its last_seen timestamp.
 def _is_online(last_seen: str, timeout_seconds: int) -> bool:
     dt = _parse_iso(last_seen)
     if dt is None:
@@ -125,7 +159,22 @@ def _is_online(last_seen: str, timeout_seconds: int) -> bool:
     return delta.total_seconds() <= timeout_seconds
 
 
-# this is for testing purposes. remove after tests
+# Build the frontend-ready node payload with derived fields.
+def _build_node_response(item: dict, timeout_seconds: int) -> dict:
+    return {
+        "node_id": item["node_id"],
+        "serial": item["serial"],
+        "first_seen": item["first_seen"],
+        "last_seen": item["last_seen"],
+        "x": item["x"],
+        "y": item["y"],
+        "position_zone": _position_zone_for(item["y"]),
+        "label": _label_for(item["node_id"], item["serial"]),
+        "online": _is_online(item["last_seen"], timeout_seconds),
+    }
+
+
+# TESTCODE: Ensure a test node exists for development previews.
 def _ensure_test_node():
     raw = _load_registry_raw()
     nodes = raw["nodes"]
@@ -153,28 +202,19 @@ def _ensure_test_node():
     ensure_node_defaults(next_node_id)
 
 
+# Return all nodes in a frontend-ready format.
 def list_nodes(timeout_seconds: int = 60):
     raw = _load_registry_raw()
     nodes = sorted(raw["nodes"], key=lambda item: item["node_id"])
 
     out = []
     for item in nodes:
-        out.append(
-            {
-                "node_id": item["node_id"],
-                "serial": item["serial"],
-                "first_seen": item["first_seen"],
-                "last_seen": item["last_seen"],
-                "x": item["x"],
-                "y": item["y"],
-                "label": _label_for(item["node_id"], item["serial"]),
-                "online": _is_online(item["last_seen"], timeout_seconds),
-            }
-        )
+        out.append(_build_node_response(item, timeout_seconds))
 
     return out
 
 
+# Return one node by numeric node ID.
 def get_node_by_id(node_id: int, timeout_seconds: int = 60):
     for item in list_nodes(timeout_seconds=timeout_seconds):
         if item["node_id"] == node_id:
@@ -182,6 +222,7 @@ def get_node_by_id(node_id: int, timeout_seconds: int = 60):
     return None
 
 
+# Return one node by serial number.
 def get_node_by_serial(serial: str, timeout_seconds: int = 60):
     serial = serial.strip()
     for item in list_nodes(timeout_seconds=timeout_seconds):
@@ -190,6 +231,7 @@ def get_node_by_serial(serial: str, timeout_seconds: int = 60):
     return None
 
 
+# Register a node serial or refresh its last_seen timestamp.
 def register_serial(serial: str, seen_at: Optional[str] = None):
     serial = serial.strip()
     if not serial:
@@ -205,16 +247,7 @@ def register_serial(serial: str, seen_at: Optional[str] = None):
             item["last_seen"] = now_iso
             _save_registry_raw({"nodes": sorted(nodes, key=lambda item: item["node_id"])})
             ensure_node_defaults(item["node_id"])
-            return {
-                "node_id": item["node_id"],
-                "serial": item["serial"],
-                "first_seen": item["first_seen"],
-                "last_seen": item["last_seen"],
-                "x": item["x"],
-                "y": item["y"],
-                "label": _label_for(item["node_id"], item["serial"]),
-                "online": True,
-            }
+            return _build_node_response(item, 60)
 
     next_node_id = max((item["node_id"] for item in nodes), default=0) + 1
     default_x, default_y = _default_position(next_node_id)
@@ -232,41 +265,25 @@ def register_serial(serial: str, seen_at: Optional[str] = None):
     _save_registry_raw({"nodes": sorted(nodes, key=lambda item: item["node_id"])})
     ensure_node_defaults(next_node_id)
 
-    return {
-        "node_id": new_item["node_id"],
-        "serial": new_item["serial"],
-        "first_seen": new_item["first_seen"],
-        "last_seen": new_item["last_seen"],
-        "x": new_item["x"],
-        "y": new_item["y"],
-        "label": _label_for(new_item["node_id"], new_item["serial"]),
-        "online": True,
-    }
+    return _build_node_response(new_item, 60)
 
 
+# Update a node's map position and return the updated node.
 def update_node_position(node_id: int, x: float, y: float):
     raw = _load_registry_raw()
     nodes = raw["nodes"]
 
     for item in nodes:
         if item["node_id"] == node_id:
-            item["x"] = _clamp_position(x)
-            item["y"] = _clamp_position(y)
+            item["x"] = _clamp_x(x)
+            item["y"] = _clamp_y(y)
             _save_registry_raw({"nodes": sorted(nodes, key=lambda item: item["node_id"])})
-            return {
-                "node_id": item["node_id"],
-                "serial": item["serial"],
-                "first_seen": item["first_seen"],
-                "last_seen": item["last_seen"],
-                "x": item["x"],
-                "y": item["y"],
-                "label": _label_for(item["node_id"], item["serial"]),
-                "online": _is_online(item["last_seen"], 60),
-            }
+            return _build_node_response(item, 60)
 
     return None
 
 
+# Extract the node serial number from the MQTT topic.
 def serial_from_topic(topic: str) -> str:
     parts = topic.split("/")
     if len(parts) < 3:
@@ -282,5 +299,5 @@ def serial_from_topic(topic: str) -> str:
     return serial
 
 
-# this is for testing purposes. remove after tests
+# TESTCODE: Add the temporary test node during development.
 _ensure_test_node()

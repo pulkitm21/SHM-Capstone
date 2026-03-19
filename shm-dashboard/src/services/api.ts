@@ -31,9 +31,20 @@ export type ApiResponse = {
 };
 
 export type SettingsResponse = {
+  site_name?: string;
   meta: Record<string, unknown>;
   config: Record<string, unknown>;
   [key: string]: unknown;
+};
+
+export type SiteNameResponse = {
+  site_name: string;
+  ok?: boolean;
+  [key: string]: unknown;
+};
+
+export type UpdateSiteNameRequest = {
+  site_name: string;
 };
 
 export type HealthResponse = {
@@ -71,6 +82,7 @@ export type NodeRecord = {
   online: boolean;
   x?: number;
   y?: number;
+  position_zone?: string;
   [key: string]: unknown;
 };
 
@@ -95,23 +107,20 @@ export type UpdateNodePositionResponse = {
   [key: string]: unknown;
 };
 
-export type SetAccelerometerHpfBody = {
-  highPassFilterDesired: "none" | "on";
+export type BulkNodePositionItem = {
+  node_id: number;
+  x: number;
+  y: number;
 };
 
-export type SetAccelerometerHpfResponse = {
-  node_id: number;
-  serial: string;
-  sensor: "accelerometer";
-  desired: {
-    highPassFilter: "none" | "on";
-  };
-  applied: {
-    highPassFilter: "none" | "on" | null;
-  };
-  sync_status: "unknown" | "synced" | "pending" | "failed";
-  request_id?: string;
-  acked_at?: string | null;
+export type BulkNodePositionsRequest = {
+  positions: BulkNodePositionItem[];
+};
+
+export type BulkNodePositionsResponse = {
+  ok: boolean;
+  nodes: NodeRecord[];
+  [key: string]: unknown;
 };
 
 export function getHealth(signal?: AbortSignal) {
@@ -148,11 +157,26 @@ export function putNodePosition(
   });
 }
 
+export function putNodePositions(
+  body: BulkNodePositionsRequest,
+  signal?: AbortSignal
+) {
+  return request<BulkNodePositionsResponse>("/api/nodes/positions", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+}
+
 export function getSettings(signal?: AbortSignal) {
   return request<SettingsResponse>("/api/settings", { signal });
 }
 
-export function putSettings(body: SettingsResponse, signal?: AbortSignal) {
+export function putSettings(
+  body: SettingsResponse,
+  signal?: AbortSignal
+) {
   return request<SettingsResponse>("/api/settings", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
@@ -161,12 +185,15 @@ export function putSettings(body: SettingsResponse, signal?: AbortSignal) {
   });
 }
 
-export function putAccelerometerHpf(
-  nodeId: number,
-  body: SetAccelerometerHpfBody,
+export function getSiteName(signal?: AbortSignal) {
+  return request<SiteNameResponse>("/api/settings/site-name", { signal });
+}
+
+export function putSiteName(
+  body: UpdateSiteNameRequest,
   signal?: AbortSignal
 ) {
-  return request<SetAccelerometerHpfResponse>(`/api/nodes/${nodeId}/config/accelerometer/hpf`, {
+  return request<SiteNameResponse>("/api/settings/site-name", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -199,20 +226,125 @@ export type FaultRow = {
   [key: string]: unknown;
 };
 
+export type FaultFilterOptions = {
+  sensor_types: string[];
+  fault_types: string[];
+  severities: number[];
+  statuses: string[];
+};
+
 export type FaultsResponse = {
   faults: FaultRow[];
+  page: number;
+  page_size: number;
+  total_items: number;
+  total_pages: number;
+  filter_options?: FaultFilterOptions;
   [key: string]: unknown;
 };
 
+export type FaultsQueryParams = {
+  serial_number?: string;
+  sensor_type?: string;
+  fault_type?: string;
+  severity?: number;
+  fault_status?: string;
+  description?: string;
+  page?: number;
+  page_size?: number;
+  limit?: number;
+};
+
 export function getFaults(
-  params?: { serial_number?: string; limit?: number },
+  params?: FaultsQueryParams,
   signal?: AbortSignal
 ) {
   const qs = new URLSearchParams();
 
   if (params?.serial_number) qs.set("serial_number", params.serial_number);
+  if (params?.sensor_type) qs.set("sensor_type", params.sensor_type);
+  if (params?.fault_type) qs.set("fault_type", params.fault_type);
+  if (params?.severity !== undefined) qs.set("severity", String(params.severity));
+  if (params?.fault_status) qs.set("fault_status", params.fault_status);
+  if (params?.description) qs.set("description", params.description);
+  if (params?.page !== undefined) qs.set("page", String(params.page));
+  if (params?.page_size !== undefined) qs.set("page_size", String(params.page_size));
   if (params?.limit !== undefined) qs.set("limit", String(params.limit));
 
   const suffix = qs.toString() ? `?${qs.toString()}` : "";
   return request<FaultsResponse>(`/api/faults${suffix}`, { signal });
+}
+
+export type AccelerometerOdrIndex = 0 | 1 | 2;
+export type AccelerometerRange = 1 | 2 | 3;
+export type ConfigSyncStatus = "unknown" | "synced" | "pending" | "failed";
+export type NodeState = "unknown" | "idle" | "configured" | "recording" | "reconfig" | "error";
+
+export type ApplyAccelerometerConfigBody = {
+  odr_index: AccelerometerOdrIndex;
+  range: AccelerometerRange;
+  hpf_corner: number;
+};
+
+export type ApplyAccelerometerConfigResponse = {
+  ok: boolean;
+  node_id: number;
+  serial: string;
+  sensor: "accelerometer";
+  desired: {
+    odr_index: AccelerometerOdrIndex;
+    range: AccelerometerRange;
+    hpf_corner: number;
+  };
+  applied: {
+    odr_index: AccelerometerOdrIndex | null;
+    range: AccelerometerRange | null;
+    hpf_corner: number | null;
+  };
+  current_state: NodeState;
+  pending_seq: number | null;
+  applied_seq: number | null;
+  sync_status: ConfigSyncStatus;
+  acked_at?: string | null;
+};
+
+export type NodeControlBody = {
+  cmd: "start" | "stop" | "init" | "reset";
+};
+
+export type NodeControlResponse = {
+  ok: boolean;
+  node_id: number;
+  serial: string;
+  cmd: "start" | "stop" | "init" | "reset";
+  status: string;
+};
+
+export function applyAccelerometerConfig(
+  nodeId: number,
+  body: ApplyAccelerometerConfigBody,
+  signal?: AbortSignal
+) {
+  return request<ApplyAccelerometerConfigResponse>(
+    `/api/nodes/${nodeId}/config/accelerometer/apply`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    }
+  );
+}
+
+export function sendNodeControl(
+  nodeId: number,
+  body: NodeControlBody,
+  signal?: AbortSignal
+) {
+  return request<NodeControlResponse>(`/api/nodes/${nodeId}/control`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
 }
