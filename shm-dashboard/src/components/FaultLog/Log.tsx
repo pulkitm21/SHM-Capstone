@@ -1,3 +1,4 @@
+// Log.tsx
 import { useEffect, useMemo, useState } from "react";
 import { getFaults, type FaultRow } from "../../services/api";
 import LogRecent from "./LogRecent";
@@ -11,16 +12,16 @@ type FaultLogProps = {
   serial_number?: string;
   limit?: number;
   variant?: FaultLogVariant;
-  title?: string;
+
   previewMode?: boolean;
   previewFaults?: FaultRow[];
 };
 
 type FaultEventsResponse = {
   faults?: FaultRow[];
-  time?: string;
 };
 
+// Sort faults newest-first so all UI variants display a consistent order.
 function normalizeFaultRows(rows: FaultRow[] | undefined): FaultRow[] {
   if (!rows) return [];
 
@@ -31,6 +32,7 @@ function normalizeFaultRows(rows: FaultRow[] | undefined): FaultRow[] {
   });
 }
 
+// Keep only active faults for summary-style variants.
 function getActiveFaultRows(rows: FaultRow[]): FaultRow[] {
   return rows.filter(
     (fault) => String(fault.fault_status ?? "").toLowerCase() === "active"
@@ -42,15 +44,25 @@ export default function FaultLog({
   limit = 10,
   variant = "full",
   previewMode = false,
-  previewFaults = [],
+  previewFaults,
 }: FaultLogProps) {
+  // Guard against an undefined preview array.
+  const safePreviewFaults = previewFaults ?? [];
+
+  // Local state is only used for the non-table variants.
   const [faults, setFaults] = useState<FaultRow[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(variant !== "full");
   const [error, setError] = useState("");
 
   useEffect(() => {
+    // The full table manages its own fetching and state internally.
+    if (variant === "full") {
+      return;
+    }
+
+    // In preview mode, skip API calls and use the provided mock data.
     if (previewMode) {
-      setFaults(normalizeFaultRows(previewFaults.slice(0, limit)));
+      setFaults(normalizeFaultRows(safePreviewFaults.slice(0, limit)));
       setLoading(false);
       setError("");
       return;
@@ -60,6 +72,7 @@ export default function FaultLog({
     let eventSource: EventSource | null = null;
     let reconnectTimeoutId: number | null = null;
 
+    // Fallback request used when SSE is unavailable or reconnecting.
     async function loadFaultsFallback() {
       try {
         setLoading(true);
@@ -76,15 +89,16 @@ export default function FaultLog({
         setLoading(false);
         setError("");
       } catch (err: any) {
-        console.error(err);
         if (!mounted) return;
 
+        console.error(err);
         setFaults([]);
         setLoading(false);
         setError(err?.message ?? "Failed to load faults.");
       }
     }
 
+    // Open an SSE connection for live fault updates.
     function connectFaultLogSSE() {
       const params = new URLSearchParams();
       if (serial_number) params.set("serial_number", serial_number);
@@ -93,11 +107,15 @@ export default function FaultLog({
       const query = params.toString();
 
       eventSource = new EventSource(
-        `${import.meta.env.VITE_API_BASE_URL}/api/events/faults${query ? `?${query}` : ""}`
+        `${import.meta.env.VITE_API_BASE_URL}/api/events/faults${
+          query ? `?${query}` : ""
+        }`
       );
 
       eventSource.onopen = () => {
         if (!mounted) return;
+
+        // Keep the loading state on until the first message arrives.
         setLoading(true);
         setError("");
       };
@@ -124,6 +142,7 @@ export default function FaultLog({
         setLoading(false);
         setError("Fault log connection lost — retrying...");
 
+        // Try a REST refresh first, then reopen SSE after a short delay.
         reconnectTimeoutId = window.setTimeout(() => {
           if (!mounted) return;
           void loadFaultsFallback();
@@ -142,39 +161,21 @@ export default function FaultLog({
         window.clearTimeout(reconnectTimeoutId);
       }
     };
-  }, [serial_number, limit, previewMode, previewFaults]);
+  }, [serial_number, limit, previewMode, safePreviewFaults, variant]);
 
+  // Only active faults are shown in the recent and node variants.
   const displayFaults = useMemo(() => {
     if (variant === "full") return faults;
     return getActiveFaultRows(faults);
   }, [faults, variant]);
 
-
   if (variant === "recent") {
-    return (
-      <LogRecent
-        faults={displayFaults}
-        loading={loading}
-        error={error}
-      />
-    );
+    return <LogRecent faults={displayFaults} loading={loading} error={error} />;
   }
 
   if (variant === "node") {
-    return (
-      <LogNode
-        faults={displayFaults}
-        loading={loading}
-        error={error}
-      />
-    );
+    return <LogNode faults={displayFaults} loading={loading} error={error} />;
   }
 
-  return (
-    <LogTable
-      faults={displayFaults}
-      loading={loading}
-      error={error}
-    />
-  );
+  return <LogTable serial_number={serial_number} />;
 }
