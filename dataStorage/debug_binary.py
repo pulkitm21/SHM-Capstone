@@ -8,14 +8,15 @@ Three-pass diagnostic tool for binary files from delta_encoder.py.
   Pass 3 — Anomaly report     (root-cause hints)
 
 Usage:
-    python debug_binary.py <file.bin>
-    python debug_binary.py <file.bin> --pass 1
-    python debug_binary.py <file.bin> --pass 2
-    python debug_binary.py <file.bin> --pass 3
-    python debug_binary.py <file.bin> --record 5     # zoom into record #5 ±2
+    python debug_binary.py <file.zst>
+    python debug_binary.py <file.zst> --pass 1
+    python debug_binary.py <file.zst> --pass 2
+    python debug_binary.py <file.zst> --pass 3
+    python debug_binary.py <file.zst> --record 5     # zoom into record #5 ±2
 """
 
-import struct, sys, os, argparse
+import struct, sys, os, argparse, io
+import zstandard as zstd
 from datetime import datetime, timezone
 
 TEMP_SCALE    = 100
@@ -34,6 +35,28 @@ TS_MIN          = 1_577_836_800.0
 TS_MAX          = 4_102_444_800.0
 TS_MS_THRESHOLD = 1e11
 
+
+
+# ── Zstd decompression helper ─────────────────────────────────────
+
+def open_decompressed(filepath: str) -> io.BytesIO:
+    """Return BytesIO of decompressed content. Handles both .zst and plain files."""
+    raw = open(filepath, "rb").read()
+    if not filepath.endswith(".zst"):
+        return io.BytesIO(raw)
+    decompressor = zstd.ZstdDecompressor()
+    buf = bytearray()
+    pos = 0
+    while pos < len(raw):
+        if pos + 4 > len(raw):
+            raise ValueError(f"Truncated chunk header at byte {pos}")
+        (chunk_size,) = struct.unpack_from("<I", raw, pos)
+        pos += 4
+        if pos + chunk_size > len(raw):
+            raise ValueError(f"Chunk claims {chunk_size} bytes but only {len(raw)-pos} remain")
+        buf += decompressor.decompress(raw[pos:pos + chunk_size])
+        pos += chunk_size
+    return io.BytesIO(bytes(buf))
 
 def read_bytes(f, n, label=""):
     d = f.read(n)
@@ -86,7 +109,7 @@ def pass1_structural(filepath, focus_record=None):
     print(f"{'─'*70}")
     issues = []
 
-    with open(filepath, "rb") as f:
+    with open_decompressed(filepath) as f:
         idx = 0
         while True:
             offset = f.tell()
@@ -196,7 +219,8 @@ def pass1_structural(filepath, focus_record=None):
 # ══════════════════════════════════════════════════════════════════
 
 def _fresh_sensor_state():
-    return {"ts_us": 0, "ts_delta_prev": 0, "xyz_prev": [0, 0, 0], "val_prev": 0}
+    return {"ts_us": 0, "ts_delta_prev": 0, "xyz_prev": [0, 0, 0], "val_prev": 0,
+            "first_ts_us": None}  # first sample ts of previous packet (for jump check)
 
 def pass2_delta_trace(filepath, focus_record=None):
     print(f"\n{'─'*70}")
@@ -215,28 +239,44 @@ def pass2_delta_trace(filepath, focus_record=None):
     def fmt_i(v): return f"{v/INCLIN_SCALE:+.3f}"
     def fmt_t(v): return f"{v/TEMP_SCALE:.2f}"
 
-    def _abs_ts(f, ss, label):
+    def _abs_ts(f, ss, label, is_first_sample=False):
         (ts_us,) = read_fmt(f, "<q", label)
+        if is_first_sample:
+            ss["first_ts_us"] = ts_us
         ss["ts_us"] = ts_us; ss["ts_delta_prev"] = 0
         return ts_us
 
-    def _dod_ts(f, ss, label, show, rec_idx):
+    def _dod_ts(f, ss, label, show, rec_idx, is_first_sample=False):
         (dod,)   = read_fmt(f, "<i", label)
         delta_us = ss["ts_delta_prev"] + dod
         ts_us    = ss["ts_us"] + delta_us
         if show:
             print(f"    {label}: dod={dod}µs  delta={delta_us}µs  "
                   f"ts_us={ts_us}  ({ts_str(ts_us/TS_SCALE)})")
-        prev_ts = ss["ts_us"]
-        jump_s  = (ts_us - prev_ts) / TS_SCALE
-        if abs(jump_s) > MAX_TS_JUMP_S or jump_s < 0:
-            msg = f"{label} jump {jump_s:+.3f} s"
-            issues.append((rec_idx, "DELTA", msg))
-            if show: print(f"    ⚠ {msg}")
+        # For the first sample of a burst, compare against the first sample of the
+        # previous packet — not the last sample — to avoid false negatives caused
+        # by back-spacing (e.g. accel[0].ts = now - (n-1)*dt is always behind
+        # accel[n-1].ts of the previous packet by design, not a real anomaly).
+        if is_first_sample and ss["first_ts_us"] is not None:
+            jump_s = (ts_us - ss["first_ts_us"]) / TS_SCALE
+            if abs(jump_s) > MAX_TS_JUMP_S or jump_s < 0:
+                msg = f"{label} jump {jump_s:+.3f} s (first-to-first)"
+                issues.append((rec_idx, "DELTA", msg))
+                if show: print(f"    ⚠ {msg}")
+        elif not is_first_sample:
+            # Within a burst: each sample should be a small positive step
+            prev_ts = ss["ts_us"]
+            jump_s  = (ts_us - prev_ts) / TS_SCALE
+            if jump_s < 0 or jump_s > MAX_TS_JUMP_S:
+                msg = f"{label} within-burst jump {jump_s:+.3f} s"
+                issues.append((rec_idx, "DELTA", msg))
+                if show: print(f"    ⚠ {msg}")
+        if is_first_sample:
+            ss["first_ts_us"] = ts_us
         ss["ts_us"] = ts_us; ss["ts_delta_prev"] = delta_us
         return ts_us
 
-    with open(filepath, "rb") as f:
+    with open_decompressed(filepath) as f:
         idx = 0
         while True:
             b = f.read(1)
@@ -253,7 +293,8 @@ def pass2_delta_trace(filepath, focus_record=None):
                     if header & FLAG_ACCEL:
                         (n,) = read_fmt(f, "<B", "accel n")
                         for i in range(n):
-                            ts_us = _abs_ts(f, state["accel"], f"accel[{i}].ts")
+                            ts_us = _abs_ts(f, state["accel"], f"accel[{i}].ts",
+                                            is_first_sample=(i == 0))
                             x, y, z = read_fmt(f, "<iii", f"accel[{i}]")
                             state["accel"]["xyz_prev"] = [x, y, z]
                             if show:
@@ -262,7 +303,7 @@ def pass2_delta_trace(filepath, focus_record=None):
                                 print(f"    state.accel.xyz_prev ← {[x,y,z]}  ({[fmt_a(v) for v in [x,y,z]]})")
 
                     if header & FLAG_INCLIN:
-                        ts_us = _abs_ts(f, state["inclin"], "inclin.ts")
+                        ts_us = _abs_ts(f, state["inclin"], "inclin.ts", is_first_sample=True)
                         r, p, y = read_fmt(f, "<iii", "inclin")
                         state["inclin"]["xyz_prev"] = [r, p, y]
                         if show:
@@ -271,7 +312,7 @@ def pass2_delta_trace(filepath, focus_record=None):
                             print(f"    state.inclin.xyz_prev ← {[r,p,y]}")
 
                     if header & FLAG_TEMP:
-                        ts_us = _abs_ts(f, state["temp"], "temp.ts")
+                        ts_us = _abs_ts(f, state["temp"], "temp.ts", is_first_sample=True)
                         (val,) = read_fmt(f, "<i", "temp")
                         state["temp"]["val_prev"] = val
                         if show:
@@ -288,7 +329,8 @@ def pass2_delta_trace(filepath, focus_record=None):
                         (n,) = read_fmt(f, "<B", "accel n")
                         prev = state["accel"]["xyz_prev"]
                         for i in range(n):
-                            ts_us = _dod_ts(f, state["accel"], f"accel[{i}].ts", show, idx)
+                            ts_us = _dod_ts(f, state["accel"], f"accel[{i}].ts",
+                                            show, idx, is_first_sample=(i == 0))
                             dx, dy, dz = read_fmt(f, "<hhh", f"accel[{i}] Δxyz")
                             cur = [prev[0]+dx, prev[1]+dy, prev[2]+dz]
                             if show:
@@ -299,7 +341,7 @@ def pass2_delta_trace(filepath, focus_record=None):
                         state["accel"]["xyz_prev"] = prev
 
                     if header & FLAG_INCLIN:
-                        ts_us = _dod_ts(f, state["inclin"], "inclin.ts", show, idx)
+                        ts_us = _dod_ts(f, state["inclin"], "inclin.ts", show, idx, is_first_sample=True)
                         dr, dp, dy = read_fmt(f, "<hhh", "inclin Δ")
                         prev = state["inclin"]["xyz_prev"]
                         cur  = [prev[0]+dr, prev[1]+dp, prev[2]+dy]
@@ -310,7 +352,7 @@ def pass2_delta_trace(filepath, focus_record=None):
                                   f"→ now={[fmt_i(v) for v in cur]} °")
 
                     if header & FLAG_TEMP:
-                        ts_us = _dod_ts(f, state["temp"], "temp.ts", show, idx)
+                        ts_us = _dod_ts(f, state["temp"], "temp.ts", show, idx, is_first_sample=True)
                         (dt,) = read_fmt(f, "<h", "temp Δ")
                         prev  = state["temp"]["val_prev"]
                         cur   = prev + dt
@@ -425,7 +467,16 @@ def main():
     if not os.path.isfile(args.file):
         print(f"[ERROR] Not found: {args.file}", file=sys.stderr); sys.exit(1)
 
-    print(f"Debug target : {args.file}  ({os.path.getsize(args.file):,} bytes)")
+    compressed_size = os.path.getsize(args.file)
+    if args.file.endswith(".zst"):
+        _buf = open_decompressed(args.file)
+        uncompressed_size = len(_buf.getvalue())
+        ratio = compressed_size / uncompressed_size * 100 if uncompressed_size else 0
+        print(f"Debug target : {args.file}")
+        print(f"  Compressed   : {compressed_size:>10,} bytes")
+        print(f"  Uncompressed : {uncompressed_size:>10,} bytes  (ratio {ratio:.1f}%)")
+    else:
+        print(f"Debug target : {args.file}  ({compressed_size:,} bytes)")
     if args.record is not None:
         print(f"Focusing on  : record #{args.record} ± 2")
 
