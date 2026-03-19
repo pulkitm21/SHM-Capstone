@@ -359,7 +359,7 @@ def pass2_delta_trace(filepath, focus_record=None):
                                   f"  +  Δ{dt} ({dt/TEMP_SCALE:+.2f} °C)"
                                   f"  →  {state['temp_prev']} ({fmt_temp(state['temp_prev'])} °C)")
 
-                prev_ts_us = ts_us_recon if sentinel != SENTINEL else ts_us_recon
+                prev_ts_us = ts_us if sentinel == SENTINEL else ts_us_recon
                 rec_idx += 1
 
             except EOFError as e:
