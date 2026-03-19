@@ -7,11 +7,12 @@ Mimics the exact JSON packet format consumed by multiple_nodes_test.py.
 Packet format (JSON over MQTT):
   topic : wind_turbine/<node_id>/data
   payload: {
-      "t": <float>,          # Unix timestamp (seconds)
-      "a": [[x,y,z], ...],   # Accelerometer — list of samples
-      "i": [roll, pitch, yaw],  # Inclinometer — single reading
-      "T": <float>           # Temperature (°C)
+      "a": [[t,x,y,z], ...],   # Accelerometer — each sample carries its own timestamp
+      "i": [t,roll,pitch,yaw], # Inclinometer  — single reading with timestamp
+      "T": [t,val]             # Temperature   — value with timestamp
   }
+  Each sensor carries its own Unix timestamp (seconds) so sensors
+  sampled at different rates have independent time axes.
 
 Usage:
     # Single node, all sensors, default rate
@@ -37,12 +38,12 @@ import time
 import paho.mqtt.client as mqtt
 
 # ── Defaults ──────────────────────────────────────────────────────
-DEFAULT_BROKER    = "192.168.2.2"
+DEFAULT_BROKER    = "localhost"
 DEFAULT_PORT      = 1883
-DEFAULT_NODES     = ["node2"]
-DEFAULT_ACCEL_HZ  = 1      # accelerometer publish rate
+DEFAULT_NODES     = ["node1"]
+DEFAULT_ACCEL_HZ  = 10      # accelerometer publish rate
 DEFAULT_SLOW_HZ   = 1       # inclinometer + temperature publish rate
-DEFAULT_ACCEL_SPB = 100       # accel samples per MQTT packet (burst)
+DEFAULT_ACCEL_SPB = 5       # accel samples per MQTT packet (burst)
 
 TOPIC_TEMPLATE = "wind_turbine/{node_id}/data"
 
@@ -68,13 +69,14 @@ class SensorSimulator:
     def _elapsed(self) -> float:
         return time.time() - self.start_t
 
-    def accel_samples(self, n: int) -> list[list[float]]:
-        """Return n accelerometer samples spaced evenly over the last 1/accel_hz window."""
+    def accel_samples(self, n: int, hz: float) -> list[list[float]]:
+        """Return n accelerometer samples each as [t, x, y, z].
+        Timestamps are evenly back-spaced so the last sample lands at now."""
         samples = []
         now = time.time()
-        dt  = 1.0 / (n * DEFAULT_ACCEL_HZ) if n > 1 else 0.0
+        dt  = 1.0 / hz if n > 1 else 0.0
         for i in range(n):
-            t = now - (n - 1 - i) * dt
+            t       = round(now - (n - 1 - i) * dt, 6)
             elapsed = t - self.start_t
 
             # Gravity component (near-static tilt ≈ 0.02 g sway)
@@ -89,23 +91,27 @@ class SensorSimulator:
             x = round(g_x + vib * 0.6 + noise(), 4)
             y = round(       vib * 0.4 + noise(), 4)
             z = round(g_z  + vib * 0.1 + noise(), 4)
-            samples.append([x, y, z])
+            samples.append([t, x, y, z])   # ← timestamp first
         return samples
 
     def inclin(self) -> list[float]:
+        """Return [t, roll, pitch, yaw] with the current timestamp."""
+        t       = round(time.time(), 6)
         elapsed = self._elapsed()
         roll  = round(1.5  * math.sin(2 * math.pi * self.sway_freq * elapsed)
                       + self.rng.gauss(0, 0.01), 4)
         pitch = round(0.8  * math.cos(2 * math.pi * self.sway_freq * elapsed * 0.9)
                       + self.rng.gauss(0, 0.01), 4)
         yaw   = round(0.05 * elapsed % 360 + self.rng.gauss(0, 0.005), 4)  # slow drift
-        return [roll, pitch, yaw]
+        return [t, roll, pitch, yaw]   # ← timestamp first
 
-    def temperature(self) -> float:
+    def temperature(self) -> list:
+        """Return [t, val] with the current timestamp."""
+        t       = round(time.time(), 6)
         elapsed = self._elapsed()
-        # Slow thermal drift + tiny noise
-        drift = 0.3 * math.sin(2 * math.pi * elapsed / 3600.0)  # 1-hour cycle
-        return round(self.temp_base + drift + self.rng.gauss(0, 0.05), 2)
+        drift   = 0.3 * math.sin(2 * math.pi * elapsed / 3600.0)  # 1-hour cycle
+        val     = round(self.temp_base + drift + self.rng.gauss(0, 0.05), 2)
+        return [t, val]   # ← timestamp first
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -150,17 +156,17 @@ class NodePublisher(threading.Thread):
         print(f"[{self.node_id}] Publisher started → topic: {self.topic}")
 
         while not self._stop_event.is_set():
-            now = time.time()
-            packet = {"t": round(now, 6)}
+            now    = time.time()
+            packet = {}       # no packet-level "t" — each sensor carries its own timestamp
             publish = False
 
-            # High-rate: accelerometer
+            # High-rate: accelerometer — each sample gets its own timestamp
             if self.enable_accel and (now - last_accel) >= self.accel_interval:
-                packet["a"] = self.sim.accel_samples(self.spb)
+                packet["a"] = self.sim.accel_samples(self.spb, self.accel_hz)
                 last_accel  = now
                 publish = True
 
-            # Low-rate: inclinometer + temperature (piggy-back on same packet)
+            # Low-rate: inclinometer + temperature — each carries its own timestamp
             if (now - last_slow) >= self.slow_interval:
                 if self.enable_inclin:
                     packet["i"] = self.sim.inclin()
@@ -186,18 +192,27 @@ class NodePublisher(threading.Thread):
 # ──────────────────────────────────────────────────────────────────
 
 def _preview(node_id: str, seq: int, packet: dict):
-    ts  = packet["t"]
-    dt  = time.strftime("%H:%M:%S", time.localtime(ts))
-    msg = f"[{node_id}] #{seq:>5}  t={ts:.3f} ({dt})"
+    # Use the timestamp from the first available sensor for the log line
+    ts = None
+    if "a" in packet and packet["a"]:
+        ts = packet["a"][-1][0]
+    elif "i" in packet:
+        ts = packet["i"][0]
+    elif "T" in packet:
+        ts = packet["T"][0]
+
+    dt  = time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "?"
+    msg = f"[{node_id}] #{seq:>5}  ({dt})"
+
     if "a" in packet:
         n    = len(packet["a"])
-        last = packet["a"][-1]
-        msg += f"  accel[{n}] last=({last[0]:+.3f},{last[1]:+.3f},{last[2]:+.3f})g"
+        last = packet["a"][-1]   # [t, x, y, z]
+        msg += f"  accel[{n}] t={last[0]:.3f} last=({last[1]:+.3f},{last[2]:+.3f},{last[3]:+.3f})g"
     if "i" in packet:
-        i = packet["i"]
-        msg += f"  inclin=({i[0]:+.3f},{i[1]:+.3f},{i[2]:+.3f})°"
+        i = packet["i"]          # [t, roll, pitch, yaw]
+        msg += f"  inclin t={i[0]:.3f} ({i[1]:+.3f},{i[2]:+.3f},{i[3]:+.3f})°"
     if "T" in packet:
-        msg += f"  temp={packet['T']:.2f}°C"
+        msg += f"  temp t={packet['T'][0]:.3f} {packet['T'][1]:.2f}°C"
     print(msg)
 
 
