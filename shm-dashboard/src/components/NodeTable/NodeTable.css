@@ -1,0 +1,65 @@
+.sm-node-table-panel {
+  background: #ffffff;
+  border-radius: 18px;
+  padding: 16px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.08);
+}
+
+.sm-node-table-wrap {
+  overflow-x: auto;
+}
+
+.sm-node-table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 1000px;
+}
+
+.sm-node-table th,
+.sm-node-table td {
+  padding: 12px 10px;
+  border-bottom: 1px solid #e8edf3;
+  text-align: left;
+  vertical-align: middle;
+  font-size: 14px;
+}
+
+.sm-node-table th {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #6f7c8d;
+}
+
+.sm-node-table tbody tr.selected {
+  background: #f6f9fc;
+}
+
+.sm-node-primary {
+  font-weight: 700;
+  color: #1e2a37;
+}
+
+.sm-node-secondary {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #6f7c8d;
+  word-break: break-word;
+}
+
+.sm-select-btn {
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid #d6dde6;
+  border-radius: 10px;
+  background: #ffffff;
+  color: #223042;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.sm-select-btn.active {
+  background: #223042;
+  color: #ffffff;
+  border-color: #223042;
+}

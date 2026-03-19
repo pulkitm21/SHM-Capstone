@@ -1,110 +1,181 @@
-import { useEffect, useState } from "react";
-import { getFaults } from "../../services/api";
+// Log.tsx
+import { useEffect, useMemo, useState } from "react";
+import { getFaults, type FaultRow } from "../../services/api";
+import LogRecent from "./LogRecent";
+import LogNode from "./LogNode";
+import LogTable from "./LogTable";
 import "./Log.css";
 
-type FaultEntry = {
-  id: number;
-  ts: string;
-  severity: number;
-  serial_number: string;
-  sensor_type: string;
-  fault_type: string;
-  fault_status: string;
-  description: string;
-};
+export type FaultLogVariant = "recent" | "node" | "full";
 
 type FaultLogProps = {
   serial_number?: string;
   limit?: number;
+  variant?: FaultLogVariant;
+
+  previewMode?: boolean;
+  previewFaults?: FaultRow[];
 };
 
-function getSeverityLabel(severity: number) {
-  if (severity >= 3) return "High";
-  if (severity === 2) return "Warning";
-  return "Info";
+type FaultEventsResponse = {
+  faults?: FaultRow[];
+};
+
+// Sort faults newest-first so all UI variants display a consistent order.
+function normalizeFaultRows(rows: FaultRow[] | undefined): FaultRow[] {
+  if (!rows) return [];
+
+  return [...rows].sort((a, b) => {
+    const aTime = new Date(a.ts ?? 0).getTime();
+    const bTime = new Date(b.ts ?? 0).getTime();
+    return bTime - aTime;
+  });
 }
 
-function getSeverityClass(severity: number) {
-  if (severity >= 3) return "high";
-  if (severity === 2) return "warning";
-  return "info";
+// Keep only active faults for summary-style variants.
+function getActiveFaultRows(rows: FaultRow[]): FaultRow[] {
+  return rows.filter(
+    (fault) => String(fault.fault_status ?? "").toLowerCase() === "active"
+  );
 }
 
-export default function FaultLog({ serial_number, limit = 200 }: FaultLogProps) {
-  const [faults, setFaults] = useState<FaultEntry[]>([]);
-  const [status, setStatus] = useState("Loading…");
+export default function FaultLog({
+  serial_number,
+  limit = 10,
+  variant = "full",
+  previewMode = false,
+  previewFaults,
+}: FaultLogProps) {
+  // Guard against an undefined preview array.
+  const safePreviewFaults = previewFaults ?? [];
+
+  // Local state is only used for the non-table variants.
+  const [faults, setFaults] = useState<FaultRow[]>([]);
+  const [loading, setLoading] = useState(variant !== "full");
+  const [error, setError] = useState("");
 
   useEffect(() => {
-    const controller = new AbortController();
+    // The full table manages its own fetching and state internally.
+    if (variant === "full") {
+      return;
+    }
 
-    async function loadFaults() {
+    // In preview mode, skip API calls and use the provided mock data.
+    if (previewMode) {
+      setFaults(normalizeFaultRows(safePreviewFaults.slice(0, limit)));
+      setLoading(false);
+      setError("");
+      return;
+    }
+
+    let mounted = true;
+    let eventSource: EventSource | null = null;
+    let reconnectTimeoutId: number | null = null;
+
+    // Fallback request used when SSE is unavailable or reconnecting.
+    async function loadFaultsFallback() {
       try {
-        setStatus("Loading…");
+        setLoading(true);
+        setError("");
 
-        const res = await getFaults({ serial_number, limit }, controller.signal);
+        const response = await getFaults({
+          serial_number,
+          limit,
+        });
 
-        setFaults(res.faults ?? []);
-        setStatus("");
+        if (!mounted) return;
+
+        setFaults(normalizeFaultRows(response.faults));
+        setLoading(false);
+        setError("");
       } catch (err: any) {
+        if (!mounted) return;
+
         console.error(err);
         setFaults([]);
-        setStatus("Fault log load failed");
+        setLoading(false);
+        setError(err?.message ?? "Failed to load faults.");
       }
     }
 
-    loadFaults();
-    return () => controller.abort();
-  }, [serial_number, limit]);
+    // Open an SSE connection for live fault updates.
+    function connectFaultLogSSE() {
+      const params = new URLSearchParams();
+      if (serial_number) params.set("serial_number", serial_number);
+      params.set("limit", String(limit));
 
-  return (
-    <div className="fault-log">
-      {status && <p>{status}</p>}
+      const query = params.toString();
 
-      <table className="fault-table">
-        <thead>
-          <tr>
-            <th>Time</th>
-            <th>Status</th>
-            <th>Location</th>
-            <th>Description</th>
-          </tr>
-        </thead>
+      eventSource = new EventSource(
+        `${import.meta.env.VITE_API_BASE_URL}/api/events/faults${
+          query ? `?${query}` : ""
+        }`
+      );
 
-        <tbody>
-          {faults.length === 0 && !status && (
-            <tr>
-              <td colSpan={4}>No faults recorded</td>
-            </tr>
-          )}
+      eventSource.onopen = () => {
+        if (!mounted) return;
 
-          {faults.map((entry) => {
-            const severityLabel = getSeverityLabel(entry.severity);
-            const severityClass = getSeverityClass(entry.severity);
+        // Keep the loading state on until the first message arrives.
+        setLoading(true);
+        setError("");
+      };
 
-            return (
-              <tr key={entry.id}>
-                <td className="mono">{entry.ts}</td>
+      eventSource.onmessage = (event) => {
+        if (!mounted) return;
 
-                <td>
-                  <span className={`status-pill ${severityClass}`}>
-                    {severityLabel}
-                  </span>
-                </td>
+        try {
+          const data: FaultEventsResponse = JSON.parse(event.data);
+          setFaults(normalizeFaultRows(data.faults));
+          setLoading(false);
+          setError("");
+        } catch (err) {
+          console.error(err);
+          setLoading(false);
+          setError("Failed to parse live fault updates.");
+        }
+      };
 
-                <td>
-                  {entry.serial_number} – {entry.sensor_type}
-                </td>
+      eventSource.onerror = () => {
+        if (!mounted) return;
 
-                <td>
-                  {entry.fault_type}
-                  {entry.description ? `: ${entry.description}` : ""}
-                  {entry.fault_status ? ` (${entry.fault_status})` : ""}
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-    </div>
-  );
+        eventSource?.close();
+        setLoading(false);
+        setError("Fault log connection lost — retrying...");
+
+        // Try a REST refresh first, then reopen SSE after a short delay.
+        reconnectTimeoutId = window.setTimeout(() => {
+          if (!mounted) return;
+          void loadFaultsFallback();
+          connectFaultLogSSE();
+        }, 3000);
+      };
+    }
+
+    connectFaultLogSSE();
+
+    return () => {
+      mounted = false;
+      eventSource?.close();
+
+      if (reconnectTimeoutId !== null) {
+        window.clearTimeout(reconnectTimeoutId);
+      }
+    };
+  }, [serial_number, limit, previewMode, safePreviewFaults, variant]);
+
+  // Only active faults are shown in the recent and node variants.
+  const displayFaults = useMemo(() => {
+    if (variant === "full") return faults;
+    return getActiveFaultRows(faults);
+  }, [faults, variant]);
+
+  if (variant === "recent") {
+    return <LogRecent faults={displayFaults} loading={loading} error={error} />;
+  }
+
+  if (variant === "node") {
+    return <LogNode faults={displayFaults} loading={loading} error={error} />;
+  }
+
+  return <LogTable serial_number={serial_number} />;
 }
