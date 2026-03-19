@@ -1,12 +1,14 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 import FaultLog from "../../components/FaultLog/Log";
 import NodeMap from "../../components/NodeMap/NodeMap";
 import {
+  getFaults,
   getNodes,
   getStorage,
   getStorageStatus,
+  type FaultRow,
   type NodeRecord,
   type StorageResponse,
   type StorageStatusResponse,
@@ -14,12 +16,14 @@ import {
 
 import "./Home.css";
 
+function isActiveFault(fault: FaultRow) {
+  return String(fault.fault_status ?? "").toLowerCase() !== "resolved";
+}
+
 export default function Home() {
   const navigate = useNavigate();
 
   const [backendOnline, setBackendOnline] = useState<boolean>(false);
-  const [backendStatusText, setBackendStatusText] = useState<string>("Loading…");
-  const [backendTime, setBackendTime] = useState<string>("");
   const [lastOnline, setLastOnline] = useState<string>("");
   const [lastUpdate, setLastUpdate] = useState<string>("");
 
@@ -33,8 +37,9 @@ export default function Home() {
 
   const [ssdMounted, setSsdMounted] = useState<boolean>(false);
   const [ssdAvailable, setSsdAvailable] = useState<boolean>(false);
-  const [ssdStatusText, setSsdStatusText] = useState<string>("Loading…");
   const [ssdMountPath, setSsdMountPath] = useState<string>("/mnt/ssd");
+
+  const [warningSerials, setWarningSerials] = useState<string[]>([]);
 
   useEffect(() => {
     let mounted = true;
@@ -55,7 +60,6 @@ export default function Home() {
 
       eventSource.onopen = () => {
         if (!mounted) return;
-
         setBackendOnline(true);
       };
 
@@ -68,15 +72,12 @@ export default function Home() {
           const onlineTime = data.time ? formatLocalDateTime(data.time) : receivedAt;
 
           setBackendOnline(true);
-          setBackendStatusText(data.status ?? "OK");
-          setBackendTime(data.time ?? "");
           setLastOnline(onlineTime);
           setLastUpdate(receivedAt);
         } catch {
           const receivedAt = new Date().toLocaleString();
 
           setBackendOnline(true);
-          setBackendStatusText("OK");
           setLastOnline(receivedAt);
           setLastUpdate(receivedAt);
         }
@@ -86,8 +87,6 @@ export default function Home() {
         if (!mounted) return;
 
         setBackendOnline(false);
-        setBackendStatusText("Offline");
-        setBackendTime("");
 
         eventSource?.close();
 
@@ -138,15 +137,34 @@ export default function Home() {
 
         setSsdMounted(Boolean(res.mounted));
         setSsdAvailable(Boolean(res.available));
-        setSsdStatusText(String(res.status ?? "unknown"));
         setSsdMountPath(String(res.mount_path ?? "/mnt/ssd"));
       } catch {
         if (!mounted) return;
 
         setSsdMounted(false);
         setSsdAvailable(false);
-        setSsdStatusText("Status unavailable");
         setSsdMountPath("/mnt/ssd");
+      }
+    }
+
+    async function pollFaultWarnings() {
+      try {
+        const res = await getFaults({ limit: 5000 });
+        if (!mounted) return;
+
+        const activeWarningSerials = Array.from(
+          new Set(
+            (res.faults ?? [])
+              .filter(isActiveFault)
+              .map((fault) => String(fault.serial_number))
+              .filter(Boolean)
+          )
+        );
+
+        setWarningSerials(activeWarningSerials);
+      } catch {
+        if (!mounted) return;
+        setWarningSerials([]);
       }
     }
 
@@ -154,137 +172,176 @@ export default function Home() {
     pollNodes();
     pollStorage();
     pollStorageStatus();
+    pollFaultWarnings();
 
     const id = window.setInterval(() => {
       pollNodes();
       pollStorage();
       pollStorageStatus();
+      pollFaultWarnings();
     }, 5000);
 
     return () => {
       mounted = false;
       eventSource?.close();
+
       if (reconnectTimeoutId !== null) {
         window.clearTimeout(reconnectTimeoutId);
       }
+
       window.clearInterval(id);
     };
   }, []);
 
-  return (
-    <div className="home-grid">
-      <div className="sc-card">
-        <div className="sc-card-title">Backend Status</div>
+  // Count online nodes for quick dashboard context.
+  const onlineNodeCount = useMemo(
+    () => nodes.filter((node) => node.online).length,
+    [nodes]
+  );
 
-        <div className="sc-card-body">
-          <div className="backend-status-row">
+  return (
+    <div className="home-page">
+      <div className="home-hero">
+        <div>
+          <h1 className="home-title">System Overview</h1>
+        </div>
+      </div>
+
+      <div className="home-grid">
+        <section className="sc-card home-card">
+          <div className="home-card-header">
+            <div>
+              <div className="sc-card-title">Backend Status</div>
+            </div>
+
             <span className={`status-pill ${backendOnline ? "info" : "high"}`}>
               {backendOnline ? "Online" : "Offline"}
             </span>
           </div>
 
-          <div style={{ marginTop: 8 }}>{backendStatusText}</div>
+          <div className="sc-card-body home-card-body">
+            <div className="home-detail-list">
+              <div className="home-detail-row">
+                <span>Last Online</span>
+                <span className="mono home-detail-value">
+                  {lastOnline || "—"}
+                </span>
+              </div>
 
-          {backendTime && (
-            <div className="backend-time">
-              <span className="mono">{backendTime}</span>
-            </div>
-          )}
+              <div className="home-detail-row">
+                <span>Last Update</span>
+                <span className="mono home-detail-value">
+                  {lastUpdate || "—"}
+                </span>
+              </div>
 
-          {lastOnline && (
-            <div style={{ marginTop: 8 }}>
-              Last Online: <span className="mono">{lastOnline}</span>
-            </div>
-          )}
-
-          {lastUpdate && (
-            <div style={{ marginTop: 4 }}>
-              Last Update: <span className="mono">{lastUpdate}</span>
-            </div>
-          )}
-        </div>
-      </div>
-
-      <div className="sc-card">
-        <div className="sc-card-title">Storage</div>
-
-        <div className="sc-card-body">
-          <div className="storage-row">
-            <div>Used: {storageUsed.toFixed(1)} GB</div>
-            <div>Free: {storageFree.toFixed(1)} GB</div>
-            <div>Total: {storageTotal.toFixed(1)} GB</div>
-          </div>
-
-          <div className="storage-bar">
-            <div
-              className="storage-fill"
-              style={{ width: `${Math.max(0, Math.min(100, storagePercent))}%` }}
-            />
-          </div>
-
-          <div className="storage-percent">
-            {storagePercent.toFixed(1)}% used
-          </div>
-
-          <div style={{ marginTop: 12 }}>
-            <div style={{ marginBottom: 6, fontWeight: 600 }}>
-              SSD Mount Diagnostic
-            </div>
-
-            <div className="backend-status-row">
-              <span className={`status-pill ${ssdAvailable ? "info" : "high"}`}>
-                {ssdAvailable ? "Available" : "Unavailable"}
-              </span>
-            </div>
-
-            <div style={{ marginTop: 8 }}>
-              Mounted: <span className="mono">{ssdMounted ? "Yes" : "No"}</span>
-            </div>
-
-            <div style={{ marginTop: 4 }}>
-              Path: <span className="mono">{ssdMountPath}</span>
-            </div>
-
-            <div style={{ marginTop: 4 }}>
-              Status: <span className="mono">{ssdStatusText}</span>
+              <div className="home-detail-row">
+                <span>Nodes Online</span>
+                <span className="mono home-detail-value">
+                  {onlineNodeCount}
+                </span>
+              </div>
             </div>
           </div>
-        </div>
-      </div>
+        </section>
 
-      <div className="sc-card node-health-card">
-        <div className="sc-card-title">Node Placement</div>
+        <section className="sc-card home-card">
+          <div className="home-card-header">
+            <div>
+              <div className="sc-card-title">SSD Health</div>
+            </div>
 
-        <div className="sc-card-body">
-          {nodesStatus ? (
-            <p>{nodesStatus}</p>
-          ) : (
-            <NodeMap
-              nodes={nodes}
-              onNodeClick={(node) =>
-                navigate(`/sensor-management?serial=${encodeURIComponent(node.serial)}`)
-              }
-            />
-          )}
-        </div>
-      </div>
+            <span className={`status-pill ${ssdAvailable ? "info" : "high"}`}>
+              {ssdAvailable ? "Available" : "Unavailable"}
+            </span>
+          </div>
 
-      <div className="sc-card home-faults-card">
-        <div className="sc-card-title">Recent Faults</div>
+          <div className="sc-card-body home-card-body">
+            <div className="home-storage-stats">
+              <div className="home-storage-stat">
+                <span className="home-storage-label">Used</span>
+                <strong>{storageUsed.toFixed(1)} GB</strong>
+              </div>
 
-        <div className="sc-card-body">
-          <FaultLog limit={10} />
-        </div>
+              <div className="home-storage-stat">
+                <span className="home-storage-label">Free</span>
+                <strong>{storageFree.toFixed(1)} GB</strong>
+              </div>
 
-        <div className="home-faults-footer">
-          <button
-            className="home-link-btn"
-            onClick={() => navigate("/fault-log")}
-            type="button"
-          >
-            View all faults
-          </button>
-        </div>
+              <div className="home-storage-stat">
+                <span className="home-storage-label">Total</span>
+                <strong>{storageTotal.toFixed(1)} GB</strong>
+              </div>
+            </div>
+
+            <div className="storage-bar">
+              <div
+                className="storage-fill"
+                style={{ width: `${Math.max(0, Math.min(100, storagePercent))}%` }}
+              />
+            </div>
+
+            <div className="storage-percent">{storagePercent.toFixed(1)}% used</div>
+
+            <div className="home-detail-list compact">
+              <div className="home-detail-row">
+                <span>Mounted</span>
+                <span className="mono home-detail-value">
+                  {ssdMounted ? "Yes" : "No"}
+                </span>
+              </div>
+
+              <div className="home-detail-row">
+                <span>Path</span>
+                <span className="mono home-detail-value">{ssdMountPath}</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="sc-card home-card node-health-card">
+          <div className="home-card-header">
+            <div>
+              <div className="sc-card-title">Node Placement</div>
+            </div>
+          </div>
+
+          <div className="sc-card-body home-card-body node-map-card-body">
+            {nodesStatus ? (
+              <p>{nodesStatus}</p>
+            ) : (
+              <NodeMap
+                nodes={nodes}
+                warningSerials={warningSerials}
+                onNodeClick={(node) =>
+                  navigate(`/sensor-management?serial=${encodeURIComponent(node.serial)}`)
+                }
+              />
+            )}
+          </div>
+        </section>
+
+        <section className="sc-card home-card home-faults-card">
+          <div className="home-card-header">
+            <div>
+              <div className="sc-card-title">Recent Faults</div>
+            </div>
+          </div>
+
+          <div className="sc-card-body home-card-body">
+            <FaultLog variant="recent" limit={5} />
+          </div>
+
+          <div className="home-faults-footer">
+            <button
+              className="home-link-btn"
+              onClick={() => navigate("/fault-log")}
+              type="button"
+            >
+              View all faults
+            </button>
+          </div>
+        </section>
       </div>
     </div>
   );
