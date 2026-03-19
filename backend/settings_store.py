@@ -181,3 +181,40 @@ def mark_accelerometer_config_failed(node_id: int):
     settings.config[key]["accelerometer"] = to_dict(updated_accel)
     save_settings(settings)
     return updated_accel
+
+
+# Update runtime state from a status message without changing applied config fields.
+def update_accelerometer_runtime_state(
+    node_id: int,
+    current_state: str,
+    acked_at: str | None = None,
+):
+    settings = load_settings()
+    key = str(node_id)
+
+    if key not in settings.config:
+        settings.config[key] = build_default_node_config()
+
+    current_raw = settings.config[key].get("accelerometer") or {}
+    current_accel = validate_model(AccelerometerConfigModel, current_raw)
+
+    updated_accel = AccelerometerConfigModel(
+        odr_index=current_accel.odr_index,
+        range=current_accel.range,
+        hpf_corner=current_accel.hpf_corner,
+        desired_odr_index=current_accel.desired_odr_index,
+        desired_range=current_accel.desired_range,
+        desired_hpf_corner=current_accel.desired_hpf_corner,
+        applied_odr_index=current_accel.applied_odr_index,
+        applied_range=current_accel.applied_range,
+        applied_hpf_corner=current_accel.applied_hpf_corner,
+        current_state=current_state,
+        pending_seq=current_accel.pending_seq,
+        applied_seq=current_accel.applied_seq,
+        last_ack_at=acked_at or current_accel.last_ack_at,
+        sync_status=current_accel.sync_status,
+    )
+
+    settings.config[key]["accelerometer"] = to_dict(updated_accel)
+    save_settings(settings)
+    return updated_accel
