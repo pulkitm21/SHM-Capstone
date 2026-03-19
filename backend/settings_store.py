@@ -12,8 +12,8 @@ from settings_schema import (
     to_dict,
 )
 
-SETTINGS_JSON = Path("/mnt/ssd/settings.json")
 
+SETTINGS_JSON = Path("/home/pi/settings.json")
 
 def save_settings(settings) -> None:
     SETTINGS_JSON.write_text(json.dumps(to_dict(settings), indent=2), encoding="utf-8")

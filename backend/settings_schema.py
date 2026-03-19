@@ -4,10 +4,8 @@ from typing import Dict, Optional, Literal
 
 class SensorMetaModel(BaseModel):
     model: str = ""
-    serial: str = ""
     installationDate: str = ""
-    location: str = ""
-    orientation: str = ""
+
 
 
 # Accelerometer config must match the real node configure payload.
@@ -63,24 +61,17 @@ def build_default_node_meta():
     return {
         "accelerometer": SensorMetaModel(
             model="ADXL355",
-            serial="ACCEL-001",
             installationDate="2025-09-15",
-            location="Tower",
-            orientation="+X +Y +Z",
+
         ),
         "inclinometer": SensorMetaModel(
             model="SCL3300",
-            serial="INCL-001",
             installationDate="2025-09-15",
-            location="Foundation",
-            orientation="+X +Y",
         ),
+
         "temperature": SensorMetaModel(
             model="ADT7420",
-            serial="TEMP-001",
             installationDate="2025-09-15",
-            location="Tower",
-            orientation="N/A",
         ),
     }
 
