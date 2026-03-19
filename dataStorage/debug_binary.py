@@ -8,14 +8,15 @@ Three-pass diagnostic tool for binary files from delta_encoder.py.
   Pass 3 — Anomaly report     (root-cause hints)
 
 Usage:
-    python debug_binary.py <file.bin>
-    python debug_binary.py <file.bin> --pass 1
-    python debug_binary.py <file.bin> --pass 2
-    python debug_binary.py <file.bin> --pass 3
-    python debug_binary.py <file.bin> --record 5     # zoom into record #5 ±2
+    python debug_binary.py <file.zst>
+    python debug_binary.py <file.zst> --pass 1
+    python debug_binary.py <file.zst> --pass 2
+    python debug_binary.py <file.zst> --pass 3
+    python debug_binary.py <file.zst> --record 5     # zoom into record #5 ±2
 """
 
-import struct, sys, os, argparse
+import struct, sys, os, argparse, io
+import zstandard as zstd
 from datetime import datetime, timezone
 
 TEMP_SCALE    = 100
@@ -34,6 +35,28 @@ TS_MIN          = 1_577_836_800.0
 TS_MAX          = 4_102_444_800.0
 TS_MS_THRESHOLD = 1e11
 
+
+
+# ── Zstd decompression helper ─────────────────────────────────────
+
+def open_decompressed(filepath: str) -> io.BytesIO:
+    """Return BytesIO of decompressed content. Handles both .zst and plain files."""
+    raw = open(filepath, "rb").read()
+    if not filepath.endswith(".zst"):
+        return io.BytesIO(raw)
+    decompressor = zstd.ZstdDecompressor()
+    buf = bytearray()
+    pos = 0
+    while pos < len(raw):
+        if pos + 4 > len(raw):
+            raise ValueError(f"Truncated chunk header at byte {pos}")
+        (chunk_size,) = struct.unpack_from("<I", raw, pos)
+        pos += 4
+        if pos + chunk_size > len(raw):
+            raise ValueError(f"Chunk claims {chunk_size} bytes but only {len(raw)-pos} remain")
+        buf += decompressor.decompress(raw[pos:pos + chunk_size])
+        pos += chunk_size
+    return io.BytesIO(bytes(buf))
 
 def read_bytes(f, n, label=""):
     d = f.read(n)
@@ -86,7 +109,7 @@ def pass1_structural(filepath, focus_record=None):
     print(f"{'─'*70}")
     issues = []
 
-    with open(filepath, "rb") as f:
+    with open_decompressed(filepath) as f:
         idx = 0
         while True:
             offset = f.tell()
@@ -253,7 +276,7 @@ def pass2_delta_trace(filepath, focus_record=None):
         ss["ts_us"] = ts_us; ss["ts_delta_prev"] = delta_us
         return ts_us
 
-    with open(filepath, "rb") as f:
+    with open_decompressed(filepath) as f:
         idx = 0
         while True:
             b = f.read(1)
@@ -444,7 +467,16 @@ def main():
     if not os.path.isfile(args.file):
         print(f"[ERROR] Not found: {args.file}", file=sys.stderr); sys.exit(1)
 
-    print(f"Debug target : {args.file}  ({os.path.getsize(args.file):,} bytes)")
+    compressed_size = os.path.getsize(args.file)
+    if args.file.endswith(".zst"):
+        _buf = open_decompressed(args.file)
+        uncompressed_size = len(_buf.getvalue())
+        ratio = compressed_size / uncompressed_size * 100 if uncompressed_size else 0
+        print(f"Debug target : {args.file}")
+        print(f"  Compressed   : {compressed_size:>10,} bytes")
+        print(f"  Uncompressed : {uncompressed_size:>10,} bytes  (ratio {ratio:.1f}%)")
+    else:
+        print(f"Debug target : {args.file}  ({compressed_size:,} bytes)")
     if args.record is not None:
         print(f"Focusing on  : record #{args.record} ± 2")
 

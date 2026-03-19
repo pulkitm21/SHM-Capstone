@@ -14,13 +14,14 @@ Binary format recap:
       temp:   dod_ts(i) dval(h)
 
 Usage:
-    python decode_binary.py <file.bin>
-    python decode_binary.py <file.bin> --csv out.csv
-    python decode_binary.py <file.bin> --verbose
-    python decode_binary.py <file.bin> --head 10
+    python decode_binary.py <file.zst>
+    python decode_binary.py <file.zst> --csv out.csv
+    python decode_binary.py <file.zst> --verbose
+    python decode_binary.py <file.zst> --head 10
 """
 
-import struct, sys, os, argparse, csv
+import struct, sys, os, argparse, csv, io
+import zstandard as zstd
 from datetime import datetime, timezone
 
 TEMP_SCALE    = 100
@@ -33,6 +34,45 @@ FLAG_INCLIN = 0x02
 FLAG_TEMP   = 0x04
 SENTINEL    = 0xFF
 
+
+
+# ── Zstd decompression helper ─────────────────────────────────────
+
+def open_decompressed(filepath: str) -> io.BytesIO:
+    """
+    Read a .zst file and return a BytesIO of the fully decompressed
+    binary content, ready to be passed to the record decoders.
+
+    File layout written by delta_encoder.py:
+        [ chunk_size(uint32 LE) | zstd_compressed_chunk ] × N
+    Each chunk decompresses independently and is concatenated in order.
+    Plain uncompressed files (no .zst extension) are returned as-is
+    for backwards compatibility.
+    """
+    raw = open(filepath, "rb").read()
+
+    if not filepath.endswith(".zst"):
+        return io.BytesIO(raw)
+
+    decompressor = zstd.ZstdDecompressor()
+    buf = bytearray()
+    pos = 0
+    chunk_num = 0
+    while pos < len(raw):
+        if pos + 4 > len(raw):
+            raise ValueError(f"Truncated chunk header at byte {pos}")
+        (chunk_size,) = struct.unpack_from("<I", raw, pos)
+        pos += 4
+        if pos + chunk_size > len(raw):
+            raise ValueError(
+                f"Chunk {chunk_num} claims {chunk_size} bytes but only "
+                f"{len(raw)-pos} remain (file truncated?)")
+        compressed_chunk = raw[pos:pos + chunk_size]
+        buf += decompressor.decompress(compressed_chunk)
+        pos += chunk_size
+        chunk_num += 1
+
+    return io.BytesIO(bytes(buf))
 
 # ── Low-level helpers ─────────────────────────────────────────────
 
@@ -153,7 +193,7 @@ def decode_file(filepath: str, verbose: bool = False):
     records = []
     state   = _fresh_decode_state()
 
-    with open(filepath, "rb") as f:
+    with open_decompressed(filepath) as f:
         idx = 0
         while True:
             b = f.read(1)
@@ -301,7 +341,18 @@ def main():
     if not os.path.isfile(args.file):
         print(f"[ERROR] Not found: {args.file}", file=sys.stderr); sys.exit(1)
 
-    print(f"Decoding: {args.file}  ({os.path.getsize(args.file):,} bytes)")
+    compressed_size = os.path.getsize(args.file)
+    if args.file.endswith(".zst"):
+        # Decompress once to get uncompressed size for display
+        import io as _io
+        _buf = open_decompressed(args.file)
+        uncompressed_size = len(_buf.getvalue())
+        ratio = compressed_size / uncompressed_size * 100 if uncompressed_size else 0
+        print(f"Decoding: {args.file}")
+        print(f"  Compressed   : {compressed_size:>10,} bytes")
+        print(f"  Uncompressed : {uncompressed_size:>10,} bytes  (ratio {ratio:.1f}%)")
+    else:
+        print(f"Decoding: {args.file}  ({compressed_size:,} bytes)")
     records = decode_file(args.file)
 
     if args.head > 0:
