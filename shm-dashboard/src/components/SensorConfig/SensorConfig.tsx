@@ -231,7 +231,6 @@ export default function SensorConfigCard({
       <div className="sc-topbar">
         <div>
           <h2 className="sc-title">{title}</h2>
-          <p className="sc-subtitle">Compact live config for the selected node.</p>
         </div>
 
         <div className="sc-topbar-actions">
