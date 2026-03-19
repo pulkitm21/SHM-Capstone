@@ -43,13 +43,6 @@ type PlotCacheRecord = {
   data: ApiResponse;
 };
 
-type NodeFaultSummary = {
-  total: number;
-  critical: number;
-  warning: number;
-  latest: FaultRow | null;
-};
-
 const SENSOR_DEFINITIONS: {
   label: string;
   value: SensorValue;
@@ -265,15 +258,6 @@ function getSimpleSensorStatus(
   }
 
   return { status: "online", count: 0 };
-}
-
-function getNodeFaultSummary(faults: FaultRow[]): NodeFaultSummary {
-  return {
-    total: faults.length,
-    critical: faults.filter((f) => Number(f.severity) >= 3).length,
-    warning: faults.filter((f) => Number(f.severity) === 2).length,
-    latest: faults[0] ?? null,
-  };
 }
 
 export default function SensorManagement() {
@@ -714,7 +698,6 @@ const configForNode = nodeId ? (configByNode[nodeId] ?? FALLBACK_CONFIG) : FALLB
 const meta = metaForNode[sensor];
 const config = configForNode[sensor];
 
-  const nodeFaultSummary = useMemo(() => getNodeFaultSummary(nodeFaults), [nodeFaults]);
 
   const sensorCards = useMemo(() => {
     return SENSOR_DEFINITIONS.map((sensorDef) => {
