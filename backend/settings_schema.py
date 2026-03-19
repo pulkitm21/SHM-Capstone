@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Dict, Optional
+from typing import Dict, Optional, Literal
 
 
 class SensorMetaModel(BaseModel):
@@ -10,29 +10,41 @@ class SensorMetaModel(BaseModel):
     orientation: str = ""
 
 
+# Accelerometer config must match the real node configure payload.
+class AccelerometerConfigModel(BaseModel):
+    odr_index: Literal[0, 1, 2] = 2
+    range: Literal[1, 2, 3] = 1
+    hpf_corner: int = Field(0, ge=0, le=6)
+
+    # Desired values are what the user most recently requested.
+    desired_odr_index: Literal[0, 1, 2] = 2
+    desired_range: Literal[1, 2, 3] = 1
+    desired_hpf_corner: int = Field(0, ge=0, le=6)
+
+    # Applied values come from the node ACK later.
+    applied_odr_index: Optional[Literal[0, 1, 2]] = None
+    applied_range: Optional[Literal[1, 2, 3]] = None
+    applied_hpf_corner: Optional[int] = Field(default=None, ge=0, le=6)
+
+    # Runtime state indicators shown in the UI.
+    current_state: str = "unknown"
+    pending_seq: Optional[int] = None
+    applied_seq: Optional[int] = None
+    last_ack_at: Optional[str] = None
+    sync_status: str = "unknown"  # unknown | pending | synced | failed
+
+
+# Keep a lighter generic model for the non-configurable sensors for now.
 class SensorConfigModel(BaseModel):
     samplingRate: str = "200"
     measurementRange: str = "2g"
     lowPassFilter: str = "none"
 
-    # desired configuration (what the user requested)
-    highPassFilterDesired: str = "none"
-
-    # applied configuration (what the ESP32 last confirmed)
-    highPassFilterApplied: Optional[str] = None
-
-    # sync state: unknown | pending | synced | failed
-    highPassFilterStatus: str = "unknown"
-
-    # request/ack tracking
-    lastRequestId: Optional[str] = None
-    lastAckAt: Optional[str] = None
-
 
 class SettingsModel(BaseModel):
     site_name: str = "Cape Scott, BC"
     meta: Dict[str, Dict[str, SensorMetaModel]] = Field(default_factory=dict)
-    config: Dict[str, Dict[str, SensorConfigModel]] = Field(default_factory=dict)
+    config: Dict[str, Dict[str, dict]] = Field(default_factory=dict)
 
 
 def to_dict(model: BaseModel) -> dict:
@@ -75,35 +87,20 @@ def build_default_node_meta():
 
 def build_default_node_config():
     return {
-        "accelerometer": SensorConfigModel(
-            samplingRate="200",
-            measurementRange="2g",
-            lowPassFilter="none",
-            highPassFilterDesired="none",
-            highPassFilterApplied=None,
-            highPassFilterStatus="unknown",
-            lastRequestId=None,
-            lastAckAt=None,
+        "accelerometer": to_dict(AccelerometerConfigModel()),
+        "inclinometer": to_dict(
+            SensorConfigModel(
+                samplingRate="20",
+                measurementRange="fixed",
+                lowPassFilter="fixed",
+            )
         ),
-        "inclinometer": SensorConfigModel(
-            samplingRate="200",
-            measurementRange="2g",
-            lowPassFilter="none",
-            highPassFilterDesired="none",
-            highPassFilterApplied=None,
-            highPassFilterStatus="unknown",
-            lastRequestId=None,
-            lastAckAt=None,
-        ),
-        "temperature": SensorConfigModel(
-            samplingRate="100",
-            measurementRange="2g",
-            lowPassFilter="none",
-            highPassFilterDesired="none",
-            highPassFilterApplied=None,
-            highPassFilterStatus="unknown",
-            lastRequestId=None,
-            lastAckAt=None,
+        "temperature": to_dict(
+            SensorConfigModel(
+                samplingRate="1",
+                measurementRange="fixed",
+                lowPassFilter="fixed",
+            )
         ),
     }
 

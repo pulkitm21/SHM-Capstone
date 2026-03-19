@@ -17,7 +17,7 @@ from settings_store import (
     load_settings,
     save_settings,
     ensure_node_defaults,
-    update_accelerometer_hpf_request,
+    update_accelerometer_config_request,
     get_site_name,
     update_site_name,
 )
@@ -61,8 +61,14 @@ class NodePositionUpdate(BaseModel):
     y: float = Field(..., ge=0.0, le=1.0)
 
 
-class AccelerometerHpfUpdate(BaseModel):
-    highPassFilterDesired: str = Field(..., pattern="^(none|on)$")
+class AccelerometerConfigApplyRequest(BaseModel):
+    odr_index: int = Field(..., ge=0, le=2)
+    range: int = Field(..., ge=1, le=3)
+    hpf_corner: int = Field(..., ge=0, le=6)
+
+
+class NodeControlRequest(BaseModel):
+    cmd: str = Field(..., pattern="^(start|stop|init|reset)$")
 
 
 class SiteNameUpdate(BaseModel):
@@ -356,32 +362,61 @@ def api_put_site_name(payload: SiteNameUpdate):
     return {"ok": True, "site_name": updated_name}
 
 
-@app.put("/api/nodes/{node_id}/config/accelerometer/hpf")
-def put_accelerometer_hpf(node_id: int, payload: AccelerometerHpfUpdate):
+@app.post("/api/nodes/{node_id}/config/accelerometer/apply")
+def apply_accelerometer_config(node_id: int, payload: AccelerometerConfigApplyRequest):
     node = get_node_by_id(node_id, timeout_seconds=60)
     if node is None:
         raise HTTPException(status_code=404, detail="Node not found")
 
     ensure_node_defaults(node_id)
 
-    updated = update_accelerometer_hpf_request(
+    seq = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+    updated = update_accelerometer_config_request(
         node_id=node_id,
-        desired=payload.highPassFilterDesired,
+        odr_index=payload.odr_index,
+        range_value=payload.range,
+        hpf_corner=payload.hpf_corner,
+        seq=seq,
     )
 
+    # Phase 1 only: store the request and return it.
+    # MQTT publish will be added in Phase 2.
     return {
+        "ok": True,
         "node_id": node["node_id"],
         "serial": node["serial"],
         "sensor": "accelerometer",
         "desired": {
-            "highPassFilter": updated.highPassFilterDesired,
+            "odr_index": updated.desired_odr_index,
+            "range": updated.desired_range,
+            "hpf_corner": updated.desired_hpf_corner,
         },
         "applied": {
-            "highPassFilter": updated.highPassFilterApplied,
+            "odr_index": updated.applied_odr_index,
+            "range": updated.applied_range,
+            "hpf_corner": updated.applied_hpf_corner,
         },
-        "sync_status": updated.highPassFilterStatus,
-        "request_id": updated.lastRequestId,
-        "acked_at": updated.lastAckAt,
+        "current_state": updated.current_state,
+        "pending_seq": updated.pending_seq,
+        "applied_seq": updated.applied_seq,
+        "sync_status": updated.sync_status,
+        "acked_at": updated.last_ack_at,
+    }
+@app.post("/api/nodes/{node_id}/control")
+def control_node(node_id: int, payload: NodeControlRequest):
+    node = get_node_by_id(node_id, timeout_seconds=60)
+    if node is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    # Phase 1 only: backend accepts the request shape.
+    # MQTT control publish will be added in Phase 2.
+    return {
+        "ok": True,
+        "node_id": node["node_id"],
+        "serial": node["serial"],
+        "cmd": payload.cmd,
+        "status": "accepted",
     }
 
 

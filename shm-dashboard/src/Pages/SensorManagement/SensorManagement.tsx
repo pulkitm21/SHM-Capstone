@@ -1,9 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
-import SensorInfoCard, { type SensorMeta } from "../../components/SensorInfo/SensorInfo";
 import SensorConfigCard, {
-  type HpfValue,
   type SensorConfig,
 } from "../../components/SensorConfig/SensorConfig";
 import FaultLog from "../../components/FaultLog/Log";
@@ -13,8 +11,8 @@ import SensorCardGrid from "../../components/SensorCardGrid/SensorCardGrid";
 
 import {
   getSettings,
-  putSettings,
-  putAccelerometerHpf,
+  applyAccelerometerConfig,
+  sendNodeControl,
   getSensorData,
   getNodes,
   getFaults,
@@ -33,6 +31,7 @@ import {
   type SensorValue,
 } from "./SensorManagement.preview";
 
+import type { SensorMeta } from "../../components/SensorInfo/SensorInfo";
 import "./SensorManagement.css";
 
 const SETTINGS_CACHE_KEY = "shm_settings_cache";
@@ -47,18 +46,9 @@ const SENSOR_DEFINITIONS: {
   label: string;
   value: SensorValue;
 }[] = [
-  {
-    label: "Accelerometer",
-    value: "accelerometer",
-  },
-  {
-    label: "Inclinometer",
-    value: "inclinometer",
-  },
-  {
-    label: "Temperature",
-    value: "temperature",
-  },
+  { label: "Accelerometer", value: "accelerometer" },
+  { label: "Inclinometer", value: "inclinometer" },
+  { label: "Temperature", value: "temperature" },
 ];
 
 const TIMEFRAME_OPTIONS = [
@@ -111,11 +101,20 @@ const FALLBACK_META: Record<SensorValue, SensorMeta> = {
 };
 
 const EMPTY_SENSOR_CONFIG: SensorConfig = {
-  highPassFilterDesired: "none",
-  highPassFilterApplied: null,
-  highPassFilterStatus: "unknown",
-  lastRequestId: undefined,
-  lastAckAt: null,
+  odr_index: 2,
+  range: 1,
+  hpf_corner: 0,
+  desired_odr_index: 2,
+  desired_range: 1,
+  desired_hpf_corner: 0,
+  applied_odr_index: null,
+  applied_range: null,
+  applied_hpf_corner: null,
+  current_state: "unknown",
+  pending_seq: null,
+  applied_seq: null,
+  last_ack_at: null,
+  sync_status: "unknown",
 };
 
 const FALLBACK_CONFIG: Record<SensorValue, SensorConfig> = {
@@ -202,35 +201,21 @@ function normalizeNodeKeyedObject<T>(obj: unknown): Record<number, T> {
 }
 
 function normalizeSensorConfig(raw: any): SensorConfig {
-  const desired = raw?.highPassFilterDesired ?? raw?.highPassFilter ?? "none";
-  const applied =
-    raw?.highPassFilterApplied ??
-    raw?.applied?.highPassFilter ??
-    raw?.highPassFilterAppliedValue ??
-    null;
-
-  const status =
-    raw?.highPassFilterStatus ??
-    raw?.sync_status ??
-    (applied === null ? "unknown" : desired === applied ? "synced" : "pending");
-
   return {
-    highPassFilterDesired: desired === "on" ? "on" : "none",
-    highPassFilterApplied: applied === "on" || applied === "none" ? applied : null,
-    highPassFilterStatus:
-      status === "synced" || status === "pending" || status === "failed" ? status : "unknown",
-    lastRequestId:
-      typeof raw?.lastRequestId === "string"
-        ? raw.lastRequestId
-        : typeof raw?.request_id === "string"
-          ? raw.request_id
-          : undefined,
-    lastAckAt:
-      typeof raw?.lastAckAt === "string"
-        ? raw.lastAckAt
-        : typeof raw?.acked_at === "string"
-          ? raw.acked_at
-          : null,
+    odr_index: raw?.odr_index ?? 2,
+    range: raw?.range ?? 1,
+    hpf_corner: raw?.hpf_corner ?? 0,
+    desired_odr_index: raw?.desired_odr_index ?? raw?.odr_index ?? 2,
+    desired_range: raw?.desired_range ?? raw?.range ?? 1,
+    desired_hpf_corner: raw?.desired_hpf_corner ?? raw?.hpf_corner ?? 0,
+    applied_odr_index: raw?.applied_odr_index ?? null,
+    applied_range: raw?.applied_range ?? null,
+    applied_hpf_corner: raw?.applied_hpf_corner ?? null,
+    current_state: raw?.current_state ?? "unknown",
+    pending_seq: raw?.pending_seq ?? null,
+    applied_seq: raw?.applied_seq ?? null,
+    last_ack_at: raw?.last_ack_at ?? raw?.acked_at ?? null,
+    sync_status: raw?.sync_status ?? "unknown",
   };
 }
 
@@ -277,9 +262,7 @@ export default function SensorManagement() {
     return cached?.meta ?? {};
   });
 
-  const [configByNode, setConfigByNode] = useState<
-    Record<number, Record<SensorValue, SensorConfig>>
-  >(() => {
+  const [configByNode, setConfigByNode] = useState<Record<number, Record<SensorValue, SensorConfig>>>(() => {
     const cached = loadCachedSettings();
     return cached?.config ?? {};
   });
@@ -310,8 +293,7 @@ export default function SensorManagement() {
         const res = await getNodes();
         if (!mounted) return;
 
-        const nextNodes = res.nodes ?? [];
-        setNodes(nextNodes);
+        setNodes(res.nodes ?? []);
         setNodesStatus("");
       } catch (e: any) {
         if (!mounted) return;
@@ -321,7 +303,7 @@ export default function SensorManagement() {
       }
     }
 
-    loadNodeList();
+    void loadNodeList();
 
     return () => {
       mounted = false;
@@ -404,7 +386,7 @@ export default function SensorManagement() {
       }
     }
 
-    loadSettingsFromBackend();
+    void loadSettingsFromBackend();
   }, []);
 
   function ensureNodeDefaults(n: number) {
@@ -418,90 +400,65 @@ export default function SensorManagement() {
     if (nodeId) ensureNodeDefaults(nodeId);
   }, [nodeId]);
 
-  async function saveAllSettings(
-    nextMetaByNode: Record<number, Record<SensorValue, SensorMeta>>,
-    nextConfigByNode: Record<number, Record<SensorValue, SensorConfig>>
-  ) {
-    if (UI_PREVIEW_MODE) {
-      setMetaByNode(nextMetaByNode);
-      setConfigByNode(nextConfigByNode);
-      setSettingsStatus("UI preview mode: config changes are local only and not sent to the backend.");
-      return;
-    }
-
-    try {
-      setSettingsStatus("Saving…");
-      await putSettings({ meta: nextMetaByNode, config: nextConfigByNode });
-      saveCachedSettings(nextMetaByNode, nextConfigByNode);
-      setSettingsStatus("");
-    } catch (e: any) {
-      setSettingsStatus(`Save failed: ${e?.message ?? "Unknown error"}`);
-    }
-  }
-
-  function handleSaveMeta(updated: SensorMeta) {
-    if (!nodeId) return;
-
-    const currentNodeMeta = metaByNode[nodeId] ?? FALLBACK_META;
-    const nextNodeMeta = { ...currentNodeMeta, [sensor]: updated };
-    const nextMetaByNode = { ...metaByNode, [nodeId]: nextNodeMeta };
-
-    setMetaByNode(nextMetaByNode);
-    void saveAllSettings(nextMetaByNode, configByNode);
-  }
-
-  async function handleSaveConfig(updatedDesired: HpfValue) {
+  async function handleApplyAccelerometerConfig(updated: {
+    odr_index: 0 | 1 | 2;
+    range: 1 | 2 | 3;
+    hpf_corner: number;
+  }) {
     if (!nodeId || !selectedNode) return;
 
     const currentNodeConfig = configByNode[nodeId] ?? FALLBACK_CONFIG;
-    const currentSensorConfig = currentNodeConfig[sensor] ?? EMPTY_SENSOR_CONFIG;
+    const currentAccelConfig = currentNodeConfig.accelerometer ?? EMPTY_SENSOR_CONFIG;
 
-    const nextSensorConfig: SensorConfig = {
-      ...currentSensorConfig,
-      highPassFilterDesired: updatedDesired,
-      highPassFilterApplied: UI_PREVIEW_MODE ? updatedDesired : currentSensorConfig.highPassFilterApplied,
-      highPassFilterStatus: UI_PREVIEW_MODE ? "synced" : "pending",
-      lastAckAt: UI_PREVIEW_MODE ? new Date().toISOString() : currentSensorConfig.lastAckAt,
-    };
-
-    const nextNodeConfig: Record<SensorValue, SensorConfig> = {
-      ...currentNodeConfig,
-      [sensor]: nextSensorConfig,
+    const optimisticAccelConfig: SensorConfig = {
+      ...currentAccelConfig,
+      odr_index: updated.odr_index,
+      range: updated.range,
+      hpf_corner: updated.hpf_corner,
+      desired_odr_index: updated.odr_index,
+      desired_range: updated.range,
+      desired_hpf_corner: updated.hpf_corner,
+      sync_status: UI_PREVIEW_MODE ? "synced" : "pending",
+      last_ack_at: UI_PREVIEW_MODE ? new Date().toISOString() : currentAccelConfig.last_ack_at,
+      current_state: currentAccelConfig.current_state ?? "unknown",
     };
 
     const nextConfigByNode: Record<number, Record<SensorValue, SensorConfig>> = {
       ...configByNode,
-      [nodeId]: nextNodeConfig,
+      [nodeId]: {
+        ...currentNodeConfig,
+        accelerometer: optimisticAccelConfig,
+      },
     };
 
     if (UI_PREVIEW_MODE) {
       setConfigByNode(nextConfigByNode);
-      setSettingsStatus(
-        `UI preview mode: ${sensor} configuration updated locally only for frontend testing.`
-      );
-      return;
-    }
-
-    if (sensor !== "accelerometer") {
-      setConfigByNode(nextConfigByNode);
-      await saveAllSettings(metaByNode, nextConfigByNode);
+      setSettingsStatus("UI preview mode: accelerometer config updated locally only.");
       return;
     }
 
     try {
       setConfigByNode(nextConfigByNode);
-      setSettingsStatus(selectedNode.online ? "Applying HPF…" : "Saving desired config…");
+      setSettingsStatus(selectedNode.online ? "Applying accelerometer config…" : "Saving desired config…");
 
-      const res = await putAccelerometerHpf(nodeId, {
-        highPassFilterDesired: updatedDesired,
-      });
+      const res = await applyAccelerometerConfig(nodeId, updated);
 
       const appliedAccelConfig: SensorConfig = {
-        highPassFilterDesired: res.desired.highPassFilter,
-        highPassFilterApplied: res.applied.highPassFilter,
-        highPassFilterStatus: res.sync_status,
-        lastRequestId: res.request_id,
-        lastAckAt: res.acked_at ?? null,
+        ...currentAccelConfig,
+        odr_index: res.desired.odr_index,
+        range: res.desired.range,
+        hpf_corner: res.desired.hpf_corner,
+        desired_odr_index: res.desired.odr_index,
+        desired_range: res.desired.range,
+        desired_hpf_corner: res.desired.hpf_corner,
+        applied_odr_index: res.applied.odr_index,
+        applied_range: res.applied.range,
+        applied_hpf_corner: res.applied.hpf_corner,
+        current_state: res.current_state,
+        pending_seq: res.pending_seq,
+        applied_seq: res.applied_seq,
+        last_ack_at: res.acked_at ?? null,
+        sync_status: res.sync_status,
       };
 
       setConfigByNode((prev) => ({
@@ -512,20 +469,48 @@ export default function SensorManagement() {
         },
       }));
 
-      setSettingsStatus("");
+      setSettingsStatus("Accelerometer config request accepted.");
     } catch (e: any) {
       setConfigByNode((prev) => ({
         ...prev,
         [nodeId]: {
           ...(prev[nodeId] ?? FALLBACK_CONFIG),
           accelerometer: {
-            ...nextSensorConfig,
-            highPassFilterStatus: "failed",
+            ...optimisticAccelConfig,
+            sync_status: "failed",
           },
         },
       }));
 
-      setSettingsStatus(`HPF apply failed: ${e?.message ?? "Unknown error"}`);
+      setSettingsStatus(`Accelerometer config apply failed: ${e?.message ?? "Unknown error"}`);
+    }
+  }
+
+  async function handleNodeControl(cmd: "start" | "stop") {
+    if (!nodeId || !selectedNode) return;
+
+    if (UI_PREVIEW_MODE) {
+      setConfigByNode((prev) => ({
+        ...prev,
+        [nodeId]: {
+          ...(prev[nodeId] ?? FALLBACK_CONFIG),
+          accelerometer: {
+            ...(prev[nodeId]?.accelerometer ?? EMPTY_SENSOR_CONFIG),
+            current_state: cmd === "start" ? "recording" : "configured",
+          },
+        },
+      }));
+
+      setSettingsStatus(`UI preview mode: node ${cmd} handled locally only.`);
+      return;
+    }
+
+    try {
+      setSettingsStatus(`${cmd === "start" ? "Starting" : "Stopping"} node…`);
+      const res = await sendNodeControl(nodeId, { cmd });
+      setSettingsStatus(`Node ${res.cmd} request accepted.`);
+    } catch (e: any) {
+      setSettingsStatus(`Node ${cmd} failed: ${e?.message ?? "Unknown error"}`);
     }
   }
 
@@ -570,7 +555,7 @@ export default function SensorManagement() {
       }
     }
 
-    loadNodeFaults();
+    void loadNodeFaults();
 
     return () => controller.abort();
   }, [selectedNode?.serial]);
@@ -692,12 +677,10 @@ export default function SensorManagement() {
     void loadPlot();
   }, [nodeId, nodeKey, sensor, channel, timeframeMin]);
 
-const metaForNode = nodeId ? (metaByNode[nodeId] ?? FALLBACK_META) : FALLBACK_META;
-const configForNode = nodeId ? (configByNode[nodeId] ?? FALLBACK_CONFIG) : FALLBACK_CONFIG;
+  const metaForNode = nodeId ? (metaByNode[nodeId] ?? FALLBACK_META) : FALLBACK_META;
+  const configForNode = nodeId ? (configByNode[nodeId] ?? FALLBACK_CONFIG) : FALLBACK_CONFIG;
 
-const meta = metaForNode[sensor];
-const config = configForNode[sensor];
-
+  const config = configForNode[sensor];
 
   const sensorCards = useMemo(() => {
     return SENSOR_DEFINITIONS.map((sensorDef) => {
@@ -748,20 +731,14 @@ const config = configForNode[sensor];
               onSelectSensor={setSensor}
             />
 
-            <div className="sm-detail-grid">
-              <div className="sm-detail-column">
-                <SensorInfoCard meta={meta} onSave={handleSaveMeta} />
-              </div>
-
-              <div className="sm-detail-column">
-                <SensorConfigCard
-                  title={`${selectedSensorDef.label} Configuration`}
-                  config={config}
-                  onSave={handleSaveConfig}
-                  disabled={!selectedNode}
-                />
-              </div>
-            </div>
+            <SensorConfigCard
+              title={`${selectedSensorDef.label} Configuration`}
+              config={config}
+              onApply={handleApplyAccelerometerConfig}
+              onStart={() => handleNodeControl("start")}
+              onStop={() => handleNodeControl("stop")}
+              disabled={!selectedNode || sensor !== "accelerometer"}
+            />
 
             <div className="sm-panel sm-full-width-panel">
               <div className="sm-plot-toolbar">
@@ -808,26 +785,30 @@ const config = configForNode[sensor];
               <div className="sm-plot-status">{plotStatus}</div>
 
               <div className="sm-plot-wrap">
-                {apiData && selectedNode ? (
+                {apiData && selectedNode && Array.isArray(apiData.points) && apiData.points.length > 0 ? (
                   <SensorLineChart
                     title={`${selectedSensorDef.label} (${selectedNode.serial})`}
                     sensorKey={apiData.sensor ?? sensor}
                     unit={apiData.unit ?? ""}
-                    points={apiData.points.map((p) => ({ ts: p.t, value: p.v }))}
+                    points={apiData.points.map((p) => ({
+                      ts: p.t,
+                      value: p.v,
+                    }))}
                     height={420}
                   />
                 ) : (
-                  <div className="sm-plot-empty">No plot data available for the current selection.</div>
+                  <div className="sm-plot-empty">No plot data available for the selected view.</div>
                 )}
               </div>
             </div>
-<FaultLog
-  variant="node"
-  serial_number={selectedNode.serial}
-  limit={5}
-  previewMode={UI_PREVIEW_MODE}
-  previewFaults={PREVIEW_FAULTS_BY_SERIAL[selectedNode.serial] ?? []}
-/>
+
+            <FaultLog
+              variant="node"
+              serial_number={selectedNode.serial}
+              limit={5}
+              previewMode={UI_PREVIEW_MODE}
+              previewFaults={PREVIEW_FAULTS_BY_SERIAL[selectedNode.serial] ?? []}
+            />
           </section>
         </div>
       )}

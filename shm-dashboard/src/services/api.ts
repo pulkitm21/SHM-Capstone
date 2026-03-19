@@ -123,25 +123,6 @@ export type BulkNodePositionsResponse = {
   [key: string]: unknown;
 };
 
-export type SetAccelerometerHpfBody = {
-  highPassFilterDesired: "none" | "on";
-};
-
-export type SetAccelerometerHpfResponse = {
-  node_id: number;
-  serial: string;
-  sensor: "accelerometer";
-  desired: {
-    highPassFilter: "none" | "on";
-  };
-  applied: {
-    highPassFilter: "none" | "on" | null;
-  };
-  sync_status: "unknown" | "synced" | "pending" | "failed";
-  request_id?: string;
-  acked_at?: string | null;
-};
-
 export function getHealth(signal?: AbortSignal) {
   // Testing/manual health check endpoint only. SSE is used for backend status updates in the dashboard.
   return request<HealthResponse>("/health", { signal });
@@ -213,19 +194,6 @@ export function putSiteName(
   signal?: AbortSignal
 ) {
   return request<SiteNameResponse>("/api/settings/site-name", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal,
-  });
-}
-
-export function putAccelerometerHpf(
-  nodeId: number,
-  body: SetAccelerometerHpfBody,
-  signal?: AbortSignal
-) {
-  return request<SetAccelerometerHpfResponse>(`/api/nodes/${nodeId}/config/accelerometer/hpf`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -305,4 +273,78 @@ export function getFaults(
 
   const suffix = qs.toString() ? `?${qs.toString()}` : "";
   return request<FaultsResponse>(`/api/faults${suffix}`, { signal });
+}
+
+export type AccelerometerOdrIndex = 0 | 1 | 2;
+export type AccelerometerRange = 1 | 2 | 3;
+export type ConfigSyncStatus = "unknown" | "synced" | "pending" | "failed";
+export type NodeState = "unknown" | "idle" | "configured" | "recording" | "reconfig" | "error";
+
+export type ApplyAccelerometerConfigBody = {
+  odr_index: AccelerometerOdrIndex;
+  range: AccelerometerRange;
+  hpf_corner: number;
+};
+
+export type ApplyAccelerometerConfigResponse = {
+  ok: boolean;
+  node_id: number;
+  serial: string;
+  sensor: "accelerometer";
+  desired: {
+    odr_index: AccelerometerOdrIndex;
+    range: AccelerometerRange;
+    hpf_corner: number;
+  };
+  applied: {
+    odr_index: AccelerometerOdrIndex | null;
+    range: AccelerometerRange | null;
+    hpf_corner: number | null;
+  };
+  current_state: NodeState;
+  pending_seq: number | null;
+  applied_seq: number | null;
+  sync_status: ConfigSyncStatus;
+  acked_at?: string | null;
+};
+
+export type NodeControlBody = {
+  cmd: "start" | "stop" | "init" | "reset";
+};
+
+export type NodeControlResponse = {
+  ok: boolean;
+  node_id: number;
+  serial: string;
+  cmd: "start" | "stop" | "init" | "reset";
+  status: string;
+};
+
+export function applyAccelerometerConfig(
+  nodeId: number,
+  body: ApplyAccelerometerConfigBody,
+  signal?: AbortSignal
+) {
+  return request<ApplyAccelerometerConfigResponse>(
+    `/api/nodes/${nodeId}/config/accelerometer/apply`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    }
+  );
+}
+
+export function sendNodeControl(
+  nodeId: number,
+  body: NodeControlBody,
+  signal?: AbortSignal
+) {
+  return request<NodeControlResponse>(`/api/nodes/${nodeId}/control`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
 }
