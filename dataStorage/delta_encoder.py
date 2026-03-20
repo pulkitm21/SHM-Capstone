@@ -7,6 +7,7 @@ import paho.mqtt.client as mqtt
 import queue
 import threading
 
+from backend.fault_logger import init_fault_db, log_fault_codes
 import zstandard as zstd
 
 ## Addition for ACK
@@ -23,6 +24,8 @@ DATA_DIR = "/mnt/ssd/data"
 STATUS_TOPIC = "wind_turbine/+/status" ## ADDITION FOR ACK
 
 os.makedirs(DATA_DIR, exist_ok=True)
+
+init_fault_db()
 
 # -------------------------------------------------------------------
 # Zstandard compression settings
@@ -473,8 +476,8 @@ def on_connect(client, userdata, flags, reason_code, properties):
 
 def on_message(client, userdata, msg):
     try:
-        if msg.topic.endswith("/status"): ## Handle status messages separately for ACKs and state updates
-            handle_status_message(msg.topic, msg.payload) 
+        if msg.topic.endswith("/status"):  # Handle status messages separately for ACKs and state updates
+            handle_status_message(msg.topic, msg.payload)
             return
 
         if not msg.topic.endswith("/data"):
@@ -483,17 +486,39 @@ def on_message(client, userdata, msg):
         topic_parts = msg.topic.split("/")
         node_id = topic_parts[1]
         register_serial(node_id)
+
         data = json.loads(msg.payload.decode())
 
-        # Normalise all per-sensor timestamps (ms→s, clock-sync check)
+        # ---------------------------------------------------------------
+        # Fault logging
+        # ---------------------------------------------------------------
+        # The ESP32 may include an "f" field with a list of fault codes.
+        # Example: "f": [1, 4]
+        #
+        # We log each code as its own row in faults.db using backend
+        # receive time, since packet field "t" may not be a true UTC time.
+        # ---------------------------------------------------------------
+        fault_codes = data.get("f", [])
+        mqtt_ts = data.get("t")
+
+        if isinstance(fault_codes, list) and fault_codes:
+            if mqtt_ts is None:
+                raise ValueError("Fault packet missing timestamp 't'")
+
+            log_fault_codes(
+                serial_number=node_id,
+                fault_codes=fault_codes,
+                mqtt_ts=mqtt_ts,
+            )
+
+        # Keep your existing timestamp normalization for sensor payloads.
         if not normalise_sensor_timestamps(data, node_id):
-            return  # invalid timestamp — drop whole packet
+            return
 
         data_buffer.put((node_id, data))
-        print(f"Queued data for {node_id} from {msg.topic}")
 
     except Exception as e:
-        print(f"Failed to process MQTT message on {msg.topic}: {e}")
+        print(f"Error processing MQTT message on {msg.topic}: {e}")
 
 
 # -------------------------------------------------------------------

@@ -4,7 +4,7 @@ import type { SensorConfig } from "../../components/SensorConfig/SensorConfig";
 
 export type SensorValue = "accelerometer" | "inclinometer" | "temperature";
 
-export const UI_PREVIEW_MODE = true;
+export const UI_PREVIEW_MODE = false;
 
 export const PREVIEW_NODES: NodeRecord[] = [
   {
