@@ -40,23 +40,19 @@ TS_MS_THRESHOLD = 1e11
 # ── Zstd decompression helper ─────────────────────────────────────
 
 def open_decompressed(filepath: str) -> io.BytesIO:
-    """Return BytesIO of decompressed content. Handles both .zst and plain files."""
-    raw = open(filepath, "rb").read()
+    """
+    Return a BytesIO of the file contents ready for the record decoders.
+
+    .zst  — decompressed from a standard single-frame Zstd file
+            (written by compress_and_replace() at hour boundary).
+    .bin  — returned as-is (current hour file, still being written).
+    """
+    with open(filepath, "rb") as f:
+        raw = f.read()
     if not filepath.endswith(".zst"):
         return io.BytesIO(raw)
-    decompressor = zstd.ZstdDecompressor()
-    buf = bytearray()
-    pos = 0
-    while pos < len(raw):
-        if pos + 4 > len(raw):
-            raise ValueError(f"Truncated chunk header at byte {pos}")
-        (chunk_size,) = struct.unpack_from("<I", raw, pos)
-        pos += 4
-        if pos + chunk_size > len(raw):
-            raise ValueError(f"Chunk claims {chunk_size} bytes but only {len(raw)-pos} remain")
-        buf += decompressor.decompress(raw[pos:pos + chunk_size])
-        pos += chunk_size
-    return io.BytesIO(bytes(buf))
+    dctx = zstd.ZstdDecompressor()
+    return io.BytesIO(dctx.decompress(raw))
 
 def read_bytes(f, n, label=""):
     d = f.read(n)
