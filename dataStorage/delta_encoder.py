@@ -15,6 +15,7 @@ from backend.settings_store import (
     apply_accelerometer_config_ack,
     update_accelerometer_runtime_state,
 )
+import zstandard as zstd
 
 BROKER_IP = "localhost"
 PORT = 1883
@@ -25,6 +26,22 @@ DATA_DIR = "/mnt/ssd/data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
 init_fault_db()
+
+# -------------------------------------------------------------------
+# Zstandard compression settings
+#
+# Records are buffered in memory and flushed to a .zst file either:
+#   a) when the hourly file boundary is crossed, or
+#   b) when the in-memory buffer reaches FLUSH_EVERY_N_RECORDS records.
+#
+# ZSTD_LEVEL  : 1 (fastest) … 22 (smallest).  Level 3 is a good
+#               balance: ~3× smaller than raw binary, negligible CPU.
+# FLUSH_EVERY_N_RECORDS : upper bound on data loss if the process
+#               crashes between flushes.  100 records ≈ 10 s at 10 Hz.
+# -------------------------------------------------------------------
+ZSTD_LEVEL          = 3
+FLUSH_EVERY_N_RECORDS = 100
+_zstd_compressor    = zstd.ZstdCompressor(level=ZSTD_LEVEL)
 
 # -------------------------------------------------------------------
 # Packet format (JSON input):
@@ -141,14 +158,16 @@ def _fresh_state() -> dict:
         "accel":  {"ts_us": 0, "ts_delta_prev": 0, "xyz_prev": [0, 0, 0]},
         "inclin": {"ts_us": 0, "ts_delta_prev": 0, "xyz_prev": [0, 0, 0]},
         "temp":   {"ts_us": 0, "ts_delta_prev": 0, "val_prev": 0},
-        "file_hour": None,
-        "is_first":  True,
+        "file_hour":   None,
+        "is_first":    True,
+        "record_buf":  bytearray(),   # in-memory buffer of raw binary records
+        "buf_count":   0,             # number of records in buffer
     }
 
 
 def get_hourly_filepath(node_id: str) -> tuple[str, str]:
     hour_str = datetime.now().strftime("%Y%m%d_%H")
-    return hour_str, os.path.join(DATA_DIR, f"data_{node_id}_{hour_str}.bin")
+    return hour_str, os.path.join(DATA_DIR, f"data_{node_id}_{hour_str}.zst")
 
 
 # -------------------------------------------------------------------
@@ -319,6 +338,22 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
 # Write record
 # -------------------------------------------------------------------
 
+def _flush_buffer(node_id: str, state: dict, filepath: str):
+    """Compress the in-memory record buffer and append it to the .zst file."""
+    if not state["record_buf"]:
+        return
+    compressed = _zstd_compressor.compress(bytes(state["record_buf"]))
+    with open(filepath, "ab") as f:
+        # Each flush is stored as: chunk_size(uint32 LE) | compressed_bytes
+        # This allows the decoder to read independent chunks sequentially.
+        f.write(struct.pack("<I", len(compressed)))
+        f.write(compressed)
+    flushed = state["buf_count"]
+    state["record_buf"] = bytearray()
+    state["buf_count"]  = 0
+    print(f"[{node_id}] Flushed {flushed} records → {os.path.basename(filepath)}")
+
+
 def write_record(node_id: str, data: dict):
     hour_str, filepath = get_hourly_filepath(node_id)
 
@@ -327,6 +362,11 @@ def write_record(node_id: str, data: dict):
     state = node_state[node_id]
 
     if state["file_hour"] != hour_str:
+        # Hour boundary: flush current buffer to old file, then start fresh
+        if state["file_hour"] is not None:
+            old_filepath = os.path.join(
+                DATA_DIR, f"data_{node_id}_{state['file_hour']}.zst")
+            _flush_buffer(node_id, state, old_filepath)
         state["file_hour"] = hour_str
         state["is_first"]  = True
         print(f"[{node_id}] New hourly file: {filepath}")
@@ -343,8 +383,13 @@ def write_record(node_id: str, data: dict):
     else:
         record = encode_delta_record(data, state)
 
-    with open(filepath, "ab") as f:
-        f.write(record)
+    # Accumulate into in-memory buffer
+    state["record_buf"] += record
+    state["buf_count"]  += 1
+
+    # Flush when buffer reaches threshold
+    if state["buf_count"] >= FLUSH_EVERY_N_RECORDS:
+        _flush_buffer(node_id, state, filepath)
 
 
 # -------------------------------------------------------------------

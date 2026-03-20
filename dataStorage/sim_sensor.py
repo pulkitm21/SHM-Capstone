@@ -38,12 +38,12 @@ import time
 import paho.mqtt.client as mqtt
 
 # ── Defaults ──────────────────────────────────────────────────────
-DEFAULT_BROKER    = "localhost"
+DEFAULT_BROKER    = "192.168.2.2"
 DEFAULT_PORT      = 1883
 DEFAULT_NODES     = ["node1"]
 DEFAULT_ACCEL_HZ  = 10      # accelerometer publish rate
 DEFAULT_SLOW_HZ   = 1       # inclinometer + temperature publish rate
-DEFAULT_ACCEL_SPB = 5       # accel samples per MQTT packet (burst)
+DEFAULT_ACCEL_SPB = 10       # accel samples per MQTT packet (burst)
 
 TOPIC_TEMPLATE = "wind_turbine/{node_id}/data"
 
@@ -143,48 +143,51 @@ class NodePublisher(threading.Thread):
         self._stop_event = threading.Event()
 
         self.accel_interval = 1.0 / accel_hz
-        self.slow_interval  = 1.0 / slow_hz
 
     def stop(self):
         self._stop_event.set()
 
     def run(self):
-        last_slow = 0.0
-        last_accel = 0.0
-        sent = 0
+        # Use accumulating next_tick instead of last_tick = now to prevent
+        # drift: each deadline is scheduled relative to the previous one,
+        # not relative to when the loop body actually finished executing.
+        next_tick = time.perf_counter()
+        sent      = 0
 
         print(f"[{self.node_id}] Publisher started → topic: {self.topic}")
 
         while not self._stop_event.is_set():
-            now    = time.time()
-            packet = {}       # no packet-level "t" — each sensor carries its own timestamp
-            publish = False
+            now_pc = time.perf_counter()
 
-            # High-rate: accelerometer — each sample gets its own timestamp
-            if self.enable_accel and (now - last_accel) >= self.accel_interval:
-                packet["a"] = self.sim.accel_samples(self.spb, self.accel_hz)
-                last_accel  = now
-                publish = True
+            if now_pc >= next_tick:
+                # Advance deadline by exactly one interval regardless of
+                # how late we woke up — keeps long-term rate accurate.
+                next_tick += self.accel_interval
 
-            # Low-rate: inclinometer + temperature — each carries its own timestamp
-            if (now - last_slow) >= self.slow_interval:
+                # Every packet always contains all enabled sensor types.
+                # Each sensor independently timestamps its own reading.
+                packet = {}
+
+                if self.enable_accel:
+                    packet["a"] = self.sim.accel_samples(self.spb, self.accel_hz)
                 if self.enable_inclin:
                     packet["i"] = self.sim.inclin()
                 if self.enable_temp:
                     packet["T"] = self.sim.temperature()
-                last_slow = now
-                publish = True
 
-            if publish:
                 payload = json.dumps(packet)
-                result  = self.client.publish(self.topic, payload, qos=0)
-                sent   += 1
+                self.client.publish(self.topic, payload, qos=0)
+                sent += 1
 
                 if sent <= 3 or sent % 50 == 0:
                     _preview(self.node_id, sent, packet)
 
-            # Sleep until next accel tick (smallest interval)
-            time.sleep(max(0, self.accel_interval - (time.time() - now)))
+            # Sleep for a fraction of the interval so we poll frequently
+            # enough not to miss a deadline, without busy-waiting.
+            # At 10 Hz (interval=0.1 s) this sleeps ~10 ms per poll.
+            sleep_s = min(self.accel_interval * 0.1, next_tick - time.perf_counter())
+            if sleep_s > 0:
+                time.sleep(sleep_s)
 
 
 # ──────────────────────────────────────────────────────────────────
