@@ -10,8 +10,8 @@ import threading
 import zstandard as zstd
 
 ## Addition for ACK
-from backend.node_registry import register_serial, serial_from_topic, get_node_by_serial
-from backend.settings_store import (
+from node_registry import register_serial, serial_from_topic, get_node_by_serial
+from settings_store import (
     apply_accelerometer_config_ack,
     update_accelerometer_runtime_state,
 )
