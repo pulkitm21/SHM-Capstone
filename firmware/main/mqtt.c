@@ -48,6 +48,19 @@ static esp_mqtt_client_handle_t s_mqtt_client = NULL;
 static EventGroupHandle_t s_mqtt_event_group = NULL;
 static bool s_is_connected = false;
 
+/* Command handler registered by the application layer */
+static mqtt_cmd_handler_t s_cmd_handler = NULL;
+
+/* Command topic strings — built at subscribe time from s_serial_no */
+#define CMD_TOPIC_MAX_LEN  80
+static char s_topic_cmd_configure[CMD_TOPIC_MAX_LEN];
+static char s_topic_cmd_control[CMD_TOPIC_MAX_LEN];
+static const char s_topic_cmd_all[] = "wind_turbine/all/cmd/control";
+
+/* Scratch buffer for inbound payloads (command packets are always small) */
+#define CMD_PAYLOAD_MAX_LEN  256
+static char s_cmd_payload_buf[CMD_PAYLOAD_MAX_LEN];
+
 #define JSON_BUFFER_SIZE    4096
 static char *s_json_buffer = NULL;
 
@@ -178,6 +191,41 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             if (s_mqtt_event_group) {
                 xEventGroupSetBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
                 xEventGroupClearBits(s_mqtt_event_group, MQTT_DISCONNECTED_BIT);
+            }
+            /* Re-subscribe to cmd topics after reconnect */
+            if (s_topic_cmd_configure[0] != '\0') {
+                esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd_configure, 0);
+                esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd_control,   0);
+                esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd_all,       0);
+                ESP_LOGI(TAG, "Re-subscribed to cmd topics after reconnect");
+            }
+            break;
+
+        case MQTT_EVENT_DATA:
+            /* Dispatch inbound command messages to the registered handler.
+             * event->topic and event->data are NOT null-terminated. */
+            if (event->topic && event->data && s_cmd_handler) {
+                char topic_buf[CMD_TOPIC_MAX_LEN];
+                int tlen = event->topic_len < (int)(sizeof(topic_buf) - 1)
+                           ? event->topic_len : (int)(sizeof(topic_buf) - 1);
+                memcpy(topic_buf, event->topic, tlen);
+                topic_buf[tlen] = '\0';
+
+                int plen = event->data_len < (CMD_PAYLOAD_MAX_LEN - 1)
+                           ? event->data_len : (CMD_PAYLOAD_MAX_LEN - 1);
+                memcpy(s_cmd_payload_buf, event->data, plen);
+                s_cmd_payload_buf[plen] = '\0';
+
+                /* Strip trailing whitespace / CRLF (Windows mosquitto_pub sends \r\n) */
+                while (plen > 0 &&
+                       (s_cmd_payload_buf[plen-1] == '\r' ||
+                        s_cmd_payload_buf[plen-1] == '\n' ||
+                        s_cmd_payload_buf[plen-1] == ' '))  {
+                    s_cmd_payload_buf[--plen] = '\0';
+                }
+
+                ESP_LOGI(TAG, "CMD on [%s]: %s", topic_buf, s_cmd_payload_buf);
+                s_cmd_handler(topic_buf, s_cmd_payload_buf);
             }
             break;
 
@@ -510,4 +558,92 @@ const char *mqtt_get_topic_data(void)
 const char *mqtt_get_topic_status(void)
 {
     return s_topic_status;
+}
+/******************************************************************************
+ * COMMAND SUBSCRIPTION
+ *****************************************************************************/
+
+void mqtt_set_cmd_handler(mqtt_cmd_handler_t handler)
+{
+    s_cmd_handler = handler;
+}
+
+esp_err_t mqtt_subscribe_cmd(void)
+{
+    if (!s_is_connected || s_mqtt_client == NULL) {
+        ESP_LOGE(TAG, "mqtt_subscribe_cmd: not connected");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    snprintf(s_topic_cmd_configure, sizeof(s_topic_cmd_configure),
+             "%s/%s/cmd/configure", MQTT_TOPIC_PREFIX, s_serial_no);
+    snprintf(s_topic_cmd_control,   sizeof(s_topic_cmd_control),
+             "%s/%s/cmd/control",   MQTT_TOPIC_PREFIX, s_serial_no);
+
+    int r1 = esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd_configure, 0);
+    int r2 = esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd_control,   0);
+    int r3 = esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd_all,       0);
+
+    if (r1 < 0 || r2 < 0 || r3 < 0) {
+        ESP_LOGE(TAG, "Subscribe failed (configure=%d control=%d all=%d)", r1, r2, r3);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Subscribed to cmd topics:");
+    ESP_LOGI(TAG, "  %s", s_topic_cmd_configure);
+    ESP_LOGI(TAG, "  %s", s_topic_cmd_control);
+    ESP_LOGI(TAG, "  %s", s_topic_cmd_all);
+    return ESP_OK;
+}
+
+/******************************************************************************
+ * STRUCTURED STATUS PUBLISHER
+ *****************************************************************************/
+
+esp_err_t mqtt_publish_status_json(const char *state_str,
+                                   uint32_t odr_hz,
+                                   uint8_t range,
+                                   uint32_t output_hz,
+                                   bool selftest_ok,
+                                   uint32_t seq_ack,
+                                   const char *error_msg)
+{
+    if (!s_is_connected) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char buf[256];
+    int offset = 0;
+    int range_g = (range == 1) ? 2 : (range == 2) ? 4 : 8;
+
+    offset += snprintf(buf + offset, sizeof(buf) - offset,
+                       "{\"state\":\"%s\","
+                       "\"odr_hz\":%lu,"
+                       "\"range_g\":%d,"
+                       "\"output_hz\":%lu,"
+                       "\"selftest_ok\":%s,"
+                       "\"seq_ack\":%lu",
+                       state_str ? state_str : "unknown",
+                       (unsigned long)odr_hz,
+                       range_g,
+                       (unsigned long)output_hz,
+                       selftest_ok ? "true" : "false",
+                       (unsigned long)seq_ack);
+
+    if (error_msg && error_msg[0] != '\0') {
+        offset += snprintf(buf + offset, sizeof(buf) - offset,
+                           ",\"error\":\"%s\"", error_msg);
+    }
+
+    offset += snprintf(buf + offset, sizeof(buf) - offset, "}");
+
+    int msg_id = esp_mqtt_client_publish(s_mqtt_client, s_topic_status,
+                                         buf, offset, MQTT_PUBLISH_QOS, 0);
+    if (msg_id < 0) {
+        ESP_LOGE(TAG, "Failed to publish status JSON");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Status → %s: %s", s_topic_status, buf);
+    return ESP_OK;
 }

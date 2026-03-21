@@ -124,6 +124,21 @@ esp_err_t adxl355_set_range(uint8_t range);
  */
 esp_err_t adxl355_read_temperature(float *temperature_c);
 
+/**
+ * @brief Low-level register read (used by node_config for reconfiguration).
+ * @param reg    Register address
+ * @param data   Output buffer
+ * @param len    Number of bytes to read
+ */
+esp_err_t adxl355_read_reg_pub(uint8_t reg, uint8_t *data, size_t len);
+
+/**
+ * @brief Low-level register write (used by node_config for reconfiguration).
+ * @param reg    Register address
+ * @param value  Byte to write
+ */
+esp_err_t adxl355_write_reg_pub(uint8_t reg, uint8_t value);
+
 #ifdef __cplusplus
 }
 #endif

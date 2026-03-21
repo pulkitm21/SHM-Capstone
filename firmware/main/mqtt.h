@@ -188,6 +188,49 @@ esp_err_t mqtt_publish(const char *topic, const char *data, int len);
 esp_err_t mqtt_deinit(void);
 
 /**
+ * @brief Subscribe to command topics for this node.
+ *
+ * Subscribes to:
+ *   wind_turbine/<node_id>/cmd/configure
+ *   wind_turbine/<node_id>/cmd/control
+ *   wind_turbine/all/cmd/control
+ *
+ * Must be called after mqtt_wait_for_connection() succeeds.
+ * Re-subscribed automatically on reconnect.
+ *
+ * @return ESP_OK on success.
+ */
+esp_err_t mqtt_subscribe_cmd(void);
+
+/**
+ * @brief Callback type invoked when a command packet is received.
+ * @param topic   Null-terminated topic string
+ * @param payload Null-terminated JSON payload
+ */
+typedef void (*mqtt_cmd_handler_t)(const char *topic, const char *payload);
+
+/**
+ * @brief Register the function to call when a cmd packet arrives.
+ * Must be registered before mqtt_subscribe_cmd().
+ */
+void mqtt_set_cmd_handler(mqtt_cmd_handler_t handler);
+
+/**
+ * @brief Publish a structured status JSON to the status topic.
+ *
+ * Builds:
+ *   {"state":"recording","odr_hz":1000,"range_g":2,"output_hz":200,
+ *    "selftest_ok":true,"seq_ack":42}
+ */
+esp_err_t mqtt_publish_status_json(const char *state_str,
+                                   uint32_t odr_hz,
+                                   uint8_t range,
+                                   uint32_t output_hz,
+                                   bool selftest_ok,
+                                   uint32_t seq_ack,
+                                   const char *error_msg);
+
+/**
  * @brief Return the serial number used for this node's identity.
  *        Either the NVS-provisioned value (e.g. "WT01-N03") or the
  *        MAC-based fallback (e.g. "MAC-AABBCCDDEEFF") if not provisioned.

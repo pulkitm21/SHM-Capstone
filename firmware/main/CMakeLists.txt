@@ -10,6 +10,8 @@ idf_component_register(
          adxl355.c
          scl3300.c
          mqtt.c
+         node_config.c
+         fault_log.c
          data_processing_and_mqtt_task.c
          sensor_task.c
     INCLUDE_DIRS "."
