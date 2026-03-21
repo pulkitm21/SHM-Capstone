@@ -11,8 +11,7 @@ Packet format (JSON over MQTT):
       "i": [t,roll,pitch,yaw], # Inclinometer  — single reading with timestamp
       "T": [t,val]             # Temperature   — value with timestamp
   }
-  Each sensor carries its own Unix timestamp (seconds) so sensors
-  sampled at different rates have independent time axes.
+  Timestamps are ISO 8601 UTC strings: "2026-03-21T21:26:57.519349Z"
 
 Usage:
     # Single node, all sensors, default rate
@@ -46,6 +45,12 @@ DEFAULT_SLOW_HZ   = 1       # inclinometer + temperature publish rate
 DEFAULT_ACCEL_SPB = 10       # accel samples per MQTT packet (burst)
 
 TOPIC_TEMPLATE = "wind_turbine/{node_id}/data"
+
+
+def _iso(ts: float) -> str:
+    """Format a Unix timestamp as ISO 8601 UTC string with microseconds."""
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -91,27 +96,27 @@ class SensorSimulator:
             x = round(g_x + vib * 0.6 + noise(), 4)
             y = round(       vib * 0.4 + noise(), 4)
             z = round(g_z  + vib * 0.1 + noise(), 4)
-            samples.append([t, x, y, z])   # ← timestamp first
+            samples.append([_iso(t), x, y, z])   # ← ISO 8601 timestamp first
         return samples
 
     def inclin(self) -> list[float]:
         """Return [t, roll, pitch, yaw] with the current timestamp."""
-        t       = round(time.time(), 6)
+        t       = time.time()
         elapsed = self._elapsed()
         roll  = round(1.5  * math.sin(2 * math.pi * self.sway_freq * elapsed)
                       + self.rng.gauss(0, 0.01), 4)
         pitch = round(0.8  * math.cos(2 * math.pi * self.sway_freq * elapsed * 0.9)
                       + self.rng.gauss(0, 0.01), 4)
         yaw   = round(0.05 * elapsed % 360 + self.rng.gauss(0, 0.005), 4)  # slow drift
-        return [t, roll, pitch, yaw]   # ← timestamp first
+        return [_iso(t), roll, pitch, yaw]   # ← ISO 8601 timestamp first
 
     def temperature(self) -> list:
         """Return [t, val] with the current timestamp."""
-        t       = round(time.time(), 6)
+        t       = time.time()
         elapsed = self._elapsed()
         drift   = 0.3 * math.sin(2 * math.pi * elapsed / 3600.0)  # 1-hour cycle
         val     = round(self.temp_base + drift + self.rng.gauss(0, 0.05), 2)
-        return [t, val]   # ← timestamp first
+        return [_iso(t), val]   # ← ISO 8601 timestamp first
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -196,26 +201,27 @@ class NodePublisher(threading.Thread):
 
 def _preview(node_id: str, seq: int, packet: dict):
     # Use the timestamp from the first available sensor for the log line
-    ts = None
+    iso_str = None
     if "a" in packet and packet["a"]:
-        ts = packet["a"][-1][0]
+        iso_str = packet["a"][-1][0]
     elif "i" in packet:
-        ts = packet["i"][0]
+        iso_str = packet["i"][0]
     elif "T" in packet:
-        ts = packet["T"][0]
+        iso_str = packet["T"][0]
 
-    dt  = time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "?"
+    # Extract HH:MM:SS from ISO string for compact display
+    dt = iso_str[11:19] if iso_str else "?"
     msg = f"[{node_id}] #{seq:>5}  ({dt})"
 
     if "a" in packet:
         n    = len(packet["a"])
         last = packet["a"][-1]   # [t, x, y, z]
-        msg += f"  accel[{n}] t={last[0]:.3f} last=({last[1]:+.3f},{last[2]:+.3f},{last[3]:+.3f})g"
+        msg += f"  accel[{n}] t={last[0][11:23]} last=({last[1]:+.3f},{last[2]:+.3f},{last[3]:+.3f})g"
     if "i" in packet:
         i = packet["i"]          # [t, roll, pitch, yaw]
-        msg += f"  inclin t={i[0]:.3f} ({i[1]:+.3f},{i[2]:+.3f},{i[3]:+.3f})°"
+        msg += f"  inclin t={i[0][11:23]} ({i[1]:+.3f},{i[2]:+.3f},{i[3]:+.3f})°"
     if "T" in packet:
-        msg += f"  temp t={packet['T'][0]:.3f} {packet['T'][1]:.2f}°C"
+        msg += f"  temp t={packet['T'][0][11:23]} {packet['T'][1]:.2f}°C"
     print(msg)
 
 

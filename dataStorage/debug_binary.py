@@ -33,8 +33,6 @@ MAX_TS_JUMP_S   = 10.0
 DOD_WARN_THRESH = 2**30
 TS_MIN          = 1_577_836_800.0
 TS_MAX          = 4_102_444_800.0
-TS_MS_THRESHOLD = 1e11
-
 
 
 # ── Zstd decompression helper ─────────────────────────────────────
@@ -413,9 +411,9 @@ def pass3_anomalies(issues_p1, issues_p2):
     if any("milliseconds not seconds" in m for _,_,m in all_issues):
         print("""
   ⚠ Sensor sending milliseconds instead of seconds:
-      e.g. 1704084600000 ms  →  correct is 1704084600 s.
-      delta_encoder.py auto-converts via normalise_timestamp().
-      Long-term: fix sensor firmware to send Unix seconds.
+      This file predates the ISO 8601 timestamp format change.
+      Current firmware sends "2026-03-21T21:26:57.519349Z" strings
+      which delta_encoder.py parses via parse_iso_timestamp().
 """)
 
     if any("out of plausible range" in m for _,_,m in all_issues):

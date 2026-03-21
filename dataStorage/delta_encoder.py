@@ -7,7 +7,7 @@ import paho.mqtt.client as mqtt
 import queue
 import threading
 
-from backend.fault_logger import init_fault_db, log_fault_codes
+from fault_logger import init_fault_db, log_fault_codes
 import zstandard as zstd
 
 ## Addition for ACK
@@ -16,6 +16,8 @@ from settings_store import (
     apply_accelerometer_config_ack,
     update_accelerometer_runtime_state,
 )
+
+from raw_backup import write_raw, close_all as raw_backup_close_all
 
 BROKER_IP = "localhost"
 PORT = 1883
@@ -43,7 +45,10 @@ ZSTD_LEVEL = 3
 # -------------------------------------------------------------------
 # Packet format (JSON input):
 #   {"a": [[t,x,y,z], ...], "i": [t,x,y,z], "T": [t,val]}
-#   Each sensor carries its own Unix timestamp (seconds or ms).
+#   Each sensor carries its own ISO 8601 UTC timestamp string,
+#   e.g. "2026-03-21T21:26:57.519349Z".
+#   parse_iso_timestamp() converts these to Unix seconds (float)
+#   before any further processing.
 #
 # Binary format — each sensor tracks its OWN timestamps independently:
 #
@@ -74,8 +79,6 @@ INT16_MAX     = 32767
 
 TS_MIN          = 1_577_836_800.0   # 2020-01-01
 TS_MAX          = 4_102_444_800.0   # 2100-01-01
-TS_MS_THRESHOLD = 1e11              # above this → must be milliseconds
-
 _clock_warn_interval              = 10.0
 _last_clock_warn: dict[str, float] = {}
 
@@ -84,13 +87,29 @@ _last_clock_warn: dict[str, float] = {}
 # Timestamp helpers
 # -------------------------------------------------------------------
 
-def normalise_timestamp(raw_t: float, node_id: str) -> float | None:
+def parse_iso_timestamp(raw_t: str, node_id: str) -> float | None:
     """
-    Convert ms→s if needed; return None (and warn) if clock not synced.
+    Parse an ISO 8601 UTC timestamp string to Unix seconds (float).
+    Accepts the format produced by the sensor firmware:
+        "2026-03-21T21:26:57.519349Z"
+    Returns None (and emits a rate-limited warning) if:
+      - the string cannot be parsed, or
+      - the resulting Unix time is outside TS_MIN … TS_MAX
+        (indicates the node clock was not synced at boot).
     """
-    ts = raw_t
-    if ts > TS_MS_THRESHOLD:
-        ts /= 1000.0
+    try:
+        # Strip trailing Z and parse as UTC
+        ts = datetime.strptime(
+            raw_t.rstrip("Z"), "%Y-%m-%dT%H:%M:%S.%f"
+        ).replace(tzinfo=__import__("datetime").timezone.utc).timestamp()
+    except (ValueError, AttributeError):
+        now  = time.monotonic()
+        last = _last_clock_warn.get(node_id, 0.0)
+        if now - last >= _clock_warn_interval:
+            _last_clock_warn[node_id] = now
+            print(f"[{node_id}] WARNING: cannot parse timestamp {raw_t!r} — packet dropped.")
+        return None
+
     if not (TS_MIN <= ts <= TS_MAX):
         now  = time.monotonic()
         last = _last_clock_warn.get(node_id, 0.0)
@@ -100,33 +119,35 @@ def normalise_timestamp(raw_t: float, node_id: str) -> float | None:
                 date_str = datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d")
             except Exception:
                 date_str = "?"
-            print(f"[{node_id}] WARNING: implausible timestamp {raw_t} "
-                  f"(normalised={ts:.0f} s, {date_str}) — clock not synced, packet dropped.")
+            print(f"[{node_id}] WARNING: implausible timestamp {raw_t!r} "
+                  f"({date_str}) — clock not synced, packet dropped.")
         return None
+
     return ts
 
 
 def normalise_sensor_timestamps(data: dict, node_id: str) -> bool:
     """
-    Normalise per-sensor timestamps in-place.
+    Parse ISO 8601 timestamp strings in-place to Unix seconds (float).
     Returns False if ANY sensor timestamp is invalid (whole packet dropped).
     Format: a=[[t,x,y,z],...],  i=[t,x,y,z],  T=[t,val]
+    where t is "YYYY-MM-DDTHH:MM:SS.ffffffZ".
     """
     if "a" in data:
         for sample in data["a"]:
-            ts = normalise_timestamp(float(sample[0]), node_id)
+            ts = parse_iso_timestamp(str(sample[0]), node_id)
             if ts is None:
                 return False
             sample[0] = ts
 
     if "i" in data:
-        ts = normalise_timestamp(float(data["i"][0]), node_id)
+        ts = parse_iso_timestamp(str(data["i"][0]), node_id)
         if ts is None:
             return False
         data["i"][0] = ts
 
     if "T" in data:
-        ts = normalise_timestamp(float(data["T"][0]), node_id)
+        ts = parse_iso_timestamp(str(data["T"][0]), node_id)
         if ts is None:
             return False
         data["T"][0] = ts
@@ -487,6 +508,11 @@ def on_message(client, userdata, msg):
         node_id = topic_parts[1]
         register_serial(node_id)
 
+        # ── Raw backup — written FIRST, before any validation or processing ──
+        # Captures exactly what the sensor sent, including packets that will
+        # be dropped below (bad clock, missing fields, etc).
+        write_raw(node_id, msg.payload)  # raw_backup: verbatim, before processing
+
         data = json.loads(msg.payload.decode())
 
         # ---------------------------------------------------------------
@@ -530,4 +556,7 @@ client.on_connect = on_connect
 client.on_message = on_message
 
 client.connect(BROKER_IP, PORT, 60)
-client.loop_forever()
+try:
+    client.loop_forever()
+finally:
+    raw_backup_close_all()
