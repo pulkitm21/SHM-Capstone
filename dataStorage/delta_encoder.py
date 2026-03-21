@@ -7,7 +7,7 @@ import paho.mqtt.client as mqtt
 import queue
 import threading
 
-from fault_logger import init_fault_db, log_fault_codes
+#from fault_logger import init_fault_db, log_fault_codes
 import zstandard as zstd
 
 ## Addition for ACK
@@ -27,7 +27,7 @@ STATUS_TOPIC = "wind_turbine/+/status" ## ADDITION FOR ACK
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-init_fault_db()
+#init_fault_db()
 
 # -------------------------------------------------------------------
 # Zstandard compression settings
@@ -70,8 +70,8 @@ ZSTD_LEVEL = 3
 # -------------------------------------------------------------------
 
 TEMP_SCALE    = 100        # 0.01 °C  → int16
-ACCEL_SCALE   = 1000       # 0.001 g  → int16
-INCLIN_SCALE  = 1000       # 0.001 °  → int16
+ACCEL_SCALE   = 10000      # 0.0001 g → int16
+INCLIN_SCALE  = 10000      # 0.0001 ° → int16
 TS_SCALE      = 1_000_000  # seconds  → µs
 
 MAX_DELTA_S   = 60.0       # force ABSOLUTE if sensor timestamp gap > this
@@ -361,9 +361,12 @@ def compress_and_replace(node_id: str, bin_path: str):
     """
     zst_path = bin_path[:-4] + ".zst"   # strip ".bin", add ".zst"
     try:
-        cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
+        # write_size=True embeds the content size in the frame header so
+        # decompressors can use dctx.decompress() without needing stream_reader.
+        file_size = os.path.getsize(bin_path)
+        cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL, write_content_size=True)
         with open(bin_path, "rb") as f_in, open(zst_path, "wb") as f_out:
-            cctx.copy_stream(f_in, f_out)
+            cctx.copy_stream(f_in, f_out, size=file_size)
         original_size   = os.path.getsize(bin_path)
         compressed_size = os.path.getsize(zst_path)
         ratio = compressed_size / original_size * 100 if original_size else 0
@@ -531,11 +534,11 @@ def on_message(client, userdata, msg):
             if mqtt_ts is None:
                 raise ValueError("Fault packet missing timestamp 't'")
 
-            log_fault_codes(
+            #log_fault_codes(
                 serial_number=node_id,
                 fault_codes=fault_codes,
                 mqtt_ts=mqtt_ts,
-            )
+            #)
 
         # Keep your existing timestamp normalization for sensor payloads.
         if not normalise_sensor_timestamps(data, node_id):

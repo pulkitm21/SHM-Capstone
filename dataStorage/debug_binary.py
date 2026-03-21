@@ -20,8 +20,8 @@ import zstandard as zstd
 from datetime import datetime, timezone
 
 TEMP_SCALE    = 100
-ACCEL_SCALE   = 1000
-INCLIN_SCALE  = 1000
+ACCEL_SCALE   = 10000
+INCLIN_SCALE  = 10000
 TS_SCALE      = 1_000_000
 
 FLAG_ACCEL  = 0x01
@@ -29,7 +29,13 @@ FLAG_INCLIN = 0x02
 FLAG_TEMP   = 0x04
 SENTINEL    = 0xFF
 
-MAX_TS_JUMP_S   = 10.0
+# Per-sensor inter-packet jump thresholds (seconds).
+# Must be >= the encoder's MAX_DELTA_S (60 s) to avoid false positives
+# on slow sensors (e.g. temperature sampled once per minute).
+# Set tighter for accel/inclin since those are high-rate sensors.
+MAX_TS_JUMP_ACCEL  = 10.0   # 10 Hz → expect ~0.1 s, warn if > 10 s
+MAX_TS_JUMP_INCLIN = 10.0   # same rate as accel in current firmware
+MAX_TS_JUMP_TEMP   = 120.0  # sampled ~once/min; warn only if > 2 min gap
 DOD_WARN_THRESH = 2**30
 TS_MIN          = 1_577_836_800.0
 TS_MAX          = 4_102_444_800.0
@@ -44,11 +50,24 @@ def open_decompressed(filepath: str) -> io.BytesIO:
     .zst  — decompressed from a standard single-frame Zstd file
             (written by compress_and_replace() at hour boundary).
     .bin  — returned as-is (current hour file, still being written).
+
+    Uses stream_reader() instead of decompress() so that files compressed
+    without a content-size header (the default for copy_stream) are handled
+    correctly.
     """
     with open(filepath, "rb") as f:
         raw = f.read()
     if not filepath.endswith(".zst"):
         return io.BytesIO(raw)
+    dctx = zstd.ZstdDecompressor()
+    buf  = bytearray()
+    with dctx.stream_reader(io.BytesIO(raw)) as reader:
+        while True:
+            chunk = reader.read(65536)
+            if not chunk:
+                break
+            buf += chunk
+    return io.BytesIO(bytes(buf))
     dctx = zstd.ZstdDecompressor()
     return io.BytesIO(dctx.decompress(raw))
 
@@ -83,11 +102,7 @@ def _date_str(ts_s):
 
 def _check_ts(ts_us, rec_idx, label, issues):
     ts_s = ts_us / TS_SCALE
-    if ts_s > TS_MS_THRESHOLD:
-        issues.append((rec_idx, label,
-            f"Timestamp is milliseconds not seconds: {ts_us} µs → "
-            f"{ts_s/1000:.3f} s ({_date_str(ts_s/1000)})"))
-    elif not (TS_MIN <= ts_s <= TS_MAX):
+    if not (TS_MIN <= ts_s <= TS_MAX):
         issues.append((rec_idx, label,
             f"Timestamp out of plausible range: {ts_s:.0f} s ({_date_str(ts_s)}) "
             f"— likely clock-not-synced"))
@@ -129,7 +144,7 @@ def pass1_structural(filepath, focus_record=None):
                             if show:
                                 ts_s = ts_us / TS_SCALE
                                 print(f"  │    [{i}] ts={ts_us}µs ({ts_str(ts_s)})  "
-                                      f"x={x/ACCEL_SCALE:+.3f}  y={y/ACCEL_SCALE:+.3f}  z={z/ACCEL_SCALE:+.3f} g")
+                                      f"x={x/ACCEL_SCALE:+.4f}  y={y/ACCEL_SCALE:+.4f}  z={z/ACCEL_SCALE:+.4f} g")
 
                     if header & FLAG_INCLIN:
                         (ts_us,) = read_fmt(f, "<q", "inclin ts")
@@ -138,7 +153,7 @@ def pass1_structural(filepath, focus_record=None):
                         if show:
                             ts_s = ts_us / TS_SCALE
                             print(f"  │  inclin ts={ts_us}µs ({ts_str(ts_s)})  "
-                                  f"r={r/INCLIN_SCALE:+.3f}  p={p/INCLIN_SCALE:+.3f}  y={y/INCLIN_SCALE:+.3f} °")
+                                  f"r={r/INCLIN_SCALE:+.4f}  p={p/INCLIN_SCALE:+.4f}  y={y/INCLIN_SCALE:+.4f} °")
 
                     if header & FLAG_TEMP:
                         (ts_us,) = read_fmt(f, "<q", "temp ts")
@@ -166,7 +181,7 @@ def pass1_structural(filepath, focus_record=None):
                                 issues.append((idx, "DELTA/accel", f"dod_ts={dod} near int32 overflow"))
                             if show:
                                 print(f"  │    [{i}] dod_ts={dod}µs  "
-                                      f"Δx={dx/ACCEL_SCALE:+.3f}  Δy={dy/ACCEL_SCALE:+.3f}  Δz={dz/ACCEL_SCALE:+.3f} g")
+                                      f"Δx={dx/ACCEL_SCALE:+.4f}  Δy={dy/ACCEL_SCALE:+.4f}  Δz={dz/ACCEL_SCALE:+.4f} g")
                                 if abs(dod) > DOD_WARN_THRESH:
                                     print(f"  │        ⚠ dod_ts near int32 overflow")
 
@@ -180,7 +195,7 @@ def pass1_structural(filepath, focus_record=None):
                                 issues.append((idx, "DELTA/inclin", f"{name} hit int16 max — likely clipped"))
                         if show:
                             print(f"  │  inclin dod_ts={dod}µs  "
-                                  f"Δr={dr/INCLIN_SCALE:+.3f}  Δp={dp/INCLIN_SCALE:+.3f}  Δy={dy/INCLIN_SCALE:+.3f} °")
+                                  f"Δr={dr/INCLIN_SCALE:+.4f}  Δp={dp/INCLIN_SCALE:+.4f}  Δy={dy/INCLIN_SCALE:+.4f} °")
 
                     if header & FLAG_TEMP:
                         (dod,) = read_fmt(f, "<i", "temp dod_ts")
@@ -229,8 +244,8 @@ def pass2_delta_trace(filepath, focus_record=None):
     }
     issues = []
 
-    def fmt_a(v): return f"{v/ACCEL_SCALE:+.3f}"
-    def fmt_i(v): return f"{v/INCLIN_SCALE:+.3f}"
+    def fmt_a(v): return f"{v/ACCEL_SCALE:+.4f}"
+    def fmt_i(v): return f"{v/INCLIN_SCALE:+.4f}"
     def fmt_t(v): return f"{v/TEMP_SCALE:.2f}"
 
     def _abs_ts(f, ss, label, is_first_sample=False):
@@ -251,9 +266,16 @@ def pass2_delta_trace(filepath, focus_record=None):
         # previous packet — not the last sample — to avoid false negatives caused
         # by back-spacing (e.g. accel[0].ts = now - (n-1)*dt is always behind
         # accel[n-1].ts of the previous packet by design, not a real anomaly).
+        # Pick threshold based on which sensor this label belongs to
+        if "temp" in label.lower():
+            _jump_thresh = MAX_TS_JUMP_TEMP
+        elif "inclin" in label.lower():
+            _jump_thresh = MAX_TS_JUMP_INCLIN
+        else:
+            _jump_thresh = MAX_TS_JUMP_ACCEL
         if is_first_sample and ss["first_ts_us"] is not None:
             jump_s = (ts_us - ss["first_ts_us"]) / TS_SCALE
-            if abs(jump_s) > MAX_TS_JUMP_S or jump_s < 0:
+            if abs(jump_s) > _jump_thresh or jump_s < 0:
                 msg = f"{label} jump {jump_s:+.3f} s (first-to-first)"
                 issues.append((rec_idx, "DELTA", msg))
                 if show: print(f"    ⚠ {msg}")
@@ -261,7 +283,7 @@ def pass2_delta_trace(filepath, focus_record=None):
             # Within a burst: each sample should be a small positive step
             prev_ts = ss["ts_us"]
             jump_s  = (ts_us - prev_ts) / TS_SCALE
-            if jump_s < 0 or jump_s > MAX_TS_JUMP_S:
+            if jump_s < 0 or jump_s > _jump_thresh:
                 msg = f"{label} within-burst jump {jump_s:+.3f} s"
                 issues.append((rec_idx, "DELTA", msg))
                 if show: print(f"    ⚠ {msg}")
@@ -441,8 +463,11 @@ def pass3_anomalies(issues_p1, issues_p2):
     if any("jump" in m for _,_,m in all_issues):
         print("""
   ⚠ Timestamp jump detected (per-sensor):
+      Thresholds: accel/inclin > 10 s, temp > 120 s.
       Possible causes: NTP step, MQTT QoS-0 reorder, broker restart,
-      or gap before the overflow fix was applied.
+      sensor sampling rate change, or gap before the overflow fix.
+      If temp is flagging: check MAX_TS_JUMP_TEMP matches actual
+      temperature sampling interval.
 """)
 
 

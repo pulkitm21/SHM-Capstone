@@ -25,8 +25,8 @@ import zstandard as zstd
 from datetime import datetime, timezone
 
 TEMP_SCALE    = 100
-ACCEL_SCALE   = 1000
-INCLIN_SCALE  = 1000
+ACCEL_SCALE   = 10000
+INCLIN_SCALE  = 10000
 TS_SCALE      = 1_000_000
 
 FLAG_ACCEL  = 0x01
@@ -45,11 +45,24 @@ def open_decompressed(filepath: str) -> io.BytesIO:
     .zst  — decompressed from a standard single-frame Zstd file
             (written by compress_and_replace() at hour boundary).
     .bin  — returned as-is (current hour file, still being written).
+
+    Uses stream_reader() instead of decompress() so that files compressed
+    without a content-size header (the default for copy_stream) are handled
+    correctly.
     """
     with open(filepath, "rb") as f:
         raw = f.read()
     if not filepath.endswith(".zst"):
         return io.BytesIO(raw)
+    dctx = zstd.ZstdDecompressor()
+    buf  = bytearray()
+    with dctx.stream_reader(io.BytesIO(raw)) as reader:
+        while True:
+            chunk = reader.read(65536)
+            if not chunk:
+                break
+            buf += chunk
+    return io.BytesIO(bytes(buf))
     dctx = zstd.ZstdDecompressor()
     return io.BytesIO(dctx.decompress(raw))
 
@@ -223,11 +236,11 @@ def _print_record(rec):
     if rec["accel_samples"]:
         for i, (ts, x, y, z) in enumerate(rec["accel_samples"]):
             print(f"  Accel[{i}]  ts={ts:.6f} ({ts_to_str(ts)})  "
-                  f"x={x:+.3f}  y={y:+.3f}  z={z:+.3f} g")
+                  f"x={x:+.4f}  y={y:+.4f}  z={z:+.4f} g")
     if rec["inclin"]:
         ts, r, p, y = rec["inclin"]
         print(f"  Inclin    ts={ts:.6f} ({ts_to_str(ts)})  "
-              f"roll={r:+.3f}  pitch={p:+.3f}  yaw={y:+.3f} °")
+              f"roll={r:+.4f}  pitch={p:+.4f}  yaw={y:+.4f} °")
     if rec["temp"]:
         ts, v = rec["temp"]
         print(f"  Temp      ts={ts:.6f} ({ts_to_str(ts)})  {v:.2f} °C")
@@ -252,18 +265,18 @@ def print_summary(records, filepath):
         ts = [s[0] for s in all_accel]
         print(f"  Accel samples : {len(all_accel)}")
         print(f"    time span   : {ts_to_str(min(ts))}  →  {ts_to_str(max(ts))}")
-        print(f"    X [{min(xs):+.3f}, {max(xs):+.3f}] g")
-        print(f"    Y [{min(ys):+.3f}, {max(ys):+.3f}] g")
-        print(f"    Z [{min(zs):+.3f}, {max(zs):+.3f}] g")
+        print(f"    X [{min(xs):+.4f}, {max(xs):+.4f}] g")
+        print(f"    Y [{min(ys):+.4f}, {max(ys):+.4f}] g")
+        print(f"    Z [{min(zs):+.4f}, {max(zs):+.4f}] g")
 
     if all_inclin:
         rs=[v[1] for v in all_inclin]; ps=[v[2] for v in all_inclin]; ys=[v[3] for v in all_inclin]
         ts=[v[0] for v in all_inclin]
         print(f"  Inclin samples: {len(all_inclin)}")
         print(f"    time span   : {ts_to_str(min(ts))}  →  {ts_to_str(max(ts))}")
-        print(f"    roll  [{min(rs):+.3f}, {max(rs):+.3f}] °")
-        print(f"    pitch [{min(ps):+.3f}, {max(ps):+.3f}] °")
-        print(f"    yaw   [{min(ys):+.3f}, {max(ys):+.3f}] °")
+        print(f"    roll  [{min(rs):+.4f}, {max(rs):+.4f}] °")
+        print(f"    pitch [{min(ps):+.4f}, {max(ps):+.4f}] °")
+        print(f"    yaw   [{min(ys):+.4f}, {max(ys):+.4f}] °")
 
     if all_temp:
         vs=[v[1] for v in all_temp]; ts=[v[0] for v in all_temp]
