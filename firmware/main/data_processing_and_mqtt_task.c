@@ -155,6 +155,7 @@ static void data_processing_task(void *pvParameters)
                                  - TEMP_READ_INTERVAL_MS;
     float current_temp  = 0.0f;
     bool  temp_valid    = false;
+    char  current_temp_ts[MQTT_TS_LEN] = {0};  // wall-clock snapshot at poll time
 
     // -------------------------------------------------------------------------
     // Inclinometer state - STICKY
@@ -215,6 +216,7 @@ static void data_processing_task(void *pvParameters)
             if (err == ESP_OK) {
                 current_temp = temp_celsius;
                 temp_valid   = true;   // sticky - stays true from here on
+                format_ts(current_temp_ts, get_tick_count()); // snapshot wall time now
             } else {
                 // Only invalidate on an active failure, not on "not polled yet"
                 temp_valid = false;
@@ -333,9 +335,7 @@ static void data_processing_task(void *pvParameters)
                         packet.temp_valid = temp_valid;
                         if (temp_valid) {
                             packet.temperature = current_temp;
-                            // Temperature is polled via I2C at 1 Hz — use current
-                            // wall time as its timestamp since it has no ISR tick
-                            format_ts(packet.temp_ts, 0);
+                            memcpy(packet.temp_ts, current_temp_ts, MQTT_TS_LEN);
                         }
 
                         // ---------------------------------------------------------

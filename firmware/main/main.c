@@ -574,6 +574,27 @@ void app_main(void)
     }
     ESP_LOGI(TAG, "");
 
+    // Wait for SNTP first sync before starting the ISR so that every sample
+    // gets a real ISO-8601 timestamp from the very first packet.
+    // Timeout after 10 s — if the Pi is unreachable we still start acquisition
+    // and fall back to tick-relative timestamps rather than blocking forever.
+    if (sntp_ok) {
+        ESP_LOGI(TAG, "--- Waiting for first SNTP sync ---");
+        const int SNTP_WAIT_TIMEOUT_MS = 10000;
+        const int SNTP_WAIT_STEP_MS    = 100;
+        int waited_ms = 0;
+        while (!sntp_sync_is_valid() && waited_ms < SNTP_WAIT_TIMEOUT_MS) {
+            vTaskDelay(pdMS_TO_TICKS(SNTP_WAIT_STEP_MS));
+            waited_ms += SNTP_WAIT_STEP_MS;
+        }
+        if (sntp_sync_is_valid()) {
+            ESP_LOGI(TAG, "SNTP synced after %d ms — starting ISR with UTC timestamps", waited_ms);
+        } else {
+            ESP_LOGW(TAG, "SNTP sync timeout after %d ms — starting ISR with tick-relative timestamps", waited_ms);
+        }
+        ESP_LOGI(TAG, "");
+    }
+
     if (init_acquisition(temp_sensor_available) != ESP_OK) {
         handle_critical_failure("ISR acquisition initialization failed");
     }
