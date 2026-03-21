@@ -79,9 +79,12 @@ static const char *TAG = "sensor_task";
  * SCL3300 COMMANDS
  *****************************************************************************/
 
-#define SCL3300_CMD_X           0x040000F7u
-#define SCL3300_CMD_Y           0x080000FDu
-#define SCL3300_CMD_Z           0x0C0000FBu
+// Angle register commands (0x24/0x28/0x2C) — NOT the acceleration registers
+// (0x04/0x08/0x0C). Using the wrong set caused ~33° Z reading when flat
+// because 1g of ACC_Z x (90/16384) x 6000 LSB/g = 32.96 degrees.
+#define SCL3300_CMD_X           0x240000C7u   // READ_ANG_X
+#define SCL3300_CMD_Y           0x280000CDu   // READ_ANG_Y
+#define SCL3300_CMD_Z           0x2C0000CBu   // READ_ANG_Z
 
 /******************************************************************************
  * DATA STRUCTURES

@@ -42,6 +42,10 @@
 #include "ethernet.h"
 #include "mqtt.h"
 #include "data_processing_and_mqtt_task.h"
+#include "sntp_sync.h"
+
+// Fault logging
+#include "fault_log.h"
 
 static const char *TAG = "main";
 
@@ -81,6 +85,50 @@ static void force_spi_cs_high_early(void)
 #endif
 
     vTaskDelay(pdMS_TO_TICKS(2));
+}
+
+/**
+ * @brief Check the reset reason and record appropriate fault codes.
+ *
+ * Must be called at the very top of app_main() before any other
+ * initialization so that boot-time faults are captured in the first
+ * outgoing MQTT packet after the system comes up.
+ */
+static void check_reset_reason(void)
+{
+    esp_reset_reason_t reason = esp_reset_reason();
+
+    switch (reason) {
+        case ESP_RST_POWERON:
+            ESP_LOGI(TAG, "Reset reason: POWER-ON (power was lost and restored)");
+            fault_log_record(FAULT_POWER_LOSS);
+            fault_log_record(FAULT_POWER_RESTORED);
+            break;
+
+        case ESP_RST_WDT:
+            ESP_LOGW(TAG, "Reset reason: WATCHDOG TIMEOUT");
+            fault_log_record(FAULT_WATCHDOG_RESET);
+            break;
+
+        case ESP_RST_SW:
+            ESP_LOGW(TAG, "Reset reason: SOFTWARE RESTART (esp_restart called)");
+            fault_log_record(FAULT_REBOOT_ATTEMPT);
+            break;
+
+        case ESP_RST_BROWNOUT:
+            ESP_LOGW(TAG, "Reset reason: BROWNOUT (power supply instability)");
+            fault_log_record(FAULT_POWER_LOSS);
+            fault_log_record(FAULT_POWER_RESTORED);
+            break;
+
+        case ESP_RST_DEEPSLEEP:
+            ESP_LOGI(TAG, "Reset reason: deep sleep wakeup");
+            break;
+
+        default:
+            ESP_LOGI(TAG, "Reset reason: %d (no fault logged)", (int)reason);
+            break;
+    }
 }
 
 /**
@@ -134,6 +182,7 @@ static void handle_critical_failure(const char *reason)
 
         vTaskDelay(pdMS_TO_TICKS(REBOOT_DELAY_MS));
 
+        fault_log_record(FAULT_REBOOT_ATTEMPT);
         ESP_LOGW(TAG, "Rebooting now...");
         esp_restart();
     }
@@ -286,6 +335,33 @@ static esp_err_t init_network(void)
     return ESP_OK;
 }
 
+static esp_err_t init_sntp(void)
+{
+    ESP_LOGI(TAG, "--- Initializing SNTP ---");
+
+    // sntp_sync_init() requires:
+    //   1. ethernet_wait_for_ip() has returned ESP_OK  (network is up)
+    //   2. mqtt_mdns_init() has been called            (mDNS can resolve hostnames)
+    if (!ethernet_is_connected()) {
+        ESP_LOGW(TAG, "Skipping SNTP init - no network");
+        return ESP_FAIL;
+    }
+
+    esp_err_t ret = sntp_sync_init();
+    if (ret != ESP_OK) {
+        // Non-fatal: without SNTP, timestamps fall back to tick-relative strings.
+        // The system still acquires and publishes sensor data normally.
+        ESP_LOGW(TAG, "SNTP init failed (%s) - timestamps will be tick-relative",
+                 esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "SNTP client started (server: raspberrypi.local, "
+             "interval: %d s)", SNTP_SYNC_POLL_INTERVAL_MS / 1000);
+    ESP_LOGI(TAG, "First sync typically takes 1-3 seconds after network is ready.");
+    return ESP_OK;
+}
+
 static esp_err_t init_mqtt(void)
 {
     ESP_LOGI(TAG, "--- Initializing MQTT ---");
@@ -362,6 +438,7 @@ static esp_err_t init_sensors(bool *temp_available)
         *temp_available = true;
         ESP_LOGI(TAG, "ADT7420 initialized");
     } else {
+        fault_log_record(FAULT_ADT7420_INIT_FAIL);
         ESP_LOGW(TAG, "ADT7420 init failed - continuing without temperature");
     }
 
@@ -373,6 +450,7 @@ static esp_err_t init_sensors(bool *temp_available)
     ESP_LOGI(TAG, "Initializing ADXL355 accelerometer...");
     ret = adxl355_init();
     if (ret != ESP_OK) {
+        fault_log_record(FAULT_ADXL355_INIT_FAIL);
         ESP_LOGE(TAG, "ADXL355 init failed - CRITICAL");
         return ESP_FAIL;
     }
@@ -391,6 +469,7 @@ static esp_err_t init_sensors(bool *temp_available)
     ESP_LOGI(TAG, "Initializing SCL3300 inclinometer...");
     ret = scl3300_init();
     if (ret != ESP_OK) {
+        fault_log_record(FAULT_SCL3300_INIT_FAIL);
         ESP_LOGE(TAG, "SCL3300 init failed - CRITICAL");
         return ESP_FAIL;
     }
@@ -445,6 +524,10 @@ void app_main(void)
 {
     bool temp_sensor_available = false;
 
+    /* Check reset reason FIRST — before any other init — so boot-time
+     * fault codes are captured and sent in the very first MQTT packet. */
+    check_reset_reason();
+
     init_reboot_counter();
 
     print_banner();
@@ -470,6 +553,14 @@ void app_main(void)
         mqtt_ok = (init_mqtt() == ESP_OK);
     } else {
         ESP_LOGW(TAG, "Skipping MQTT init - no network");
+    }
+    ESP_LOGI(TAG, "");
+
+    // SNTP must come after mqtt_mdns_init() (called inside init_mqtt) so that
+    // mDNS is ready to resolve "raspberrypi.local".
+    bool sntp_ok = false;
+    if (network_ok) {
+        sntp_ok = (init_sntp() == ESP_OK);
     }
     ESP_LOGI(TAG, "");
 
@@ -513,6 +604,7 @@ void app_main(void)
     ESP_LOGI(TAG, "  Sensors:  ISR running at 8000 Hz");
     ESP_LOGI(TAG, "  Network:  %s", network_ok ? "Connected" : "OFFLINE (sensor-only mode)");
     ESP_LOGI(TAG, "  MQTT:     %s", mqtt_ok    ? "Connected" : (network_ok ? "Connecting (retrying)..." : "Disabled"));
+    ESP_LOGI(TAG, "  SNTP:     %s", sntp_ok    ? "Started (waiting for first sync)" : (network_ok ? "Failed - tick-relative timestamps" : "Disabled"));
     if (network_ok) {
         esp_netif_ip_info_t ip;
         ethernet_get_ip_info(&ip);

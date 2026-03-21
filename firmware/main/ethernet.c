@@ -9,6 +9,7 @@
  */
 
 #include "ethernet.h"
+#include "fault_log.h"
 
 #include <stdlib.h>
 
@@ -77,6 +78,8 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
         if (s_eth_event_group) {
             xEventGroupSetBits(s_eth_event_group, ETH_CONNECTED_BIT);
         }
+        /* FAULT 2: Ethernet link came back up */
+        fault_log_record(FAULT_ETH_LINK_RECOVERED);
         break;
 
     case ETHERNET_EVENT_DISCONNECTED:
@@ -84,6 +87,8 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
         if (s_eth_event_group) {
             xEventGroupClearBits(s_eth_event_group, ETH_CONNECTED_BIT | ETH_GOT_IP_BIT);
         }
+        /* FAULT 1: Ethernet link lost */
+        fault_log_record(FAULT_ETH_LINK_DOWN);
         break;
 
     case ETHERNET_EVENT_START:
@@ -313,6 +318,8 @@ esp_err_t ethernet_wait_for_ip(uint32_t timeout_ms)
         return ESP_OK;
     }
     ESP_LOGW(TAG, "Timeout waiting for IP address");
+    /* FAULT 3: Failed to obtain IP within the timeout */
+    fault_log_record(FAULT_ETH_NO_IP);
     return ESP_ERR_TIMEOUT;
 }
 
