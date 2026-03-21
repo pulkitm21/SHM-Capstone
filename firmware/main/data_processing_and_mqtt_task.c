@@ -22,12 +22,15 @@
 #include "sensor_task.h"
 #include "adt7420.h"
 #include "mqtt.h"
+#include "fault_log.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
 #include <string.h>
 #include <math.h>
+#include <time.h>
+#include <sys/time.h>
 
 /* sensor_task.c public API used here */
 
@@ -43,6 +46,11 @@ static volatile uint32_t s_samples_dropped    = 0;
 
 // Error counters
 static volatile uint32_t s_temp_read_errors = 0;
+
+// Previous overflow counts for fault detection (compare each cycle to detect new drops)
+static uint32_t s_prev_adxl355_overflow = 0;
+static uint32_t s_prev_scl3300_overflow = 0;
+static uint32_t s_prev_adt7420_overflow = 0;
 
 // Accelerometer batch buffers
 static float    s_accel_x[ACCEL_SAMPLES_PER_BATCH];
@@ -72,8 +80,41 @@ static inline float convert_adxl355_to_g(int32_t raw)
 
 static inline float convert_scl3300_to_deg(int16_t raw)
 {
-    // SCL3300 angle output: 0.0055 deg/LSB
-    return (float)raw * 0.0055f;
+    // SCL3300 angle output registers: full-scale ±90° over 16384 LSB
+    // Datasheet section 4.2: ANG_X/Y/Z = raw * (90 / 16384)
+    return (float)raw * (90.0f / 16384.0f);
+}
+
+/*
+ * Format a wall-clock timestamp into buf (must be >= MQTT_TS_LEN bytes).
+ * tick is the ISR tick value captured at sample time (125 µs per tick).
+ * If SNTP has not synced yet, writes "tick:NNNNNNNN" as a fallback so the
+ * field is always populated and parseable by the receiver.
+ */
+static void format_ts(char *buf, uint32_t tick)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+
+    if (tv.tv_sec > 1700000000L) {
+        // Back-calculate the wall time when this tick was captured
+        uint32_t current_tick = get_tick_count();
+        int64_t delta_us = (int64_t)((int32_t)(current_tick - tick)) * 125LL;
+        int64_t sample_us = (int64_t)tv.tv_sec * 1000000LL
+                            + (int64_t)tv.tv_usec
+                            - delta_us;
+
+        time_t sec = (time_t)(sample_us / 1000000LL);
+        int    us  = (int)(sample_us % 1000000LL);
+        if (us < 0) { us += 1000000; sec -= 1; }
+
+        struct tm tm_info;
+        gmtime_r(&sec, &tm_info);
+        strftime(buf, MQTT_TS_LEN, "%Y-%m-%dT%H:%M:%S", &tm_info);
+        snprintf(buf + 19, MQTT_TS_LEN - 19, ".%06dZ", us);
+    } else {
+        snprintf(buf, MQTT_TS_LEN, "tick:%08lu", (unsigned long)tick);
+    }
 }
 
 /******************************************************************************
@@ -94,7 +135,6 @@ static void data_processing_task(void *pvParameters)
     scl3300_raw_sample_t scl_sample;
 
     int      accel_batch_count = 0;
-    uint32_t first_tick        = 0;
 
     // Decimation accumulators
     int     decim_count      = 0;
@@ -134,6 +174,34 @@ static void data_processing_task(void *pvParameters)
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
         // =====================================================================
+        // FAULT CHECK: ring buffer overflows
+        // Compare current overflow counters to previous — any increase means
+        // samples were dropped since the last processing cycle.
+        // =====================================================================
+        uint32_t cur_adxl355_overflow = adxl355_get_overflow_count();
+        uint32_t cur_scl3300_overflow = scl3300_get_overflow_count();
+        uint32_t cur_adt7420_overflow = adt7420_get_overflow_count();
+
+        if (cur_adxl355_overflow != s_prev_adxl355_overflow) {
+            fault_log_record(FAULT_ADXL355_DROPPED);
+            ESP_LOGW(TAG, "ADXL355 samples dropped (overflow count: %lu)",
+                     (unsigned long)cur_adxl355_overflow);
+            s_prev_adxl355_overflow = cur_adxl355_overflow;
+        }
+        if (cur_scl3300_overflow != s_prev_scl3300_overflow) {
+            fault_log_record(FAULT_SCL3300_DROPPED);
+            ESP_LOGW(TAG, "SCL3300 samples dropped (overflow count: %lu)",
+                     (unsigned long)cur_scl3300_overflow);
+            s_prev_scl3300_overflow = cur_scl3300_overflow;
+        }
+        if (cur_adt7420_overflow != s_prev_adt7420_overflow) {
+            fault_log_record(FAULT_ADT7420_DROPPED);
+            ESP_LOGW(TAG, "ADT7420 samples dropped (overflow count: %lu)",
+                     (unsigned long)cur_adt7420_overflow);
+            s_prev_adt7420_overflow = cur_adt7420_overflow;
+        }
+
+        // =====================================================================
         // Poll temperature via I2C every TEMP_READ_INTERVAL_MS
         // NOTE: ADT7420 is on I2C - it must NOT be accessed from the ISR.
         //       It is polled here in task context only.
@@ -151,6 +219,7 @@ static void data_processing_task(void *pvParameters)
                 // Only invalidate on an active failure, not on "not polled yet"
                 temp_valid = false;
                 s_temp_read_errors++;
+                fault_log_record(FAULT_I2C_ERROR);
                 ESP_LOGW(TAG, "Temperature read FAILED: %s (error #%lu)",
                          esp_err_to_name(err), (unsigned long)s_temp_read_errors);
             }
@@ -189,11 +258,6 @@ static void data_processing_task(void *pvParameters)
         // =====================================================================
         while (adxl355_data_available() && s_task_running) {
             if (adxl355_read_sample(&adxl_sample)) {
-
-                // Capture tick of the very first raw sample in this packet
-                if (accel_batch_count == 0 && decim_count == 0) {
-                    first_tick = adxl_sample.tick;
-                }
 
                 // Capture tick of the first raw sample in each decimation window
                 if (decim_count == 0) {
@@ -247,13 +311,13 @@ static void data_processing_task(void *pvParameters)
                         // Build packet
                         // ---------------------------------------------------------
                         mqtt_sensor_packet_t packet = {0};
-                        packet.timestamp   = TICKS_TO_US(first_tick);
                         packet.accel_count = accel_batch_count;
 
                         for (int i = 0; i < accel_batch_count; i++) {
                             packet.accel[i].x = s_accel_x[i];
                             packet.accel[i].y = s_accel_y[i];
                             packet.accel[i].z = s_accel_z[i];
+                            format_ts(packet.accel[i].ts, s_accel_ticks[i]);
                         }
 
                         packet.has_angle   = true;
@@ -262,12 +326,16 @@ static void data_processing_task(void *pvParameters)
                             packet.angle_x = current_incl_x;
                             packet.angle_y = current_incl_y;
                             packet.angle_z = current_incl_z;
+                            format_ts(packet.angle_ts, scl_sample.tick);
                         }
 
                         packet.has_temp   = true;
                         packet.temp_valid = temp_valid;
                         if (temp_valid) {
                             packet.temperature = current_temp;
+                            // Temperature is polled via I2C at 1 Hz — use current
+                            // wall time as its timestamp since it has no ISR tick
+                            format_ts(packet.temp_ts, 0);
                         }
 
                         // ---------------------------------------------------------
@@ -278,9 +346,9 @@ static void data_processing_task(void *pvParameters)
                         if (pub_ret == ESP_OK) {
                             s_samples_published += accel_batch_count;
                             // Compact one-line log per published packet
-                            ESP_LOGD(TAG, "pkt#%lu ts=%luus incl=%s temp=%s",
+                            ESP_LOGD(TAG, "pkt#%lu accel=%d incl=%s temp=%s",
                                      (unsigned long)s_packets_sent,
-                                     (unsigned long)packet.timestamp,
+                                     packet.accel_count,
                                      packet.angle_valid ? "ok" : "null",
                                      packet.temp_valid  ? "ok" : "null");
                         } else {

@@ -29,6 +29,7 @@
 
 #include "mqtt.h"
 #include "mqtt_client.h"
+#include "fault_log.h"
 #include "esp_log.h"
 #include "esp_mac.h"          // esp_read_mac(), ESP_MAC_ETH
 #include "mdns.h"             // mDNS hostname resolution over Ethernet
@@ -48,7 +49,16 @@ static esp_mqtt_client_handle_t s_mqtt_client = NULL;
 static EventGroupHandle_t s_mqtt_event_group = NULL;
 static bool s_is_connected = false;
 
-#define JSON_BUFFER_SIZE    4096
+/*
+ * JSON buffer sizing:
+ *   Each accelerometer sample now includes a 28-char ISO-8601 timestamp plus
+ *   x/y/z floats.  Worst case per sample:
+ *     {"t":"2024-11-07T13:45:22.123456Z","v":[x.xxxx,y.yyyy,z.zzzz]},
+ *   = ~70 chars.  With MQTT_ACCEL_BATCH_SIZE=100 samples that is ~7000 chars
+ *   plus packet overhead (inclinometer, temperature, fault log, JSON framing).
+ *   8192 bytes gives safe headroom.
+ */
+#define JSON_BUFFER_SIZE    8192
 static char *s_json_buffer = NULL;
 
 /*
@@ -179,6 +189,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 xEventGroupSetBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
                 xEventGroupClearBits(s_mqtt_event_group, MQTT_DISCONNECTED_BIT);
             }
+            fault_log_record(FAULT_MQTT_RECONNECTED);
             break;
 
         case MQTT_EVENT_DISCONNECTED:
@@ -188,6 +199,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 xEventGroupSetBits(s_mqtt_event_group, MQTT_DISCONNECTED_BIT);
                 xEventGroupClearBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
             }
+            fault_log_record(FAULT_MQTT_DISCONNECTED);
             break;
 
         case MQTT_EVENT_ERROR:
@@ -283,7 +295,7 @@ esp_err_t mqtt_init(void)
 
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri             = MQTT_BROKER_URI,
-        .credentials.client_id          = s_client_id,   // MAC-derived, unique per device
+        .credentials.client_id          = s_client_id,
         .session.keepalive               = 60,
         .network.reconnect_timeout_ms   = 5000,
         .buffer.size                    = 1024,
@@ -353,32 +365,37 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
     /*
      * JSON FORMAT:
      * {
-     *   "t": 123456789,                              // Timestamp (always present)
-     *   "a": [[x,y,z], [x,y,z], ...],                // Accelerometer (always present)
-     *   "i": [x, y, z] OR null,                      // Inclinometer (null if invalid)
-     *   "T": 21.5 OR null                            // Temperature (null if invalid)
+     *   "a": [
+     *     ["2026-03-21T20:49:06.305421Z", x, y, z],
+     *     ...
+     *   ],
+     *   "i": ["2026-03-21T20:49:06.355000Z", x, y, z] | null,
+     *   "T": ["2026-03-21T20:49:06.355000Z", val]      | null
      * }
+     *
+     * Every field carries its own ISO-8601 UTC timestamp.
+     * null is used when sensor data is unavailable.
      */
 
     int offset = 0;
 
-    // Timestamp
-    offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                       "{\"t\":%lu,\"a\":[", (unsigned long)packet->timestamp);
+    // Open packet, begin accelerometer array
+    offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, "{\"a\":[");
 
-    // Accelerometer array (always present)
+    // Each accel sample is [timestamp, x, y, z]
     for (int i = 0; i < packet->accel_count && i < MQTT_ACCEL_BATCH_SIZE; i++) {
         if (i > 0) {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, ",");
         }
         offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                           "[%.4f,%.4f,%.4f]",
+                           "[\"%s\",%.4f,%.4f,%.4f]",
+                           packet->accel[i].ts,
                            packet->accel[i].x,
                            packet->accel[i].y,
                            packet->accel[i].z);
 
-        if (offset >= JSON_BUFFER_SIZE - 100) {
-            ESP_LOGE(TAG, "JSON buffer overflow!");
+        if (offset >= JSON_BUFFER_SIZE - 200) {
+            ESP_LOGE(TAG, "JSON buffer overflow at sample %d!", i);
             return ESP_ERR_NO_MEM;
         }
     }
@@ -386,11 +403,12 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
     // Close accelerometer array
     offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, "]");
 
-    // Inclinometer: ALWAYS include field, use null if invalid
+    // Inclinometer: [timestamp, x, y, z] or null
     if (packet->has_angle) {
         if (packet->angle_valid) {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                               ",\"i\":[%.4f,%.4f,%.4f]",
+                               ",\"i\":[\"%s\",%.4f,%.4f,%.4f]",
+                               packet->angle_ts,
                                packet->angle_x, packet->angle_y, packet->angle_z);
         } else {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
@@ -398,18 +416,25 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
         }
     }
 
-    // Temperature ALWAYS include field, use null if invalid
+    // Temperature: [timestamp, value] or null
     if (packet->has_temp) {
         if (packet->temp_valid) {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                               ",\"T\":%.2f", packet->temperature);
+                               ",\"T\":[\"%s\",%.2f]",
+                               packet->temp_ts, packet->temperature);
         } else {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
                                ",\"T\":null");
         }
     }
 
-    // Close JSON
+    // Fault log — only appended when faults are pending.
+    // The "f" field is omitted entirely when there are no faults.
+    if (fault_log_has_pending()) {
+        offset = fault_log_append_to_json(s_json_buffer, JSON_BUFFER_SIZE, offset);
+    }
+
+    // Close JSON object
     offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, "}");
 
     // Publish to the serial-number-derived data topic
@@ -419,6 +444,7 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
 
     if (msg_id < 0) {
         ESP_LOGE(TAG, "Failed to publish sensor data");
+        fault_log_record(FAULT_MQTT_PUBLISH_FAIL);
         return ESP_FAIL;
     }
 

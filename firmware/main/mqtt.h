@@ -105,30 +105,38 @@ extern "C" {
  * DATA STRUCTURES
  *****************************************************************************/
 
+/* ISO-8601 timestamp string: "2026-03-21T20:49:06.305421Z" + '\0' = 28 chars.
+ * Sized to 40 to satisfy -Werror=format-truncation: GCC counts worst-case
+ * field widths (e.g. %d = up to 11 digits), so the compiler believes the
+ * two-part snprintf in format_ts() could write up to 21 bytes into the
+ * 13-byte suffix slot. 40 bytes gives enough total headroom. */
+#define MQTT_TS_LEN  40
+
 typedef struct {
+    char  ts[MQTT_TS_LEN]; // ISO-8601 UTC wall-clock timestamp for this sample
     float x;
     float y;
     float z;
 } mqtt_accel_sample_t;
 
-/*Sensor data packet with validity flags*/
+/* Sensor data packet — every field carries its own timestamp */
 typedef struct {
-    uint32_t timestamp;
-
     // Accelerometer (always present)
     mqtt_accel_sample_t accel[MQTT_ACCEL_BATCH_SIZE];
     int accel_count;
 
     // Inclinometer
-    bool has_angle;         // Include "i" field in JSON?
-    bool angle_valid;       // true = show values, false = show null
+    bool  has_angle;        // Include "i" field in JSON?
+    bool  angle_valid;      // true = show values, false = show null
+    char  angle_ts[MQTT_TS_LEN];
     float angle_x;
     float angle_y;
     float angle_z;
 
     // Temperature
-    bool has_temp;          // Include "T" field in JSON?
-    bool temp_valid;        // true = show value, false = show null
+    bool  has_temp;         // Include "T" field in JSON?
+    bool  temp_valid;       // true = show value, false = show null
+    char  temp_ts[MQTT_TS_LEN];
     float temperature;
 
 } mqtt_sensor_packet_t;
