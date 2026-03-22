@@ -39,48 +39,72 @@ static uint8_t s_range_code = ADXL355_RANGE_2G;
 
 static inline uint8_t adxl355_cmd(uint8_t reg, bool is_read)
 {
-    // Datasheet: MOSI sends A6..A0 then R/W as bit0
-    // So command byte = (reg << 1) | R/W
+    // Working format used by your older Linux test code:
+    // command byte = (reg << 1) | R/W
     return (uint8_t)((reg << 1) | (is_read ? 0x01 : 0x00));
 }
 
-static esp_err_t adxl355_xfer(const uint8_t *tx, uint8_t *rx, size_t nbytes)
+static esp_err_t adxl355_read_reg(uint8_t reg, uint8_t *data, size_t len)
 {
-    if (!s_dev) return ESP_ERR_INVALID_STATE;
-    if (!tx || !rx || nbytes == 0) return ESP_ERR_INVALID_ARG;
+    if (!s_dev) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (data == NULL || len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if ((1 + len) > ADXL355_MAX_XFER_BYTES) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    uint8_t tx_buf[ADXL355_MAX_XFER_BYTES] = {0};
+    uint8_t rx_buf[ADXL355_MAX_XFER_BYTES] = {0};
+
+    tx_buf[0] = adxl355_cmd(reg, true);
+    memset(&tx_buf[1], 0x00, len);
 
     spi_transaction_t t;
     memset(&t, 0, sizeof(t));
+    t.length = (1 + len) * 8;
+    t.tx_buffer = tx_buf;
+    t.rx_buffer = rx_buf;
 
-    t.length = (uint32_t)(nbytes * 8);
-    t.tx_buffer = tx;
-    t.rx_buffer = rx;
+    esp_err_t err = spi_device_polling_transmit(s_dev, &t);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "read failed: reg=0x%02X len=%u err=%s",
+                 reg, (unsigned)len, esp_err_to_name(err));
+        return err;
+    }
 
-    return spi_device_transmit(s_dev, &t);
-}
-
-static esp_err_t adxl355_read_reg(uint8_t reg, uint8_t *out, size_t len)
-{
-    if (!out || len == 0) return ESP_ERR_INVALID_ARG;
-    if (len + 1 > ADXL355_MAX_XFER_BYTES) return ESP_ERR_INVALID_SIZE;
-
-    uint8_t tx[ADXL355_MAX_XFER_BYTES] = {0};
-    uint8_t rx[ADXL355_MAX_XFER_BYTES] = {0};
-
-    tx[0] = adxl355_cmd(reg, true);
-
-    esp_err_t err = adxl355_xfer(tx, rx, 1 + len);
-    if (err != ESP_OK) return err;
-
-    memcpy(out, &rx[1], len);
+    memcpy(data, &rx_buf[1], len);
     return ESP_OK;
 }
 
-static esp_err_t adxl355_write_reg(uint8_t reg, uint8_t val)
+static esp_err_t adxl355_write_reg(uint8_t reg, uint8_t value)
 {
-    uint8_t tx[2] = { adxl355_cmd(reg, false), val };
-    uint8_t rx[2] = {0};
-    return adxl355_xfer(tx, rx, sizeof(tx));
+    if (!s_dev) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint8_t tx_buf[2] = {
+        adxl355_cmd(reg, false),
+        value
+    };
+    uint8_t rx_buf[2] = {0};
+
+    spi_transaction_t t;
+    memset(&t, 0, sizeof(t));
+    t.length = 16;
+    t.tx_buffer = tx_buf;
+    t.rx_buffer = rx_buf;
+
+    esp_err_t err = spi_device_polling_transmit(s_dev, &t);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "write failed: reg=0x%02X value=0x%02X err=%s",
+                 reg, value, esp_err_to_name(err));
+        return err;
+    }
+
+    return ESP_OK;
 }
 
 /* ----- Conversions ----- */
@@ -94,20 +118,20 @@ static inline int32_t sign_extend_20b(uint32_t v)
     return (int32_t)v;
 }
 
-static float adxl355_lsb_per_g(uint8_t range_code)
-{
-    /* From datasheet sensitivity:
-       ±2 g: 3.9 µg/LSB  -> ~256000 LSB/g
-       ±4 g: 7.8 µg/LSB  -> ~128000 LSB/g
-       ±8 g: 15.6 µg/LSB -> ~ 64000 LSB/g
-    */
-    switch (range_code) {
-        case ADXL355_RANGE_2G: return 256000.0f;
-        case ADXL355_RANGE_4G: return 128000.0f;
-        case ADXL355_RANGE_8G: return  64000.0f;
-        default:               return 256000.0f;
-    }
-}
+// static float adxl355_lsb_per_g(uint8_t range_code)
+// {
+//     /* From datasheet sensitivity:
+//        ±2 g: 3.9 µg/LSB  -> ~256000 LSB/g
+//        ±4 g: 7.8 µg/LSB  -> ~128000 LSB/g
+//        ±8 g: 15.6 µg/LSB -> ~ 64000 LSB/g
+//     */
+//     switch (range_code) {
+//         case ADXL355_RANGE_2G: return 256000.0f;
+//         case ADXL355_RANGE_4G: return 128000.0f;
+//         case ADXL355_RANGE_8G: return  64000.0f;
+//         default:               return 256000.0f;
+//     }
+// }
 
 /* ----- Public API ----- */
 
@@ -189,8 +213,6 @@ esp_err_t adxl355_init(void)
     }
 
     ESP_LOGI(TAG, "ADXL355 init OK (range code=0x%02X)", s_range_code);
-
-
     return ESP_OK;
 }
 
@@ -217,14 +239,17 @@ esp_err_t adxl355_set_range(uint8_t range)
     return ESP_OK;
 }
 
-// Reading function is left here for debugging purposes. data_processing_and_mqtt_task.c converts raw values to g's.
 // esp_err_t adxl355_read_acceleration(adxl355_accel_t *accel)
 // {
-//     if (!accel) return ESP_ERR_INVALID_ARG;
+//     if (!accel) {
+//         return ESP_ERR_INVALID_ARG;
+//     }
 
 //     uint8_t b[9] = {0};
 //     esp_err_t err = adxl355_read_reg(ADXL355_REG_XDATA3, b, sizeof(b));
-//     if (err != ESP_OK) return err;
+//     if (err != ESP_OK) {
+//         return err;
+//     }
 
 //     uint32_t x_u = ((uint32_t)b[0] << 12) | ((uint32_t)b[1] << 4) | ((uint32_t)b[2] >> 4);
 //     uint32_t y_u = ((uint32_t)b[3] << 12) | ((uint32_t)b[4] << 4) | ((uint32_t)b[5] >> 4);
@@ -267,4 +292,19 @@ esp_err_t adxl355_read_temperature(float *temperature_c)
     *temperature_c = 25.0f + ((float)raw12 - 1885.0f) / (-9.05f);
 
     return ESP_OK;
+}
+/* -------------------------------------------------------------------------
+ * Public register access wrappers
+ * Used by node_config.c for reconfiguration and self-test.
+ * Thin wrappers around the static SPI helpers to avoid duplicating framing.
+ * ---------------------------------------------------------------------- */
+
+esp_err_t adxl355_read_reg_pub(uint8_t reg, uint8_t *data, size_t len)
+{
+    return adxl355_read_reg(reg, data, len);
+}
+
+esp_err_t adxl355_write_reg_pub(uint8_t reg, uint8_t value)
+{
+    return adxl355_write_reg(reg, value);
 }

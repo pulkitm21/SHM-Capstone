@@ -10,25 +10,23 @@ idf_component_register(
          adxl355.c
          scl3300.c
          mqtt.c
+         node_config.c
+         fault_log.c
          data_processing_and_mqtt_task.c
          sensor_task.c
-         fault_log.c
     INCLUDE_DIRS "."
     PRIV_INCLUDE_DIRS
     REQUIRES esp_driver_i2c
     		 esp_driver_spi
-    PRIV_REQUIRES  esp_driver_gpio
+    PRIV_REQUIRES esp_driver_gpio
     			   esp_driver_gptimer 
     			   esp_timer 
     			   freertos
     			   esp_eth
                    esp_netif
                    esp_event
-                   espressif__ethernet_init
+                   ethernet_init
                    nvs_flash
                    mqtt
-                   espressif__mdns
-                   ptpd
-                   esp_eth_time
-                   
+                   mdns
 )
