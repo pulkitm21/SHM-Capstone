@@ -12,7 +12,7 @@ from settings_schema import (
     to_dict,
 )
 
-SETTINGS_JSON = Path("/mnt/ssd/settings.json")
+SETTINGS_JSON = Path("/home/pi/settings.json")
 
 
 def save_settings(settings) -> None:
