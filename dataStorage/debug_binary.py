@@ -29,6 +29,7 @@ FLAG_INCLIN = 0x02
 FLAG_TEMP   = 0x04
 SENTINEL    = 0xFF
 
+
 # Per-sensor inter-packet jump thresholds (seconds).
 # Must be >= the encoder's MAX_DELTA_S (60 s) to avoid false positives
 # on slow sensors (e.g. temperature sampled once per minute).
@@ -175,37 +176,59 @@ def pass1_structural(filepath, focus_record=None):
                         (n,) = read_fmt(f, "<B", "accel n")
                         if show: print(f"  │  accel n={n}")
                         for i in range(n):
-                            (dod,)       = read_fmt(f, "<i", f"accel[{i}] dod_ts")
-                            dx, dy, dz   = read_fmt(f, "<hhh", f"accel[{i}] deltas")
-                            if abs(dod) > DOD_WARN_THRESH:
-                                issues.append((idx, "DELTA/accel", f"dod_ts={dod} near int32 overflow"))
+                            (changed,)   = read_fmt(f, "<B", f"accel[{i}] changed")
+                            delta_ts = dx = dy = dz = None
+                            if changed & 0x01:
+                                (delta_ts,) = read_fmt(f, "<i", f"accel[{i}] delta_ts")
+                                if abs(delta_ts) > DOD_WARN_THRESH:
+                                    issues.append((idx, "DELTA/accel", f"delta_ts={delta_ts} near int32 overflow"))
+                            if changed & 0x02: (dx,) = read_fmt(f, "<h", f"accel[{i}] dx")
+                            if changed & 0x04: (dy,) = read_fmt(f, "<h", f"accel[{i}] dy")
+                            if changed & 0x08: (dz,) = read_fmt(f, "<h", f"accel[{i}] dz")
                             if show:
-                                print(f"  │    [{i}] dod_ts={dod}µs  "
-                                      f"Δx={dx/ACCEL_SCALE:+.4f}  Δy={dy/ACCEL_SCALE:+.4f}  Δz={dz/ACCEL_SCALE:+.4f} g")
-                                if abs(dod) > DOD_WARN_THRESH:
-                                    print(f"  │        ⚠ dod_ts near int32 overflow")
+                                dts_s = f"{delta_ts}µs" if delta_ts is not None else "null"
+                                dx_s  = f"{dx/ACCEL_SCALE:+.4f}" if dx is not None else "null"
+                                dy_s  = f"{dy/ACCEL_SCALE:+.4f}" if dy is not None else "null"
+                                dz_s  = f"{dz/ACCEL_SCALE:+.4f}" if dz is not None else "null"
+                                print(f"  │    [{i}] changed=0x{changed:02X}  delta_ts={dts_s}  "
+                                      f"Δx={dx_s}  Δy={dy_s}  Δz={dz_s} g")
 
                     if header & FLAG_INCLIN:
-                        (dod,)     = read_fmt(f, "<i", "inclin dod_ts")
-                        dr, dp, dy = read_fmt(f, "<hhh", "inclin deltas")
-                        if abs(dod) > DOD_WARN_THRESH:
-                            issues.append((idx, "DELTA/inclin", f"dod_ts={dod} near int32 overflow"))
-                        for v, name in [(abs(dr),"dr"),(abs(dp),"dp"),(abs(dy),"dy")]:
-                            if v == 32767:
+                        (changed,) = read_fmt(f, "<B", "inclin changed")
+                        delta_ts = dr = dp = dy = None
+                        if changed & 0x01:
+                            (delta_ts,) = read_fmt(f, "<i", "inclin delta_ts")
+                            if abs(delta_ts) > DOD_WARN_THRESH:
+                                issues.append((idx, "DELTA/inclin", f"delta_ts={delta_ts} near int32 overflow"))
+                        if changed & 0x02: (dr,) = read_fmt(f, "<h", "inclin dr")
+                        if changed & 0x04: (dp,) = read_fmt(f, "<h", "inclin dp")
+                        if changed & 0x08: (dy,) = read_fmt(f, "<h", "inclin dyaw")
+                        for v, name in [(dr,"dr"),(dp,"dp")]:
+                            if v is not None and abs(v) == 32767:
                                 issues.append((idx, "DELTA/inclin", f"{name} hit int16 max — likely clipped"))
                         if show:
-                            print(f"  │  inclin dod_ts={dod}µs  "
-                                  f"Δr={dr/INCLIN_SCALE:+.4f}  Δp={dp/INCLIN_SCALE:+.4f}  Δy={dy/INCLIN_SCALE:+.4f} °")
+                            dts_s = f"{delta_ts}µs" if delta_ts is not None else "null"
+                            dr_s  = f"{dr/INCLIN_SCALE:+.4f}" if dr is not None else "null"
+                            dp_s  = f"{dp/INCLIN_SCALE:+.4f}" if dp is not None else "null"
+                            dy_s  = f"{dy/INCLIN_SCALE:+.4f}" if dy is not None else "null"
+                            print(f"  │  inclin changed=0x{changed:02X}  delta_ts={dts_s}  "
+                                  f"Δr={dr_s}  Δp={dp_s}  Δy={dy_s} °")
 
                     if header & FLAG_TEMP:
-                        (dod,) = read_fmt(f, "<i", "temp dod_ts")
-                        (dt,)  = read_fmt(f, "<h", "temp delta")
-                        if abs(dod) > DOD_WARN_THRESH:
-                            issues.append((idx, "DELTA/temp", f"dod_ts={dod} near int32 overflow"))
-                        if abs(dt) == 32767:
-                            issues.append((idx, "DELTA/temp", f"Δtemp={dt} hit int16 max — likely clipped"))
+                        (changed,) = read_fmt(f, "<B", "temp changed")
+                        delta_ts = dt = None
+                        if changed & 0x01:
+                            (delta_ts,) = read_fmt(f, "<i", "temp delta_ts")
+                            if abs(delta_ts) > DOD_WARN_THRESH:
+                                issues.append((idx, "DELTA/temp", f"delta_ts={delta_ts} near int32 overflow"))
+                        if changed & 0x02:
+                            (dt,) = read_fmt(f, "<h", "temp dval")
+                            if abs(dt) == 32767:
+                                issues.append((idx, "DELTA/temp", f"Δtemp={dt} hit int16 max — likely clipped"))
                         if show:
-                            print(f"  │  temp  dod_ts={dod}µs  Δval={dt/TEMP_SCALE:+.4f} °C")
+                            dts_s = f"{delta_ts}µs" if delta_ts is not None else "null"
+                            dt_s  = f"{dt/TEMP_SCALE:+.4f}" if dt is not None else "null"
+                            print(f"  │  temp  changed=0x{changed:02X}  delta_ts={dts_s}  Δval={dt_s} °C")
 
                     if show: print(f"  └─")
 
@@ -228,8 +251,7 @@ def pass1_structural(filepath, focus_record=None):
 # ══════════════════════════════════════════════════════════════════
 
 def _fresh_sensor_state():
-    return {"ts_us": 0, "ts_delta_prev": 0, "xyz_prev": [0, 0, 0], "val_prev": 0,
-            "first_ts_us": None}  # first sample ts of previous packet (for jump check)
+    return {"ts_us": 0, "xyz_prev": [0, 0, 0], "val_prev": 0, "first_ts_us": None}  # first sample ts of previous packet (for jump check)
 
 def pass2_delta_trace(filepath, focus_record=None):
     print(f"\n{'─'*70}")
@@ -252,14 +274,12 @@ def pass2_delta_trace(filepath, focus_record=None):
         (ts_us,) = read_fmt(f, "<q", label)
         if is_first_sample:
             ss["first_ts_us"] = ts_us
-        ss["ts_us"] = ts_us; ss["ts_delta_prev"] = 0
+        ss["ts_us"] = ts_us
         return ts_us
 
-    def _dod_ts(ss, dod, label, show, rec_idx, is_first_sample=False):
-        delta_us = ss["ts_delta_prev"] + dod
-        ts_us    = ss["ts_us"] + delta_us
+    def _delta_ts(ss, delta_us, label, show, rec_idx, is_first_sample=False):
         if show:
-            print(f"    {label}: dod={dod}µs  delta={delta_us}µs  "
+            print(f"    {label}: delta_ts={delta_us}µs  "
                   f"ts_us={ts_us}  ({ts_str(ts_us/TS_SCALE)})")
         # For the first sample of a burst, compare against the first sample of the
         # previous packet — not the last sample — to avoid false negatives caused
@@ -290,7 +310,7 @@ def pass2_delta_trace(filepath, focus_record=None):
                 if show: print(f"    ⚠ {msg}")
         if is_first_sample:
             ss["first_ts_us"] = ts_us
-        ss["ts_us"] = ts_us; ss["ts_delta_prev"] = delta_us
+        ss["ts_us"] = ts_us
         return ts_us
 
     with open_decompressed(filepath) as f:
@@ -349,9 +369,9 @@ def pass2_delta_trace(filepath, focus_record=None):
                         for i in range(n):
                             (changed,) = read_fmt(f, "<B", f"accel[{i}] changed")
                             if changed & 0x01:
-                                (dod,) = read_fmt(f, "<i", f"accel[{i}].ts")
-                                ts_us  = _dod_ts(ss, dod, f"accel[{i}].ts",
-                                                 show, idx, is_first_sample=(i == 0))
+                                (delta_us,) = read_fmt(f, "<i", f"accel[{i}].ts")
+                                ts_us       = _delta_ts(ss, delta_us, f"accel[{i}].ts",
+                                                        show, idx, is_first_sample=(i == 0))
                             else:
                                 ts_us = ss["ts_us"]
                                 if show: print(f"    accel[{i}].ts: null (unchanged)")
@@ -373,15 +393,15 @@ def pass2_delta_trace(filepath, focus_record=None):
                         ss = state["inclin"]
                         (changed,) = read_fmt(f, "<B", "inclin changed")
                         if changed & 0x01:
-                            (dod,) = read_fmt(f, "<i", "inclin.ts")
-                            ts_us  = _dod_ts(ss, dod, "inclin.ts", show, idx, is_first_sample=True)
+                            (delta_us,) = read_fmt(f, "<i", "inclin.ts")
+                            ts_us       = _delta_ts(ss, delta_us, "inclin.ts", show, idx, is_first_sample=True)
                         else:
                             ts_us = ss["ts_us"]
                             if show: print(f"    inclin.ts: null (unchanged)")
                         prev = ss["xyz_prev"]
                         dr  = read_fmt(f, "<h", "inclin dr")[0]   if changed & 0x02 else 0
                         dp  = read_fmt(f, "<h", "inclin dp")[0]   if changed & 0x04 else 0
-                        dy_ = read_fmt(f, "<h", "inclin dyaw")[0] if changed & 0x08 else 0
+                        dy_ = read_fmt(f, "<i", "inclin dyaw")[0] if changed & 0x08 else 0
                         cur = [prev[0]+dr, prev[1]+dp, prev[2]+dy_]
                         ss["xyz_prev"] = cur
                         if show:
@@ -396,8 +416,8 @@ def pass2_delta_trace(filepath, focus_record=None):
                         ss = state["temp"]
                         (changed,) = read_fmt(f, "<B", "temp changed")
                         if changed & 0x01:
-                            (dod,) = read_fmt(f, "<i", "temp.ts")
-                            ts_us  = _dod_ts(ss, dod, "temp.ts", show, idx, is_first_sample=True)
+                            (delta_us,) = read_fmt(f, "<i", "temp.ts")
+                            ts_us       = _delta_ts(ss, delta_us, "temp.ts", show, idx, is_first_sample=True)
                         else:
                             ts_us = ss["ts_us"]
                             if show: print(f"    temp.ts: null (unchanged)")
@@ -484,7 +504,7 @@ def pass3_anomalies(issues_p1, issues_p2):
 
     if any("near int32 overflow" in m for _,_,m in all_issues):
         print("""
-  ⚠ dod_ts near int32 overflow:
+  ⚠ delta_ts near int32 overflow:
       File recorded before the MAX_DELTA_S gap-detection fix.
       Re-record with updated delta_encoder.py.
 """)
