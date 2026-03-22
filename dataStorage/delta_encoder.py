@@ -206,18 +206,24 @@ def get_hourly_filepath(node_id: str) -> tuple[str, str]:
 # -------------------------------------------------------------------
 
 def needs_absolute_record(data: dict, state: dict) -> tuple[bool, str]:
-    """Return (True, reason) if any sensor would overflow dod_ts or clip int16."""
+    """Return (True, reason) if any sensor would overflow delta_ts or clip int16."""
 
     if "a" in data and len(data["a"]) > 0:
         ts_s = float(data["a"][0][0])
         gap  = ts_s - state["accel"]["ts_us"] / TS_SCALE
         if abs(gap) > MAX_DELTA_S:
             return True, f"accel timestamp gap {gap:.1f} s"
+        # Check all samples — prev advances through the burst so each sample
+        # is compared against the one before it, exactly as encode_delta_record does.
         prev = state["accel"]["xyz_prev"]
-        for idx, name in enumerate(("x", "y", "z")):
-            d = int(float(data["a"][0][idx + 1]) * ACCEL_SCALE) - prev[idx]
-            if abs(d) >= INT16_MAX:
-                return True, f"accel {name} delta {d} would clip int16"
+        for s in data["a"]:
+            xi = int(float(s[1]) * ACCEL_SCALE)
+            yi = int(float(s[2]) * ACCEL_SCALE)
+            zi = int(float(s[3]) * ACCEL_SCALE)
+            for d, name in ((xi-prev[0],"x"),(yi-prev[1],"y"),(zi-prev[2],"z")):
+                if abs(d) >= INT16_MAX:
+                    return True, f"accel {name} delta {d} would clip int16"
+            prev = [xi, yi, zi]
 
     if "i" in data:
         ts_s = float(data["i"][0])
