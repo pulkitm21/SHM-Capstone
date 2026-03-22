@@ -12,25 +12,16 @@ import shutil
 import os
 from pathlib import Path
 
-from mqtt_listener import start_listener
-
 from settings_schema import SettingsModel, to_dict, copy_deep
-
-# Import config ACK helpers and MQTT command publishers
 from settings_store import (
     load_settings,
     save_settings,
     ensure_node_defaults,
     update_accelerometer_config_request,
-    mark_accelerometer_config_failed,
     get_site_name,
     update_site_name,
-    update_node_control_request,
-    mark_node_control_failed,
 )
-
 from node_registry import list_nodes, get_node_by_id, update_node_position
-from mqtt_commands import publish_accelerometer_config, publish_node_control
 
 app = FastAPI()
 
@@ -46,13 +37,11 @@ app.add_middleware(
 )
 
 DATA_DIR = Path("/mnt/ssd")
-# DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 ACCEL_BIN = DATA_DIR / "accel_data_20260219.bin"
 INCL_BIN = DATA_DIR / "incl_data.bin"
 TEMP_BIN = DATA_DIR / "temp_data.bin"
-FAULT_DIR = Path("/mnt/ssd/fault")
-# FAULT_DIR.mkdir(parents=True, exist_ok=True)
+FAULT_DIR = DATA_DIR / "fault"
 FAULTS_DB = FAULT_DIR / "faults.db"
 
 ACCEL_FORMAT = "<dfff"
@@ -82,18 +71,6 @@ class NodeControlRequest(BaseModel):
 
 class SiteNameUpdate(BaseModel):
     site_name: str = Field(..., min_length=1, max_length=60)
-
-
-def _read_tail_bytes(path: Path, record_size: int, max_records: int) -> bytes:
-    if not path.exists():
-        return b""
-    size = path.stat().st_size
-    bytes_needed = min(size, max_records * record_size)
-    if bytes_needed <= 0:
-        return b""
-    with path.open("rb") as f:
-        f.seek(size - bytes_needed)
-        return f.read()
 
 
 def _iso_from_epoch_seconds(ts: float) -> str:
@@ -126,7 +103,66 @@ def get_ssd_mount_status() -> Dict[str, Any]:
     }
 
 
-def read_accel_points(minutes: int, channel: str, max_records_to_scan: int = 50000, limit: int = 500):
+def is_ssd_available() -> bool:
+    return bool(get_ssd_mount_status()["available"])
+
+
+def empty_fault_response(page: int = 1, page_size: int = 15) -> Dict[str, Any]:
+    safe_page = max(1, page)
+    safe_page_size = max(1, page_size)
+
+    return {
+        "faults": [],
+        "page": safe_page,
+        "page_size": safe_page_size,
+        "total_items": 0,
+        "total_pages": 1,
+        "filter_options": {
+            "sensor_types": [],
+            "fault_types": [],
+            "severities": [],
+            "statuses": [],
+        },
+    }
+
+
+def _read_tail_bytes(path: Path, record_size: int, max_records: int) -> bytes:
+    """
+    Safely read the trailing bytes of a binary sensor file.
+
+    If the SSD is missing or the file cannot be read, return empty bytes so the
+    caller can degrade gracefully instead of failing the request.
+    """
+    if not is_ssd_available():
+        return b""
+
+    try:
+        if not path.exists():
+            return b""
+
+        size = path.stat().st_size
+        bytes_needed = min(size, max_records * record_size)
+
+        if bytes_needed <= 0:
+            return b""
+
+        with path.open("rb") as f:
+            f.seek(size - bytes_needed)
+            return f.read()
+
+    except (OSError, ValueError):
+        return b""
+
+
+def read_accel_points(
+    minutes: int,
+    channel: str,
+    max_records_to_scan: int = 50000,
+    limit: int = 500,
+):
+    if not is_ssd_available():
+        return []
+
     now_s = datetime.now(timezone.utc).timestamp()
     cutoff_s = now_s - (minutes * 60)
 
@@ -143,16 +179,29 @@ def read_accel_points(minutes: int, channel: str, max_records_to_scan: int = 500
     idx = {"x": 1, "y": 2, "z": 3}[channel]
     points: List[Dict[str, Any]] = []
 
-    for (ts, ax, ay, az) in struct.iter_unpack(ACCEL_FORMAT, data):
-        if ts < cutoff_s:
-            continue
-        val = (ts, ax, ay, az)[idx]
-        points.append({"ts": _iso_from_epoch_seconds(ts), "value": float(val)})
+    try:
+        for (ts, ax, ay, az) in struct.iter_unpack(ACCEL_FORMAT, data):
+            if ts < cutoff_s:
+                continue
+
+            val = (ts, ax, ay, az)[idx]
+            points.append({"ts": _iso_from_epoch_seconds(ts), "value": float(val)})
+
+    except struct.error:
+        return []
 
     return points[-limit:]
 
 
-def read_inclinometer_points(minutes: int, channel: str, max_records_to_scan: int = 50000, limit: int = 500):
+def read_inclinometer_points(
+    minutes: int,
+    channel: str,
+    max_records_to_scan: int = 50000,
+    limit: int = 500,
+):
+    if not is_ssd_available():
+        return []
+
     now_s = datetime.now(timezone.utc).timestamp()
     cutoff_s = now_s - (minutes * 60)
 
@@ -169,16 +218,28 @@ def read_inclinometer_points(minutes: int, channel: str, max_records_to_scan: in
     idx = 1 if channel == "pitch" else 2
     points: List[Dict[str, Any]] = []
 
-    for (ts, pitch, roll) in struct.iter_unpack(INCL_FORMAT, data):
-        if ts < cutoff_s:
-            continue
-        val = (ts, pitch, roll)[idx]
-        points.append({"ts": _iso_from_epoch_seconds(ts), "value": float(val)})
+    try:
+        for (ts, pitch, roll) in struct.iter_unpack(INCL_FORMAT, data):
+            if ts < cutoff_s:
+                continue
+
+            val = (ts, pitch, roll)[idx]
+            points.append({"ts": _iso_from_epoch_seconds(ts), "value": float(val)})
+
+    except struct.error:
+        return []
 
     return points[-limit:]
 
 
-def read_temperature_points(minutes: int, max_records_to_scan: int = 50000, limit: int = 500):
+def read_temperature_points(
+    minutes: int,
+    max_records_to_scan: int = 50000,
+    limit: int = 500,
+):
+    if not is_ssd_available():
+        return []
+
     now_s = datetime.now(timezone.utc).timestamp()
     cutoff_s = now_s - (minutes * 60)
 
@@ -190,10 +251,16 @@ def read_temperature_points(minutes: int, max_records_to_scan: int = 50000, limi
     data = data[:usable_len]
 
     points: List[Dict[str, Any]] = []
-    for (ts, temp) in struct.iter_unpack(TEMP_FORMAT, data):
-        if ts < cutoff_s:
-            continue
-        points.append({"ts": _iso_from_epoch_seconds(ts), "value": float(temp)})
+
+    try:
+        for (ts, temp) in struct.iter_unpack(TEMP_FORMAT, data):
+            if ts < cutoff_s:
+                continue
+
+            points.append({"ts": _iso_from_epoch_seconds(ts), "value": float(temp)})
+
+    except struct.error:
+        return []
 
     return points[-limit:]
 
@@ -205,7 +272,8 @@ def root():
 
 @app.get("/health")
 def health():
-    # Testing/manual health check endpoint only. SSE is used for backend status updates in the dashboard.
+    # Testing/manual health check endpoint only.
+    # SSE is used for backend status updates in the dashboard.
     return {
         "status": "OK",
         "time": datetime.now(timezone.utc).isoformat(),
@@ -214,7 +282,7 @@ def health():
 
 @app.get("/api/events/health")
 async def health_events(request: Request):
-    # SSE code for backend status live updates on the frontend dashboard.
+    # Backend liveness SSE. This should stay independent of SSD state.
     async def event_generator():
         while True:
             if await request.is_disconnected():
@@ -251,14 +319,27 @@ def get_storage():
             "ssd_status": mount_status,
         }
 
-    total, used, free = shutil.disk_usage(DATA_DIR)
-    return {
-        "total_gb": round(total / (1024 ** 3), 2),
-        "used_gb": round(used / (1024 ** 3), 2),
-        "free_gb": round(free / (1024 ** 3), 2),
-        "usage_percent": round((used / total) * 100, 2) if total > 0 else 0,
-        "ssd_status": mount_status,
-    }
+    try:
+        total, used, free = shutil.disk_usage(DATA_DIR)
+        return {
+            "total_gb": round(total / (1024 ** 3), 2),
+            "used_gb": round(used / (1024 ** 3), 2),
+            "free_gb": round(free / (1024 ** 3), 2),
+            "usage_percent": round((used / total) * 100, 2) if total > 0 else 0,
+            "ssd_status": mount_status,
+        }
+    except OSError:
+        return {
+            "total_gb": 0,
+            "used_gb": 0,
+            "free_gb": 0,
+            "usage_percent": 0,
+            "ssd_status": {
+                **mount_status,
+                "available": False,
+                "status": "unavailable",
+            },
+        }
 
 
 @app.get("/api/storage/status")
@@ -289,24 +370,12 @@ def put_node_position(node_id: int, payload: NodePositionUpdate):
         raise HTTPException(status_code=404, detail="Node not found")
     return {"ok": True, "node": updated}
 
-## Start MQTT listener on app startup and store client reference for potential future use (graceful shutdown)
-mqtt_status_client = None
-
-@app.on_event("startup")
-def startup_event():
-    global mqtt_status_client
-    try:
-        mqtt_status_client = start_listener()
-    except Exception as e:
-        mqtt_status_client = None
-        print(f"[startup] MQTT listener not started: {e}")
 
 # =========================
 # Bulk node position update endpoint
 # Allows frontend to save all node positions in a single request
 # Used for "Edit → Move → Save" workflow in NodeMap
 # =========================
-
 class BulkNodePositionItem(BaseModel):
     node_id: int
     x: float = Field(..., ge=0.0, le=1.0)
@@ -382,7 +451,6 @@ def api_put_site_name(payload: SiteNameUpdate):
     return {"ok": True, "site_name": updated_name}
 
 
-# Store desired config, publish MQTT command, and return pending sync state.
 @app.post("/api/nodes/{node_id}/config/accelerometer/apply")
 def apply_accelerometer_config(node_id: int, payload: AccelerometerConfigApplyRequest):
     node = get_node_by_id(node_id, timeout_seconds=60)
@@ -401,21 +469,8 @@ def apply_accelerometer_config(node_id: int, payload: AccelerometerConfigApplyRe
         seq=seq,
     )
 
-    try:
-        publish_accelerometer_config(
-            serial=node["serial"],
-            odr_index=payload.odr_index,
-            range_value=payload.range,
-            hpf_corner=payload.hpf_corner,
-            seq=seq,
-        )
-    except Exception as exc:
-        mark_accelerometer_config_failed(node_id)
-        raise HTTPException(
-            status_code=503,
-            detail=f"Failed to publish configure command: {exc}",
-        )
-
+    # Phase 1 only: store the request and return it.
+    # MQTT publish will be added in Phase 2.
     return {
         "ok": True,
         "node_id": node["node_id"],
@@ -439,62 +494,20 @@ def apply_accelerometer_config(node_id: int, payload: AccelerometerConfigApplyRe
     }
 
 
-# Publish runtime control commands to the node through MQTT.
 @app.post("/api/nodes/{node_id}/control")
 def control_node(node_id: int, payload: NodeControlRequest):
     node = get_node_by_id(node_id, timeout_seconds=60)
     if node is None:
         raise HTTPException(status_code=404, detail="Node not found")
 
-    ensure_node_defaults(node_id)
-
-    # Millisecond timestamp works well as a simple unique command sequence.
-    seq = int(datetime.now(timezone.utc).timestamp() * 1000)
-
-    try:
-        control_cfg = update_node_control_request(
-            node_id=node_id,
-            cmd=payload.cmd,
-            seq=seq,
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to store pending control request: {exc}",
-        )
-
-    try:
-        publish_node_control(
-            serial=node["serial"],
-            cmd=payload.cmd,
-            seq=seq,
-        )
-    except Exception as exc:
-        # If publish fails, mark the pending control request as failed so the UI
-        # does not stay stuck in a pending state.
-        try:
-            mark_node_control_failed(
-                node_id=node_id,
-                error_msg=f"MQTT publish failed: {exc}",
-            )
-        except Exception:
-            pass
-
-        raise HTTPException(
-            status_code=503,
-            detail=f"Failed to publish control command: {exc}",
-        )
-
+    # Phase 1 only: backend accepts the request shape.
+    # MQTT control publish will be added in Phase 2.
     return {
         "ok": True,
         "node_id": node["node_id"],
         "serial": node["serial"],
         "cmd": payload.cmd,
-        "seq": seq,
         "status": "accepted",
-        "control_status": control_cfg.get("control_status"),
-        "pending_control_cmd": control_cfg.get("pending_control_cmd"),
-        "pending_control_seq": control_cfg.get("pending_control_seq"),
     }
 
 
@@ -632,24 +645,17 @@ def read_fault_rows(
 ) -> Dict[str, Any]:
     effective_page_size = page_size if page_size is not None else limit
 
+    if not is_ssd_available():
+        return empty_fault_response(page=page, page_size=effective_page_size)
+
     if not FAULTS_DB.exists():
-        return {
-            "faults": [],
-            "page": page,
-            "page_size": effective_page_size,
-            "total_items": 0,
-            "total_pages": 1,
-            "filter_options": {
-                "sensor_types": [],
-                "fault_types": [],
-                "severities": [],
-                "statuses": [],
-            },
-        }
+        return empty_fault_response(page=page, page_size=effective_page_size)
 
     safe_page = max(1, page)
     safe_page_size = max(1, effective_page_size)
     offset = (safe_page - 1) * safe_page_size
+
+    con: Optional[sqlite3.Connection] = None
 
     try:
         con = sqlite3.connect(str(FAULTS_DB))
@@ -689,8 +695,9 @@ def read_fault_rows(
         )
         rows = [dict(r) for r in cur.fetchall()]
 
+        # Filter dropdowns are read from SQLite so the frontend does not need
+        # to scan a large in-memory dataset just to build filter choices.
         filter_options = _get_fault_filter_options(con=con, serial_number=serial_number)
-        con.close()
 
         return {
             "faults": rows,
@@ -701,21 +708,13 @@ def read_fault_rows(
             "filter_options": filter_options,
         }
 
-    except Exception as e:
-        print(f"[faults] Failed to read faults DB: {e}")
-        return {
-            "faults": [],
-            "page": safe_page,
-            "page_size": safe_page_size,
-            "total_items": 0,
-            "total_pages": 1,
-            "filter_options": {
-                "sensor_types": [],
-                "fault_types": [],
-                "severities": [],
-                "statuses": [],
-            },
-        }
+    except sqlite3.Error:
+        return empty_fault_response(page=safe_page, page_size=safe_page_size)
+
+    finally:
+        if con is not None:
+            con.close()
+
 
 @app.get("/api/faults")
 def get_faults(
@@ -729,7 +728,6 @@ def get_faults(
     page_size: int = Query(default=15, ge=1, le=200),
     limit: int = Query(default=200, ge=1, le=5000),
 ):
-    # Full fault log endpoint with backend filtering and pagination.
     return read_fault_rows(
         serial_number=serial_number,
         sensor_type=sensor_type,
@@ -749,7 +747,7 @@ async def fault_events(
     serial_number: Optional[str] = Query(default=None),
     limit: int = Query(default=200, ge=1, le=5000),
 ):
-    # SSE code for live fault log updates on the frontend dashboard.
+    # Fault SSE should also degrade cleanly if SSD or DB is unavailable.
     async def event_generator():
         while True:
             if await request.is_disconnected():
@@ -781,7 +779,13 @@ def get_accel_data(
 ):
     channel = channel.lower()
     pts = read_accel_points(minutes=minutes, channel=channel)
-    return {"sensor": "accelerometer", "unit": "g", "node": node, "channel": channel, "points": pts}
+    return {
+        "sensor": "accelerometer",
+        "unit": "g",
+        "node": node,
+        "channel": channel,
+        "points": pts,
+    }
 
 
 @app.get("/api/inclinometer")
@@ -792,7 +796,13 @@ def api_inclinometer(
 ):
     channel = channel.lower()
     pts = read_inclinometer_points(minutes=minutes, channel=channel)
-    return {"sensor": "inclinometer", "unit": "deg", "node": node, "channel": channel, "points": pts}
+    return {
+        "sensor": "inclinometer",
+        "unit": "deg",
+        "node": node,
+        "channel": channel,
+        "points": pts,
+    }
 
 
 @app.get("/api/temperature")
@@ -801,4 +811,9 @@ def api_temperature(
     minutes: int = Query(60, ge=1, le=1440),
 ):
     pts = read_temperature_points(minutes=minutes)
-    return {"sensor": "temperature", "unit": "C", "node": node, "points": pts}
+    return {
+        "sensor": "temperature",
+        "unit": "C",
+        "node": node,
+        "points": pts,
+    }
