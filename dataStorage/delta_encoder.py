@@ -61,14 +61,14 @@ ZSTD_LEVEL = 3
 # DELTA record:
 #   header(B)
 #   if accel  (bit0): n(B) + n × [ changed(B)  delta_ts?(i)  dx?(h)  dy?(h)  dz?(h)  ]
-#   if inclin (bit1):             [ changed(B)  delta_ts?(i)  dr?(h)  dp?(h)  dyaw?(i) ]
+#   if inclin (bit1):             [ changed(B)  delta_ts?(i)  dr?(h)  dp?(h)  dyaw?(h) ]
 #   if temp   (bit2):             [ changed(B)  delta_ts?(i)  dval?(h)                 ]
 #
 # changed byte bitmask (per sensor):
 #   bit0 = timestamp changed  → delta_ts(i) present
 #   bit1 = x/r/val changed    → dx/dr/dval(h) present
 #   bit2 = y/p changed        → dy/dp(h) present   [accel/inclin]
-#   bit3 = z/yaw changed      → dz(h) present [accel], dyaw(i) present [inclin — int32 for wrap-around safety]
+#   bit3 = z/yaw changed      → dz/dyaw(h) present [accel/inclin]
 # Fields with changed-bit=0 are omitted (null) — decoder keeps prev value.
 # If changed==0x00 the sensor field is still present in header (for state
 # tracking) but contributes 1 byte (the changed byte itself) to the record.
@@ -82,6 +82,11 @@ TEMP_SCALE    = 100        # 0.01 °C  → int16
 ACCEL_SCALE   = 10000      # 0.0001 g → int16
 INCLIN_SCALE  = 10000      # 0.0001 ° → int16
 TS_SCALE      = 1_000_000  # seconds  → µs
+
+# Binary file format version — first byte of every .bin file.
+#   v1 = legacy (raw dod_ts, no changed byte)
+#   v2 = current (changed byte prefix, simple delta_ts)
+FILE_FORMAT_VERSION = 2
 
 MAX_DELTA_S   = 60.0       # force ABSOLUTE if sensor timestamp gap > this
 INT16_MAX     = 32767
@@ -185,8 +190,9 @@ def _fresh_state() -> dict:
         "accel":  {"ts_us": 0, "xyz_prev": [0, 0, 0]},
         "inclin": {"ts_us": 0, "xyz_prev": [0, 0, 0]},
         "temp":   {"ts_us": 0, "val_prev": 0},
-        "file_hour": None,
-        "is_first":  True,
+        "file_hour":      None,
+        "is_first":       True,
+        "header_written": False,
     }
 
 
@@ -462,8 +468,9 @@ def write_record(node_id: str, data: dict):
                 DATA_DIR, f"data_{node_id}_{state['file_hour']}.bin")
             if os.path.exists(old_bin):
                 compress_and_replace(node_id, old_bin)
-        state["file_hour"] = hour_str
-        state["is_first"]  = True
+        state["file_hour"]      = hour_str
+        state["is_first"]       = True
+        state["header_written"] = False
         print(f"[{node_id}] New hourly file: {filepath}")
 
     if not state["is_first"]:
@@ -480,6 +487,9 @@ def write_record(node_id: str, data: dict):
 
     # Append directly to .bin — no buffering needed
     with open(filepath, "ab") as f:
+        if not state["header_written"]:
+            f.write(struct.pack("<B", FILE_FORMAT_VERSION))
+            state["header_written"] = True
         f.write(record)
 
 

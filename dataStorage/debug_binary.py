@@ -29,6 +29,9 @@ FLAG_INCLIN = 0x02
 FLAG_TEMP   = 0x04
 SENTINEL    = 0xFF
 
+FORMAT_V1 = 1
+FORMAT_V2 = 2
+
 
 # Per-sensor inter-packet jump thresholds (seconds).
 # Must be >= the encoder's MAX_DELTA_S (60 s) to avoid false positives
@@ -120,6 +123,12 @@ def pass1_structural(filepath, focus_record=None):
     issues = []
 
     with open_decompressed(filepath) as f:
+        ver = f.read(1)
+        fv  = ver[0] if ver else FORMAT_V2
+        if fv not in (FORMAT_V1, FORMAT_V2):
+            f.seek(-1, 1)  # no version byte — seek back, treat as v1
+            fv = FORMAT_V1
+        print(f"  File format: v{fv}")
         idx = 0
         while True:
             offset = f.tell()
@@ -314,6 +323,12 @@ def pass2_delta_trace(filepath, focus_record=None):
         return ts_us
 
     with open_decompressed(filepath) as f:
+        ver = f.read(1)
+        fv  = ver[0] if ver else FORMAT_V2
+        if fv not in (FORMAT_V1, FORMAT_V2):
+            f.seek(-1, 1)  # no version byte — seek back, treat as v1
+            fv = FORMAT_V1
+        print(f"  File format: v{fv}")
         idx = 0
         while True:
             b = f.read(1)
@@ -401,7 +416,7 @@ def pass2_delta_trace(filepath, focus_record=None):
                         prev = ss["xyz_prev"]
                         dr  = read_fmt(f, "<h", "inclin dr")[0]   if changed & 0x02 else 0
                         dp  = read_fmt(f, "<h", "inclin dp")[0]   if changed & 0x04 else 0
-                        dy_ = read_fmt(f, "<i", "inclin dyaw")[0] if changed & 0x08 else 0
+                        dy_ = read_fmt(f, "<h", "inclin dyaw")[0] if changed & 0x08 else 0
                         cur = [prev[0]+dr, prev[1]+dp, prev[2]+dy_]
                         ss["xyz_prev"] = cur
                         if show:
