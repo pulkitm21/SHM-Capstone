@@ -218,3 +218,113 @@ def update_accelerometer_runtime_state(
     settings.config[key]["accelerometer"] = to_dict(updated_accel)
     save_settings(settings)
     return updated_accel
+
+
+# --------------------------------------------------------------------------
+# Control command tracking helpers
+#
+# These helpers track Start / Stop / Init / Reset commands separately from the
+# accelerometer configuration sync flow.
+#
+# Why these are stored as raw dict fields instead of inside the validated
+# AccelerometerConfigModel:
+# - your existing model already supports config sync cleanly
+# - this keeps the control tracking addition small and non-breaking
+# - you can later move these fields into the schema once the flow is stable
+#
+# Stored fields added under config[node_id]["accelerometer"]:
+# - pending_control_cmd
+# - pending_control_seq
+# - last_control_cmd
+# - last_control_seq
+# - last_control_ack_at
+# - control_status
+#
+# control_status values:
+# - "idle"    -> no active control command in flight
+# - "pending" -> backend has published a control command and is waiting for ACK
+# - "acked"   -> node confirmed the command
+# - "failed"  -> backend publish failed or node reported an error
+# --------------------------------------------------------------------------
+
+
+# Store a newly requested control command and mark it pending.
+# This is called right before publishing a Start / Stop / Init / Reset command.
+def update_node_control_request(
+    node_id: int,
+    cmd: str,
+    seq: int,
+):
+    settings = load_settings()
+    key = str(node_id)
+
+    if key not in settings.config:
+        settings.config[key] = build_default_node_config()
+
+    accel_cfg = settings.config[key].get("accelerometer") or {}
+
+    accel_cfg["pending_control_cmd"] = cmd
+    accel_cfg["pending_control_seq"] = seq
+    accel_cfg["control_status"] = "pending"
+
+    settings.config[key]["accelerometer"] = accel_cfg
+    save_settings(settings)
+
+    return accel_cfg
+
+
+# Store a successful control ACK from the node.
+# This clears the pending control request and records the last confirmed command.
+def apply_node_control_ack(
+    node_id: int,
+    cmd_ack: str,
+    seq_ack: int,
+    acked_at: str,
+    current_state: str,
+):
+    settings = load_settings()
+    key = str(node_id)
+
+    if key not in settings.config:
+        settings.config[key] = build_default_node_config()
+
+    accel_cfg = settings.config[key].get("accelerometer") or {}
+
+    accel_cfg["last_control_cmd"] = cmd_ack
+    accel_cfg["last_control_seq"] = seq_ack
+    accel_cfg["last_control_ack_at"] = acked_at
+
+    accel_cfg["pending_control_cmd"] = None
+    accel_cfg["pending_control_seq"] = None
+
+    accel_cfg["control_status"] = "acked"
+
+    # Keep the runtime state aligned with the confirmed command result.
+    accel_cfg["current_state"] = current_state
+
+    settings.config[key]["accelerometer"] = accel_cfg
+    save_settings(settings)
+
+    return accel_cfg
+
+
+# Mark the current control command as failed.
+# This is used when MQTT publish fails or when the node reports an error.
+def mark_node_control_failed(
+    node_id: int,
+    error_msg: str | None = None,
+):
+    settings = load_settings()
+    key = str(node_id)
+
+    if key not in settings.config:
+        settings.config[key] = build_default_node_config()
+
+    accel_cfg = settings.config[key].get("accelerometer") or {}
+
+    accel_cfg["control_status"] = "failed"
+
+    settings.config[key]["accelerometer"] = accel_cfg
+    save_settings(settings)
+
+    return accel_cfg

@@ -45,11 +45,10 @@ def publish_accelerometer_config(
 
 
 # Publish a runtime control command to the target node.
-def publish_node_control(
-    serial: str,
-    cmd: Literal["start", "stop", "init", "reset"],
-) -> None:
+def publish_node_control(serial: str, cmd: str, seq: int | None = None) -> None:
     payload = {"cmd": cmd}
+    if seq is not None:
+        payload["seq"] = seq
 
     mqtt_publish.single(
         topic=control_topic(serial),
