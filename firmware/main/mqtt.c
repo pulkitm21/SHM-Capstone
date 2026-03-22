@@ -61,7 +61,7 @@ static const char s_topic_cmd_all[] = "wind_turbine/all/cmd/control";
 #define CMD_PAYLOAD_MAX_LEN  256
 static char s_cmd_payload_buf[CMD_PAYLOAD_MAX_LEN];
 
-#define JSON_BUFFER_SIZE    4096
+#define JSON_BUFFER_SIZE    6144
 static char *s_json_buffer = NULL;
 
 /*
@@ -335,7 +335,7 @@ esp_err_t mqtt_init(void)
         .session.keepalive               = 60,
         .network.reconnect_timeout_ms   = 5000,
         .buffer.size                    = 1024,
-        .buffer.out_size                = 4096,
+        .buffer.out_size                = 6144,
     };
 
     s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
