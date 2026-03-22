@@ -75,8 +75,8 @@ extern "C" {
  *
  * "raspberrypi" is the default hostname on Raspberry Pi OS supposedly
  */
-#define MQTT_BROKER_HOSTNAME    "192.168.0.100"
-#define MQTT_BROKER_URI         "mqtt://192.168.0.100:1883"
+#define MQTT_BROKER_HOSTNAME    "raspberrypi"
+#define MQTT_BROKER_URI         "mqtt://" MQTT_BROKER_HOSTNAME ".local:1883"
 
 /*
  * MQTT_CLIENT_ID, MQTT_TOPIC_DATA, and MQTT_TOPIC_STATUS are NOT
