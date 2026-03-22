@@ -98,37 +98,38 @@ extern "C" {
 #define MQTT_PUBLISH_QOS        0
 #define MQTT_ACCEL_BATCH_SIZE   200
 
-/* Fixed topic prefix: the node MAC is inserted between this and /data or /status */
 #define MQTT_TOPIC_PREFIX       "wind_turbine"
+
+/* ISO-8601 timestamp buffer. Sized to 40 so -Werror=format-truncation is
+ * satisfied by the two-step strftime+snprintf approach in format_ts(). */
+#define MQTT_TS_LEN  40
 
 /******************************************************************************
  * DATA STRUCTURES
  *****************************************************************************/
 
 typedef struct {
+    char  ts[MQTT_TS_LEN];
     float x;
     float y;
     float z;
 } mqtt_accel_sample_t;
 
-/*Sensor data packet with validity flags*/
+/* Sensor data packet — every field carries its own timestamp */
 typedef struct {
-    uint32_t timestamp;
-
-    // Accelerometer (always present)
     mqtt_accel_sample_t accel[MQTT_ACCEL_BATCH_SIZE];
     int accel_count;
 
-    // Inclinometer
-    bool has_angle;         // Include "i" field in JSON?
-    bool angle_valid;       // true = show values, false = show null
+    bool  has_angle;
+    bool  angle_valid;
+    char  angle_ts[MQTT_TS_LEN];
     float angle_x;
     float angle_y;
     float angle_z;
 
-    // Temperature
-    bool has_temp;          // Include "T" field in JSON?
-    bool temp_valid;        // true = show value, false = show null
+    bool  has_temp;
+    bool  temp_valid;
+    char  temp_ts[MQTT_TS_LEN];
     float temperature;
 
 } mqtt_sensor_packet_t;
@@ -226,6 +227,7 @@ esp_err_t mqtt_publish_status_json(const char *state_str,
                                    uint32_t odr_hz,
                                    uint8_t range,
                                    uint32_t output_hz,
+                                   uint8_t hpf_corner,
                                    bool selftest_ok,
                                    uint32_t seq_ack,
                                    const char *error_msg);

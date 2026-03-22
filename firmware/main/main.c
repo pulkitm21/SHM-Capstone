@@ -48,6 +48,7 @@
 // Node state machine + runtime configuration
 #include "node_config.h"
 #include "fault_log.h"
+#include "sntp_sync.h"
 
 static const char *TAG = "main";
 
@@ -350,6 +351,23 @@ static esp_err_t init_mqtt(void)
     return ESP_OK;
 }
 
+static esp_err_t init_sntp(void)
+{
+    ESP_LOGI(TAG, "--- Initializing SNTP ---");
+    if (!ethernet_is_connected()) {
+        ESP_LOGW(TAG, "Skipping SNTP init - no network");
+        return ESP_FAIL;
+    }
+    esp_err_t ret = sntp_sync_init();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "SNTP init failed (%s) - timestamps will be tick-relative",
+                 esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "SNTP client started (server: %s)", SNTP_SERVER_HOSTNAME);
+    }
+    return ret;
+}
+
 static esp_err_t init_sensors(bool *temp_available)
 {
     esp_err_t ret;
@@ -492,6 +510,7 @@ static void publish_node_status(uint32_t seq_ack, bool selftest_ok,
     mqtt_publish_status_json(
         node_state_str(node_config_get_state()),
         cfg->odr_hz, cfg->range, 200,
+        cfg->hpf_corner,
         selftest_ok, seq_ack, error_msg
     );
 }
@@ -646,6 +665,12 @@ void app_main(void)
     }
     ESP_LOGI(TAG, "");
 
+    bool sntp_ok = false;
+    if (network_ok) {
+        sntp_ok = (init_sntp() == ESP_OK);
+    }
+    ESP_LOGI(TAG, "");
+
     if (init_buses() != ESP_OK) {
         handle_critical_failure("Bus initialization failed (I2C or SPI)");
     }
@@ -655,6 +680,27 @@ void app_main(void)
         handle_critical_failure("Critical sensor initialization failed (ADXL355 or SCL3300)");
     }
     ESP_LOGI(TAG, "");
+
+    // Wait for first SNTP sync before starting ISR so every sample gets
+    // a real ISO-8601 timestamp from packet one. Hard timeout: 10 s.
+    if (sntp_ok) {
+        ESP_LOGI(TAG, "--- Waiting for first SNTP sync ---");
+        const int SNTP_WAIT_TIMEOUT_MS = 10000;
+        const int SNTP_WAIT_STEP_MS    = 100;
+        int waited_ms = 0;
+        while (!sntp_sync_is_valid() && waited_ms < SNTP_WAIT_TIMEOUT_MS) {
+            vTaskDelay(pdMS_TO_TICKS(SNTP_WAIT_STEP_MS));
+            waited_ms += SNTP_WAIT_STEP_MS;
+        }
+        if (sntp_sync_is_valid()) {
+            ESP_LOGI(TAG, "SNTP synced after %d ms — ISR will use UTC timestamps",
+                     waited_ms);
+        } else {
+            ESP_LOGW(TAG, "SNTP sync timeout (%d ms) — using tick-relative timestamps",
+                     waited_ms);
+        }
+        ESP_LOGI(TAG, "");
+    }
 
     if (init_acquisition(temp_sensor_available) != ESP_OK) {
         handle_critical_failure("ISR acquisition initialization failed");

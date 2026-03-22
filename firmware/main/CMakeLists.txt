@@ -14,6 +14,7 @@ idf_component_register(
          fault_log.c
          data_processing_and_mqtt_task.c
          sensor_task.c
+         sntp_sync.c
     INCLUDE_DIRS "."
     PRIV_INCLUDE_DIRS
     REQUIRES esp_driver_i2c
@@ -29,4 +30,5 @@ idf_component_register(
                    nvs_flash
                    mqtt
                    mdns
+                   lwip
 )

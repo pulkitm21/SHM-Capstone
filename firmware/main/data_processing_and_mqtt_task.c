@@ -35,6 +35,8 @@
 #include "esp_timer.h"
 #include <string.h>
 #include <math.h>
+#include <time.h>
+#include <sys/time.h>
 
 static const char *TAG = "DATA_PROC";
 
@@ -70,9 +72,41 @@ static inline float convert_adxl355_to_g(int32_t raw, float sensitivity_lsb_g)
 
 static inline float convert_scl3300_to_deg(int16_t raw)
 {
-    /* SCL3300 acceleration registers: 0.0055 deg/LSB */
-    return (float)raw * 0.0055f;
+    // SCL3300 angle output registers: full-scale +-90 degrees over 16384 LSB
+    return (float)raw * (90.0f / 16384.0f);
 }
+
+/*
+ * Format a wall-clock timestamp into buf (must be >= MQTT_TS_LEN bytes).
+ * Back-calculates the exact wall time when the ISR tick was captured.
+ * Falls back to "tick:NNNNNNNN" if SNTP has not yet synced.
+ */
+static void format_ts(char *buf, uint32_t tick)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+
+    if (tv.tv_sec > 1700000000L) {
+        uint32_t current_tick = get_tick_count();
+        int64_t delta_us = (int64_t)((int32_t)(current_tick - tick)) * 125LL;
+        int64_t sample_us = (int64_t)tv.tv_sec * 1000000LL
+                            + (int64_t)tv.tv_usec - delta_us;
+
+        time_t sec = (time_t)(sample_us / 1000000LL);
+        int    us  = (int)(sample_us % 1000000LL);
+        if (us < 0) { us += 1000000; sec -= 1; }
+
+        struct tm tm_info;
+        gmtime_r(&sec, &tm_info);
+        strftime(buf, MQTT_TS_LEN, "%Y-%m-%dT%H:%M:%S", &tm_info);
+        snprintf(buf + 19, MQTT_TS_LEN - 19, ".%06dZ", us);
+    } else {
+        snprintf(buf, MQTT_TS_LEN, "tick:%08lu", (unsigned long)tick);
+    }
+}
+
+/* Static packet buffer — keeps ~10500 bytes off the task stack */
+static mqtt_sensor_packet_t s_packet;
 
 static void drain_ring_buffers(void)
 {
@@ -99,12 +133,12 @@ static void data_processing_task(void *pvParameters)
     int64_t  sum_z             = 0;
     uint32_t decim_first_tick  = 0;
     int      accel_batch_count = 0;
-    uint32_t first_tick        = 0;   /* tick of first raw sample in this packet */
 
     uint32_t last_temp_read_ms = (uint32_t)(esp_timer_get_time() / 1000)
                                  - TEMP_READ_INTERVAL_MS;
     float current_temp  = 0.0f;
     bool  temp_valid    = false;
+    char  current_temp_ts[MQTT_TS_LEN] = {0};
 
     float current_incl_x = 0.0f;
     float current_incl_y = 0.0f;
@@ -153,6 +187,7 @@ static void data_processing_task(void *pvParameters)
             if (err == ESP_OK) {
                 current_temp = tc;
                 temp_valid   = true;
+                format_ts(current_temp_ts, get_tick_count());
             } else {
                 temp_valid = false;
                 s_temp_read_errors++;
@@ -198,11 +233,6 @@ static void data_processing_task(void *pvParameters)
 
             if (!adxl355_read_sample(&adxl_sample)) break;
 
-            /* Capture tick of the very first raw sample in this packet */
-            if (accel_batch_count == 0 && decim_count == 0) {
-                first_tick = adxl_sample.tick;
-            }
-
             /* Capture tick of the first raw sample in this decimation window */
             if (decim_count == 0) {
                 decim_first_tick = adxl_sample.tick;
@@ -239,40 +269,43 @@ static void data_processing_task(void *pvParameters)
                         }
                     }
 
-                    /* Build packet */
-                    mqtt_sensor_packet_t packet = {0};
-                    packet.timestamp   = TICKS_TO_US(first_tick);
-                    packet.accel_count = accel_batch_count;
+                    /* Build packet using static buffer to avoid stack overflow */
+                    mqtt_sensor_packet_t *packet = &s_packet;
+                    memset(packet, 0, sizeof(*packet));
+                    packet->accel_count = accel_batch_count;
 
                     for (int i = 0; i < accel_batch_count; i++) {
-                        packet.accel[i].x = s_accel_x[i];
-                        packet.accel[i].y = s_accel_y[i];
-                        packet.accel[i].z = s_accel_z[i];
+                        packet->accel[i].x = s_accel_x[i];
+                        packet->accel[i].y = s_accel_y[i];
+                        packet->accel[i].z = s_accel_z[i];
+                        format_ts(packet->accel[i].ts, s_accel_ticks[i]);
                     }
 
-                    packet.has_angle   = true;
-                    packet.angle_valid = incl_valid;
+                    packet->has_angle   = true;
+                    packet->angle_valid = incl_valid;
                     if (incl_valid) {
-                        packet.angle_x = current_incl_x;
-                        packet.angle_y = current_incl_y;
-                        packet.angle_z = current_incl_z;
+                        packet->angle_x = current_incl_x;
+                        packet->angle_y = current_incl_y;
+                        packet->angle_z = current_incl_z;
+                        format_ts(packet->angle_ts, scl_sample.tick);
                     }
 
-                    packet.has_temp   = true;
-                    packet.temp_valid = temp_valid;
+                    packet->has_temp   = true;
+                    packet->temp_valid = temp_valid;
                     if (temp_valid) {
-                        packet.temperature = current_temp;
+                        packet->temperature = current_temp;
+                        memcpy(packet->temp_ts, current_temp_ts, MQTT_TS_LEN);
                     }
 
-                    esp_err_t pub_ret = mqtt_publish_sensor_data(&packet);
+                    esp_err_t pub_ret = mqtt_publish_sensor_data(packet);
                     if (pub_ret == ESP_OK) {
                         s_samples_published += (uint32_t)accel_batch_count;
                         s_packets_sent++;
-                        ESP_LOGD(TAG, "pkt#%lu ts=%luus incl=%s temp=%s odr=%luHz",
+                        ESP_LOGD(TAG, "pkt#%lu accel=%d incl=%s temp=%s odr=%luHz",
                                  (unsigned long)s_packets_sent,
-                                 (unsigned long)packet.timestamp,
-                                 packet.angle_valid ? "ok" : "null",
-                                 packet.temp_valid  ? "ok" : "null",
+                                 packet->accel_count,
+                                 packet->angle_valid ? "ok" : "null",
+                                 packet->temp_valid  ? "ok" : "null",
                                  (unsigned long)odr_hz);
                     } else {
                         s_samples_dropped += (uint32_t)accel_batch_count;

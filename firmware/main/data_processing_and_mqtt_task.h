@@ -26,7 +26,7 @@ extern "C" {
  * TASK CONFIGURATION (fixed — unrelated to sensor ODR)
  *****************************************************************************/
 
-#define DATA_PROCESSING_TASK_STACK_SIZE    8192
+#define DATA_PROCESSING_TASK_STACK_SIZE    6144
 #define DATA_PROCESSING_TASK_PRIORITY      5
 #define DATA_PROCESSING_TASK_CORE          0
 

@@ -61,7 +61,8 @@ static const char s_topic_cmd_all[] = "wind_turbine/all/cmd/control";
 #define CMD_PAYLOAD_MAX_LEN  256
 static char s_cmd_payload_buf[CMD_PAYLOAD_MAX_LEN];
 
-#define JSON_BUFFER_SIZE    6144
+/* 200 samples x ~60 chars each + inclinometer + temperature + framing = ~14000 chars */
+#define JSON_BUFFER_SIZE    16384
 static char *s_json_buffer = NULL;
 
 /*
@@ -401,44 +402,40 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
     /*
      * JSON FORMAT:
      * {
-     *   "t": 123456789,                              // Timestamp (always present)
-     *   "a": [[x,y,z], [x,y,z], ...],                // Accelerometer (always present)
-     *   "i": [x, y, z] OR null,                      // Inclinometer (null if invalid)
-     *   "T": 21.5 OR null                            // Temperature (null if invalid)
+     *   "a": [["2026-03-21T20:49:06.305421Z", x, y, z], ...],
+     *   "i": ["2026-03-21T20:49:06.355000Z", x, y, z] | null,
+     *   "T": ["2026-03-21T20:49:06.355000Z", val]      | null
      * }
      */
 
     int offset = 0;
 
-    // Timestamp
-    offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                       "{\"t\":%lu,\"a\":[", (unsigned long)packet->timestamp);
+    offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, "{\"a\":[");
 
-    // Accelerometer array (always present)
     for (int i = 0; i < packet->accel_count && i < MQTT_ACCEL_BATCH_SIZE; i++) {
         if (i > 0) {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, ",");
         }
         offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                           "[%.4f,%.4f,%.4f]",
+                           "[\"%s\",%.4f,%.4f,%.4f]",
+                           packet->accel[i].ts,
                            packet->accel[i].x,
                            packet->accel[i].y,
                            packet->accel[i].z);
 
-        if (offset >= JSON_BUFFER_SIZE - 100) {
-            ESP_LOGE(TAG, "JSON buffer overflow!");
+        if (offset >= JSON_BUFFER_SIZE - 200) {
+            ESP_LOGE(TAG, "JSON buffer overflow at sample %d!", i);
             return ESP_ERR_NO_MEM;
         }
     }
 
-    // Close accelerometer array
     offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, "]");
 
-    // Inclinometer: ALWAYS include field, use null if invalid
     if (packet->has_angle) {
         if (packet->angle_valid) {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                               ",\"i\":[%.4f,%.4f,%.4f]",
+                               ",\"i\":[\"%s\",%.4f,%.4f,%.4f]",
+                               packet->angle_ts,
                                packet->angle_x, packet->angle_y, packet->angle_z);
         } else {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
@@ -446,18 +443,17 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
         }
     }
 
-    // Temperature ALWAYS include field, use null if invalid
     if (packet->has_temp) {
         if (packet->temp_valid) {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                               ",\"T\":%.2f", packet->temperature);
+                               ",\"T\":[\"%s\",%.2f]",
+                               packet->temp_ts, packet->temperature);
         } else {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
                                ",\"T\":null");
         }
     }
 
-    // Close JSON
     offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, "}");
 
     // Publish to the serial-number-derived data topic
@@ -604,6 +600,7 @@ esp_err_t mqtt_publish_status_json(const char *state_str,
                                    uint32_t odr_hz,
                                    uint8_t range,
                                    uint32_t output_hz,
+                                   uint8_t hpf_corner,
                                    bool selftest_ok,
                                    uint32_t seq_ack,
                                    const char *error_msg)
@@ -612,7 +609,7 @@ esp_err_t mqtt_publish_status_json(const char *state_str,
         return ESP_ERR_INVALID_STATE;
     }
 
-    char buf[256];
+    char buf[320];
     int offset = 0;
     int range_g = (range == 1) ? 2 : (range == 2) ? 4 : 8;
 
@@ -621,12 +618,14 @@ esp_err_t mqtt_publish_status_json(const char *state_str,
                        "\"odr_hz\":%lu,"
                        "\"range_g\":%d,"
                        "\"output_hz\":%lu,"
+                       "\"hpf_corner\":%u,"
                        "\"selftest_ok\":%s,"
                        "\"seq_ack\":%lu",
                        state_str ? state_str : "unknown",
                        (unsigned long)odr_hz,
                        range_g,
                        (unsigned long)output_hz,
+                       (unsigned)hpf_corner,
                        selftest_ok ? "true" : "false",
                        (unsigned long)seq_ack);
 
@@ -644,6 +643,6 @@ esp_err_t mqtt_publish_status_json(const char *state_str,
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Status → %s: %s", s_topic_status, buf);
+    ESP_LOGI(TAG, "Status -> %s: %s", s_topic_status, buf);
     return ESP_OK;
 }
