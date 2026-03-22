@@ -15,7 +15,8 @@ from pathlib import Path
 from mqtt_listener import start_listener
 
 from settings_schema import SettingsModel, to_dict, copy_deep
-# Import config ACK helpers and MQTT command publishers for Phase 2.
+
+# Import config ACK helpers and MQTT command publishers
 from settings_store import (
     load_settings,
     save_settings,
@@ -24,7 +25,10 @@ from settings_store import (
     mark_accelerometer_config_failed,
     get_site_name,
     update_site_name,
+    update_node_control_request,
+    mark_node_control_failed,
 )
+
 from node_registry import list_nodes, get_node_by_id, update_node_position
 from mqtt_commands import publish_accelerometer_config, publish_node_control
 

@@ -4,6 +4,8 @@ import "./SensorConfig.css";
 export type AccelerometerOdrIndex = 0 | 1 | 2;
 export type AccelerometerRange = 1 | 2 | 3;
 export type ConfigSyncStatus = "unknown" | "synced" | "pending" | "failed";
+export type ControlStatus = "idle" | "pending" | "acked" | "failed";
+export type ControlCommand = "start" | "stop";
 export type NodeState = "unknown" | "idle" | "configured" | "recording" | "reconfig" | "error";
 
 export type SensorConfig = {
@@ -24,6 +26,13 @@ export type SensorConfig = {
   applied_seq?: number | null;
   last_ack_at?: string | null;
   sync_status: ConfigSyncStatus;
+
+  pending_control_cmd?: ControlCommand | null;
+  pending_control_seq?: number | null;
+  last_control_cmd?: ControlCommand | null;
+  last_control_seq?: number | null;
+  last_control_ack_at?: string | null;
+  control_status?: ControlStatus;
 };
 
 const DEFAULT_CONFIG: SensorConfig = {
@@ -41,6 +50,12 @@ const DEFAULT_CONFIG: SensorConfig = {
   applied_seq: null,
   last_ack_at: null,
   sync_status: "unknown",
+  pending_control_cmd: null,
+  pending_control_seq: null,
+  last_control_cmd: null,
+  last_control_seq: null,
+  last_control_ack_at: null,
+  control_status: "idle",
 };
 
 function withDefaults(cfg?: Partial<SensorConfig> | null): SensorConfig {
@@ -48,9 +63,11 @@ function withDefaults(cfg?: Partial<SensorConfig> | null): SensorConfig {
     odr_index: cfg?.odr_index ?? DEFAULT_CONFIG.odr_index,
     range: cfg?.range ?? DEFAULT_CONFIG.range,
     hpf_corner: cfg?.hpf_corner ?? DEFAULT_CONFIG.hpf_corner,
-    desired_odr_index: cfg?.desired_odr_index ?? cfg?.odr_index ?? DEFAULT_CONFIG.desired_odr_index,
+    desired_odr_index:
+      cfg?.desired_odr_index ?? cfg?.odr_index ?? DEFAULT_CONFIG.desired_odr_index,
     desired_range: cfg?.desired_range ?? cfg?.range ?? DEFAULT_CONFIG.desired_range,
-    desired_hpf_corner: cfg?.desired_hpf_corner ?? cfg?.hpf_corner ?? DEFAULT_CONFIG.desired_hpf_corner,
+    desired_hpf_corner:
+      cfg?.desired_hpf_corner ?? cfg?.hpf_corner ?? DEFAULT_CONFIG.desired_hpf_corner,
     applied_odr_index: cfg?.applied_odr_index ?? DEFAULT_CONFIG.applied_odr_index,
     applied_range: cfg?.applied_range ?? DEFAULT_CONFIG.applied_range,
     applied_hpf_corner: cfg?.applied_hpf_corner ?? DEFAULT_CONFIG.applied_hpf_corner,
@@ -59,6 +76,12 @@ function withDefaults(cfg?: Partial<SensorConfig> | null): SensorConfig {
     applied_seq: cfg?.applied_seq ?? DEFAULT_CONFIG.applied_seq,
     last_ack_at: cfg?.last_ack_at ?? DEFAULT_CONFIG.last_ack_at,
     sync_status: cfg?.sync_status ?? DEFAULT_CONFIG.sync_status,
+    pending_control_cmd: cfg?.pending_control_cmd ?? DEFAULT_CONFIG.pending_control_cmd,
+    pending_control_seq: cfg?.pending_control_seq ?? DEFAULT_CONFIG.pending_control_seq,
+    last_control_cmd: cfg?.last_control_cmd ?? DEFAULT_CONFIG.last_control_cmd,
+    last_control_seq: cfg?.last_control_seq ?? DEFAULT_CONFIG.last_control_seq,
+    last_control_ack_at: cfg?.last_control_ack_at ?? DEFAULT_CONFIG.last_control_ack_at,
+    control_status: cfg?.control_status ?? DEFAULT_CONFIG.control_status,
   };
 }
 
@@ -82,7 +105,7 @@ function prettyRange(value: AccelerometerRange | null) {
   return "±8g";
 }
 
-function prettyStatus(value: ConfigSyncStatus) {
+function prettySyncStatus(value: ConfigSyncStatus) {
   switch (value) {
     case "synced":
       return "Synced";
@@ -92,6 +115,19 @@ function prettyStatus(value: ConfigSyncStatus) {
       return "Failed";
     default:
       return "Unknown";
+  }
+}
+
+function prettyControlStatus(value: ControlStatus) {
+  switch (value) {
+    case "acked":
+      return "Acked";
+    case "pending":
+      return "Pending";
+    case "failed":
+      return "Failed";
+    default:
+      return "Idle";
   }
 }
 
@@ -125,6 +161,19 @@ function pillClassForSyncStatus(status: ConfigSyncStatus) {
   }
 }
 
+function pillClassForControlStatus(status: ControlStatus) {
+  switch (status) {
+    case "acked":
+      return "sc-pill sc-pill-success";
+    case "pending":
+      return "sc-pill sc-pill-warning";
+    case "failed":
+      return "sc-pill sc-pill-danger";
+    default:
+      return "sc-pill";
+  }
+}
+
 function pillClassForNodeState(state: NodeState) {
   switch (state) {
     case "recording":
@@ -139,13 +188,13 @@ function pillClassForNodeState(state: NodeState) {
   }
 }
 
-function formatAckTime(value?: string | null) {
-  if (!value) return "No ACK yet";
+function formatAckTime(value?: string | null, empty = "No ACK yet") {
+  if (!value) return empty;
 
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "Invalid ACK time";
 
-  return `Last ACK ${date.toLocaleString()}`;
+  return date.toLocaleString();
 }
 
 export default function SensorConfigCard({
@@ -169,8 +218,12 @@ export default function SensorConfigCard({
 }) {
   const safeConfig = useMemo(() => withDefaults(config), [config]);
 
-  const [draftOdr, setDraftOdr] = useState<AccelerometerOdrIndex>(safeConfig.desired_odr_index);
-  const [draftRange, setDraftRange] = useState<AccelerometerRange>(safeConfig.desired_range);
+  const [draftOdr, setDraftOdr] = useState<AccelerometerOdrIndex>(
+    safeConfig.desired_odr_index
+  );
+  const [draftRange, setDraftRange] = useState<AccelerometerRange>(
+    safeConfig.desired_range
+  );
   const [draftHpf, setDraftHpf] = useState<number>(safeConfig.desired_hpf_corner);
   const [isEditing, setIsEditing] = useState(false);
 
@@ -189,10 +242,6 @@ export default function SensorConfigCard({
     draftRange !== safeConfig.desired_range ||
     draftHpf !== safeConfig.desired_hpf_corner;
 
-  // What the user sees as the "current" config:
-  // - synced => show applied values
-  // - pending/failed/unknown => show desired values
-  // This matches the UX you wanted: immediately show the new chosen values after Apply.
   const displayConfig =
     safeConfig.sync_status === "synced"
       ? {
@@ -205,6 +254,21 @@ export default function SensorConfigCard({
           range: safeConfig.desired_range,
           hpf: safeConfig.desired_hpf_corner,
         };
+
+  const startDisabled =
+    disabled ||
+    isEditing ||
+    safeConfig.control_status === "pending" ||
+    safeConfig.current_state === "recording";
+
+  const stopDisabled =
+    disabled ||
+    isEditing ||
+    safeConfig.control_status === "pending" ||
+    safeConfig.current_state !== "recording";
+
+  const applyDisabled =
+    disabled || !isDirty || safeConfig.sync_status === "pending";
 
   function handleCancelEdit() {
     setDraftOdr(safeConfig.desired_odr_index);
@@ -219,10 +283,6 @@ export default function SensorConfigCard({
       range: draftRange,
       hpf_corner: draftHpf,
     });
-
-    // Exit edit mode immediately.
-    // Parent updates desired config optimistically, so the card shows the new
-    // values right away while sync status remains Pending until ACK arrives.
     setIsEditing(false);
   }
 
@@ -231,7 +291,7 @@ export default function SensorConfigCard({
       <div className="sc-topbar">
         <div>
           <h2 className="sc-title">{title}</h2>
-          <p className="sc-subtitle">Compact live config for the selected node.</p>
+          <p className="sc-subtitle">Live configuration and acquisition status for the selected node.</p>
         </div>
 
         <div className="sc-topbar-actions">
@@ -240,7 +300,11 @@ export default function SensorConfigCard({
           </span>
 
           <span className={pillClassForSyncStatus(safeConfig.sync_status)}>
-            {prettyStatus(safeConfig.sync_status)}
+            Config {prettySyncStatus(safeConfig.sync_status)}
+          </span>
+
+          <span className={pillClassForControlStatus(safeConfig.control_status ?? "idle")}>
+            Control {prettyControlStatus(safeConfig.control_status ?? "idle")}
           </span>
 
           {!disabled && !isEditing && (
@@ -316,19 +380,44 @@ export default function SensorConfigCard({
       <div className="sc-footer-row">
         <div className="sc-runtime-group">
           <div className="sc-runtime-chip">
-            <span className="sc-runtime-label">Pending Seq</span>
+            <span className="sc-runtime-label">Pending Config Seq</span>
             <span className="sc-runtime-value">{safeConfig.pending_seq ?? "—"}</span>
           </div>
 
           <div className="sc-runtime-chip">
-            <span className="sc-runtime-label">Applied Seq</span>
+            <span className="sc-runtime-label">Applied Config Seq</span>
             <span className="sc-runtime-value">{safeConfig.applied_seq ?? "—"}</span>
           </div>
 
+          <div className="sc-runtime-chip">
+            <span className="sc-runtime-label">Pending Control</span>
+            <span className="sc-runtime-value">
+              {safeConfig.pending_control_cmd
+                ? `${safeConfig.pending_control_cmd} (${safeConfig.pending_control_seq ?? "—"})`
+                : "—"}
+            </span>
+          </div>
+
+          <div className="sc-runtime-chip">
+            <span className="sc-runtime-label">Last Control</span>
+            <span className="sc-runtime-value">
+              {safeConfig.last_control_cmd
+                ? `${safeConfig.last_control_cmd} (${safeConfig.last_control_seq ?? "—"})`
+                : "—"}
+            </span>
+          </div>
+
           <div className="sc-runtime-chip sc-runtime-chip-wide">
-            <span className="sc-runtime-label">ACK</span>
+            <span className="sc-runtime-label">Config ACK</span>
             <span className="sc-runtime-value sc-runtime-value-muted">
               {formatAckTime(safeConfig.last_ack_at)}
+            </span>
+          </div>
+
+          <div className="sc-runtime-chip sc-runtime-chip-wide">
+            <span className="sc-runtime-label">Control ACK</span>
+            <span className="sc-runtime-value sc-runtime-value-muted">
+              {formatAckTime(safeConfig.last_control_ack_at, "No control ACK yet")}
             </span>
           </div>
         </div>
@@ -343,17 +432,27 @@ export default function SensorConfigCard({
                 type="button"
                 className="sc-btn sc-btn-success"
                 onClick={handleApplyClick}
-                disabled={disabled || !isDirty}
+                disabled={applyDisabled}
               >
                 Apply
               </button>
             </>
           ) : (
             <>
-              <button type="button" className="sc-btn sc-btn-neutral" onClick={onStart} disabled={disabled}>
+              <button
+                type="button"
+                className="sc-btn sc-btn-neutral"
+                onClick={onStart}
+                disabled={startDisabled}
+              >
                 Start
               </button>
-              <button type="button" className="sc-btn sc-btn-danger" onClick={onStop} disabled={disabled}>
+              <button
+                type="button"
+                className="sc-btn sc-btn-danger"
+                onClick={onStop}
+                disabled={stopDisabled}
+              >
                 Stop
               </button>
             </>

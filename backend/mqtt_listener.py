@@ -10,8 +10,8 @@ from settings_store import (
     apply_accelerometer_config_ack,
     mark_accelerometer_config_failed,
     load_settings,
-    apply_node_control_ack,          # NEW
-    mark_node_control_failed,        # NEW
+    apply_node_control_ack,          
+    mark_node_control_failed,        
 )
 
 BROKER_HOST = "localhost"
