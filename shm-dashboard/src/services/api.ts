@@ -124,7 +124,6 @@ export type BulkNodePositionsResponse = {
 };
 
 export function getHealth(signal?: AbortSignal) {
-  // Testing/manual health check endpoint only. SSE is used for backend status updates in the dashboard.
   return request<HealthResponse>("/health", { signal });
 }
 
@@ -173,10 +172,7 @@ export function getSettings(signal?: AbortSignal) {
   return request<SettingsResponse>("/api/settings", { signal });
 }
 
-export function putSettings(
-  body: SettingsResponse,
-  signal?: AbortSignal
-) {
+export function putSettings(body: SettingsResponse, signal?: AbortSignal) {
   return request<SettingsResponse>("/api/settings", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
@@ -255,10 +251,7 @@ export type FaultsQueryParams = {
   limit?: number;
 };
 
-export function getFaults(
-  params?: FaultsQueryParams,
-  signal?: AbortSignal
-) {
+export function getFaults(params?: FaultsQueryParams, signal?: AbortSignal) {
   const qs = new URLSearchParams();
 
   if (params?.serial_number) qs.set("serial_number", params.serial_number);
@@ -279,6 +272,8 @@ export type AccelerometerOdrIndex = 0 | 1 | 2;
 export type AccelerometerRange = 1 | 2 | 3;
 export type ConfigSyncStatus = "unknown" | "synced" | "pending" | "failed";
 export type NodeState = "unknown" | "idle" | "configured" | "recording" | "reconfig" | "error";
+export type ControlStatus = "idle" | "pending" | "acked" | "failed";
+export type ControlCommand = "start" | "stop";
 
 export type ApplyAccelerometerConfigBody = {
   odr_index: AccelerometerOdrIndex;
@@ -309,15 +304,19 @@ export type ApplyAccelerometerConfigResponse = {
 };
 
 export type NodeControlBody = {
-  cmd: "start" | "stop" | "init" | "reset";
+  cmd: ControlCommand;
 };
 
 export type NodeControlResponse = {
   ok: boolean;
   node_id: number;
   serial: string;
-  cmd: "start" | "stop" | "init" | "reset";
+  cmd: ControlCommand;
+  seq: number;
   status: string;
+  control_status: ControlStatus;
+  pending_control_cmd: ControlCommand | null;
+  pending_control_seq: number | null;
 };
 
 export function applyAccelerometerConfig(

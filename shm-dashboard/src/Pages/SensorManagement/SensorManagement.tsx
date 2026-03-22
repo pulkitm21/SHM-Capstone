@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
 import SensorConfigCard, {
@@ -115,6 +115,12 @@ const EMPTY_SENSOR_CONFIG: SensorConfig = {
   applied_seq: null,
   last_ack_at: null,
   sync_status: "unknown",
+  pending_control_cmd: null,
+  pending_control_seq: null,
+  last_control_cmd: null,
+  last_control_seq: null,
+  last_control_ack_at: null,
+  control_status: "idle",
 };
 
 const FALLBACK_CONFIG: Record<SensorValue, SensorConfig> = {
@@ -216,6 +222,12 @@ function normalizeSensorConfig(raw: any): SensorConfig {
     applied_seq: raw?.applied_seq ?? null,
     last_ack_at: raw?.last_ack_at ?? raw?.acked_at ?? null,
     sync_status: raw?.sync_status ?? "unknown",
+    pending_control_cmd: raw?.pending_control_cmd ?? null,
+    pending_control_seq: raw?.pending_control_seq ?? null,
+    last_control_cmd: raw?.last_control_cmd ?? null,
+    last_control_seq: raw?.last_control_seq ?? null,
+    last_control_ack_at: raw?.last_control_ack_at ?? null,
+    control_status: raw?.control_status ?? "idle",
   };
 }
 
@@ -278,6 +290,30 @@ export default function SensorManagement() {
   useEffect(() => {
     setChannel("all");
   }, [sensor]);
+
+  const refreshSettingsFromBackend = useCallback(async () => {
+    const json = await getSettings();
+
+    const rawMetaByNode = normalizeNodeKeyedObject<Record<SensorValue, SensorMeta>>(json.meta);
+    const rawConfigByNode = normalizeNodeKeyedObject<any>(json.config);
+
+    const nextMetaByNode: Record<number, Record<SensorValue, SensorMeta>> = {};
+    const nextConfigByNode: Record<number, Record<SensorValue, SensorConfig>> = {};
+
+    const nodeIds = new Set<number>([
+      ...Object.keys(rawMetaByNode).map(Number),
+      ...Object.keys(rawConfigByNode).map(Number),
+    ]);
+
+    nodeIds.forEach((n) => {
+      nextMetaByNode[n] = { ...FALLBACK_META, ...(rawMetaByNode[n] ?? {}) };
+      nextConfigByNode[n] = normalizeSensorConfigMap(rawConfigByNode[n]);
+    });
+
+    setMetaByNode(nextMetaByNode);
+    setConfigByNode(nextConfigByNode);
+    saveCachedSettings(nextMetaByNode, nextConfigByNode);
+  }, []);
 
   useEffect(() => {
     if (UI_PREVIEW_MODE) {
@@ -347,31 +383,16 @@ export default function SensorManagement() {
       return;
     }
 
-    async function loadSettingsFromBackend() {
+    let mounted = true;
+
+    async function loadSettings() {
       try {
-        const json = await getSettings();
-
-        const rawMetaByNode = normalizeNodeKeyedObject<Record<SensorValue, SensorMeta>>(json.meta);
-        const rawConfigByNode = normalizeNodeKeyedObject<any>(json.config);
-
-        const nextMetaByNode: Record<number, Record<SensorValue, SensorMeta>> = {};
-        const nextConfigByNode: Record<number, Record<SensorValue, SensorConfig>> = {};
-
-        const nodeIds = new Set<number>([
-          ...Object.keys(rawMetaByNode).map(Number),
-          ...Object.keys(rawConfigByNode).map(Number),
-        ]);
-
-        nodeIds.forEach((n) => {
-          nextMetaByNode[n] = { ...FALLBACK_META, ...(rawMetaByNode[n] ?? {}) };
-          nextConfigByNode[n] = normalizeSensorConfigMap(rawConfigByNode[n]);
-        });
-
-        setMetaByNode(nextMetaByNode);
-        setConfigByNode(nextConfigByNode);
-        saveCachedSettings(nextMetaByNode, nextConfigByNode);
+        await refreshSettingsFromBackend();
+        if (!mounted) return;
         setSettingsStatus("");
       } catch (e: any) {
+        if (!mounted) return;
+
         const cached = loadCachedSettings();
 
         if (cached?.savedAt) {
@@ -386,8 +407,12 @@ export default function SensorManagement() {
       }
     }
 
-    void loadSettingsFromBackend();
-  }, []);
+    void loadSettings();
+
+    return () => {
+      mounted = false;
+    };
+  }, [refreshSettingsFromBackend]);
 
   function ensureNodeDefaults(n: number) {
     if (!n) return;
@@ -459,6 +484,12 @@ export default function SensorManagement() {
         applied_seq: res.applied_seq,
         last_ack_at: res.acked_at ?? null,
         sync_status: res.sync_status,
+        pending_control_cmd: currentAccelConfig.pending_control_cmd ?? null,
+        pending_control_seq: currentAccelConfig.pending_control_seq ?? null,
+        last_control_cmd: currentAccelConfig.last_control_cmd ?? null,
+        last_control_seq: currentAccelConfig.last_control_seq ?? null,
+        last_control_ack_at: currentAccelConfig.last_control_ack_at ?? null,
+        control_status: currentAccelConfig.control_status ?? "idle",
       };
 
       setConfigByNode((prev) => ({
@@ -470,6 +501,10 @@ export default function SensorManagement() {
       }));
 
       setSettingsStatus("Accelerometer config request accepted.");
+
+      window.setTimeout(() => {
+        void refreshSettingsFromBackend().catch(() => {});
+      }, 1000);
     } catch (e: any) {
       setConfigByNode((prev) => ({
         ...prev,
@@ -497,6 +532,12 @@ export default function SensorManagement() {
           accelerometer: {
             ...(prev[nodeId]?.accelerometer ?? EMPTY_SENSOR_CONFIG),
             current_state: cmd === "start" ? "recording" : "configured",
+            control_status: "acked",
+            last_control_cmd: cmd,
+            last_control_seq: Date.now(),
+            last_control_ack_at: new Date().toISOString(),
+            pending_control_cmd: null,
+            pending_control_seq: null,
           },
         },
       }));
@@ -505,14 +546,90 @@ export default function SensorManagement() {
       return;
     }
 
+    const currentNodeConfig = configByNode[nodeId] ?? FALLBACK_CONFIG;
+    const currentAccelConfig = currentNodeConfig.accelerometer ?? EMPTY_SENSOR_CONFIG;
+
+    setConfigByNode((prev) => ({
+      ...prev,
+      [nodeId]: {
+        ...(prev[nodeId] ?? FALLBACK_CONFIG),
+        accelerometer: {
+          ...(prev[nodeId]?.accelerometer ?? EMPTY_SENSOR_CONFIG),
+          control_status: "pending",
+          pending_control_cmd: cmd,
+        },
+      },
+    }));
+
     try {
       setSettingsStatus(`${cmd === "start" ? "Starting" : "Stopping"} node…`);
+
       const res = await sendNodeControl(nodeId, { cmd });
+
+      setConfigByNode((prev) => ({
+        ...prev,
+        [nodeId]: {
+          ...(prev[nodeId] ?? FALLBACK_CONFIG),
+          accelerometer: {
+            ...(prev[nodeId]?.accelerometer ?? EMPTY_SENSOR_CONFIG),
+            current_state:
+              cmd === "start"
+                ? currentAccelConfig.current_state
+                : currentAccelConfig.current_state,
+            control_status: res.control_status ?? "pending",
+            pending_control_cmd: res.pending_control_cmd ?? cmd,
+            pending_control_seq: res.pending_control_seq ?? res.seq ?? null,
+          },
+        },
+      }));
+
       setSettingsStatus(`Node ${res.cmd} request accepted.`);
+
+      window.setTimeout(() => {
+        void refreshSettingsFromBackend().catch(() => {});
+      }, 1000);
     } catch (e: any) {
+      setConfigByNode((prev) => ({
+        ...prev,
+        [nodeId]: {
+          ...(prev[nodeId] ?? FALLBACK_CONFIG),
+          accelerometer: {
+            ...(prev[nodeId]?.accelerometer ?? EMPTY_SENSOR_CONFIG),
+            control_status: "failed",
+            pending_control_cmd: null,
+            pending_control_seq: null,
+          },
+        },
+      }));
+
       setSettingsStatus(`Node ${cmd} failed: ${e?.message ?? "Unknown error"}`);
     }
   }
+
+  const selectedAccelConfig = nodeId
+    ? configByNode[nodeId]?.accelerometer ?? EMPTY_SENSOR_CONFIG
+    : EMPTY_SENSOR_CONFIG;
+
+  useEffect(() => {
+    if (UI_PREVIEW_MODE || !selectedNode) return;
+
+    const isPending =
+      selectedAccelConfig.sync_status === "pending" ||
+      selectedAccelConfig.control_status === "pending";
+
+    if (!isPending) return;
+
+    const intervalId = window.setInterval(() => {
+      void refreshSettingsFromBackend().catch(() => {});
+    }, 1500);
+
+    return () => window.clearInterval(intervalId);
+  }, [
+    selectedNode,
+    selectedAccelConfig.sync_status,
+    selectedAccelConfig.control_status,
+    refreshSettingsFromBackend,
+  ]);
 
   useEffect(() => {
     if (UI_PREVIEW_MODE) {

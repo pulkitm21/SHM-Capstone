@@ -12,8 +12,11 @@ import shutil
 import os
 from pathlib import Path
 
+from mqtt_listener import start_listener
+
 from settings_schema import SettingsModel, to_dict, copy_deep
-# Import config ACK helpers and MQTT command publishers for Phase 2.
+
+# Import config ACK helpers and MQTT command publishers
 from settings_store import (
     load_settings,
     save_settings,
@@ -22,7 +25,10 @@ from settings_store import (
     mark_accelerometer_config_failed,
     get_site_name,
     update_site_name,
+    update_node_control_request,
+    mark_node_control_failed,
 )
+
 from node_registry import list_nodes, get_node_by_id, update_node_position
 from mqtt_commands import publish_accelerometer_config, publish_node_control
 
@@ -283,6 +289,13 @@ def put_node_position(node_id: int, payload: NodePositionUpdate):
         raise HTTPException(status_code=404, detail="Node not found")
     return {"ok": True, "node": updated}
 
+## Start MQTT listener on app startup and store client reference for potential future use (graceful shutdown)
+mqtt_status_client = None
+
+@app.on_event("startup")
+def startup_event():
+    global mqtt_status_client
+    mqtt_status_client = start_listener()
 
 # =========================
 # Bulk node position update endpoint
@@ -431,12 +444,38 @@ def control_node(node_id: int, payload: NodeControlRequest):
 
     ensure_node_defaults(node_id)
 
+    # Millisecond timestamp works well as a simple unique command sequence.
+    seq = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+    try:
+        control_cfg = update_node_control_request(
+            node_id=node_id,
+            cmd=payload.cmd,
+            seq=seq,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to store pending control request: {exc}",
+        )
+
     try:
         publish_node_control(
             serial=node["serial"],
             cmd=payload.cmd,
+            seq=seq,
         )
     except Exception as exc:
+        # If publish fails, mark the pending control request as failed so the UI
+        # does not stay stuck in a pending state.
+        try:
+            mark_node_control_failed(
+                node_id=node_id,
+                error_msg=f"MQTT publish failed: {exc}",
+            )
+        except Exception:
+            pass
+
         raise HTTPException(
             status_code=503,
             detail=f"Failed to publish control command: {exc}",
@@ -447,7 +486,11 @@ def control_node(node_id: int, payload: NodeControlRequest):
         "node_id": node["node_id"],
         "serial": node["serial"],
         "cmd": payload.cmd,
+        "seq": seq,
         "status": "accepted",
+        "control_status": control_cfg.get("control_status"),
+        "pending_control_cmd": control_cfg.get("pending_control_cmd"),
+        "pending_control_seq": control_cfg.get("pending_control_seq"),
     }
 
 
