@@ -2,8 +2,13 @@
  * @file data_processing_and_mqtt_task.h
  * @brief MQTT Publishing Task - Reads from sensor_task ring buffers
  *
+ * Decimation factor, batch size, and sensitivity are runtime values read from
+ * node_config_get(). They update automatically when the node is reconfigured.
+ * See node_config.h for the ODR lookup table.
+ *
  * DATA INTEGRITY:
- * - If no data received → shows "null" in JSON
+ * - No inclinometer/temperature data → shows null in JSON.
+ * - Data gap during reconfiguration is expected and documented behaviour.
  */
 
 #ifndef DATA_PROCESSING_AND_MQTT_TASK_H
@@ -18,18 +23,15 @@ extern "C" {
 #endif
 
 /******************************************************************************
- * CONFIGURATION
+ * TASK CONFIGURATION (fixed — unrelated to sensor ODR)
  *****************************************************************************/
 
 #define DATA_PROCESSING_TASK_STACK_SIZE    8192
 #define DATA_PROCESSING_TASK_PRIORITY      5
 #define DATA_PROCESSING_TASK_CORE          0
 
-#define PROCESSING_INTERVAL_MS             50     // Process data every 50 ms
-#define ACCEL_RAW_RATE_HZ                 1000   // Must match ADXL355 ODR
-#define ACCEL_DECIM_FACTOR                 5    // Decimation factor to reduce 1000 Hz raw to 200 Hz published
-#define ACCEL_RAW_SAMPLES_PER_INTERVAL  ((ACCEL_RAW_RATE_HZ * PROCESSING_INTERVAL_MS) / 1000)   // 50
-#define ACCEL_SAMPLES_PER_BATCH         (ACCEL_RAW_SAMPLES_PER_INTERVAL / ACCEL_DECIM_FACTOR)   // 10
+/** How often the processing loop wakes to drain ring buffers (ms). */
+#define PROCESSING_INTERVAL_MS             50
 
 /******************************************************************************
  * PUBLIC FUNCTIONS

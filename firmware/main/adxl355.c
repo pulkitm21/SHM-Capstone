@@ -293,3 +293,18 @@ esp_err_t adxl355_read_temperature(float *temperature_c)
 
     return ESP_OK;
 }
+/* -------------------------------------------------------------------------
+ * Public register access wrappers
+ * Used by node_config.c for reconfiguration and self-test.
+ * Thin wrappers around the static SPI helpers to avoid duplicating framing.
+ * ---------------------------------------------------------------------- */
+
+esp_err_t adxl355_read_reg_pub(uint8_t reg, uint8_t *data, size_t len)
+{
+    return adxl355_read_reg(reg, data, len);
+}
+
+esp_err_t adxl355_write_reg_pub(uint8_t reg, uint8_t value)
+{
+    return adxl355_write_reg(reg, value);
+}

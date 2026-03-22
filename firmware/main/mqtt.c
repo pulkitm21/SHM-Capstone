@@ -29,7 +29,6 @@
 
 #include "mqtt.h"
 #include "mqtt_client.h"
-#include "fault_log.h"
 #include "esp_log.h"
 #include "esp_mac.h"          // esp_read_mac(), ESP_MAC_ETH
 #include "mdns.h"             // mDNS hostname resolution over Ethernet
@@ -49,16 +48,20 @@ static esp_mqtt_client_handle_t s_mqtt_client = NULL;
 static EventGroupHandle_t s_mqtt_event_group = NULL;
 static bool s_is_connected = false;
 
-/*
- * JSON buffer sizing:
- *   Each accelerometer sample now includes a 28-char ISO-8601 timestamp plus
- *   x/y/z floats.  Worst case per sample:
- *     {"t":"2024-11-07T13:45:22.123456Z","v":[x.xxxx,y.yyyy,z.zzzz]},
- *   = ~70 chars.  With MQTT_ACCEL_BATCH_SIZE=100 samples that is ~7000 chars
- *   plus packet overhead (inclinometer, temperature, fault log, JSON framing).
- *   8192 bytes gives safe headroom.
- */
-#define JSON_BUFFER_SIZE    8192
+/* Command handler registered by the application layer */
+static mqtt_cmd_handler_t s_cmd_handler = NULL;
+
+/* Command topic strings — built at subscribe time from s_serial_no */
+#define CMD_TOPIC_MAX_LEN  80
+static char s_topic_cmd_configure[CMD_TOPIC_MAX_LEN];
+static char s_topic_cmd_control[CMD_TOPIC_MAX_LEN];
+static const char s_topic_cmd_all[] = "wind_turbine/all/cmd/control";
+
+/* Scratch buffer for inbound payloads (command packets are always small) */
+#define CMD_PAYLOAD_MAX_LEN  256
+static char s_cmd_payload_buf[CMD_PAYLOAD_MAX_LEN];
+
+#define JSON_BUFFER_SIZE    6144
 static char *s_json_buffer = NULL;
 
 /*
@@ -189,7 +192,41 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 xEventGroupSetBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
                 xEventGroupClearBits(s_mqtt_event_group, MQTT_DISCONNECTED_BIT);
             }
-            fault_log_record(FAULT_MQTT_RECONNECTED);
+            /* Re-subscribe to cmd topics after reconnect */
+            if (s_topic_cmd_configure[0] != '\0') {
+                esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd_configure, 0);
+                esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd_control,   0);
+                esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd_all,       0);
+                ESP_LOGI(TAG, "Re-subscribed to cmd topics after reconnect");
+            }
+            break;
+
+        case MQTT_EVENT_DATA:
+            /* Dispatch inbound command messages to the registered handler.
+             * event->topic and event->data are NOT null-terminated. */
+            if (event->topic && event->data && s_cmd_handler) {
+                char topic_buf[CMD_TOPIC_MAX_LEN];
+                int tlen = event->topic_len < (int)(sizeof(topic_buf) - 1)
+                           ? event->topic_len : (int)(sizeof(topic_buf) - 1);
+                memcpy(topic_buf, event->topic, tlen);
+                topic_buf[tlen] = '\0';
+
+                int plen = event->data_len < (CMD_PAYLOAD_MAX_LEN - 1)
+                           ? event->data_len : (CMD_PAYLOAD_MAX_LEN - 1);
+                memcpy(s_cmd_payload_buf, event->data, plen);
+                s_cmd_payload_buf[plen] = '\0';
+
+                /* Strip trailing whitespace / CRLF (Windows mosquitto_pub sends \r\n) */
+                while (plen > 0 &&
+                       (s_cmd_payload_buf[plen-1] == '\r' ||
+                        s_cmd_payload_buf[plen-1] == '\n' ||
+                        s_cmd_payload_buf[plen-1] == ' '))  {
+                    s_cmd_payload_buf[--plen] = '\0';
+                }
+
+                ESP_LOGI(TAG, "CMD on [%s]: %s", topic_buf, s_cmd_payload_buf);
+                s_cmd_handler(topic_buf, s_cmd_payload_buf);
+            }
             break;
 
         case MQTT_EVENT_DISCONNECTED:
@@ -199,7 +236,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 xEventGroupSetBits(s_mqtt_event_group, MQTT_DISCONNECTED_BIT);
                 xEventGroupClearBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
             }
-            fault_log_record(FAULT_MQTT_DISCONNECTED);
             break;
 
         case MQTT_EVENT_ERROR:
@@ -295,11 +331,11 @@ esp_err_t mqtt_init(void)
 
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri             = MQTT_BROKER_URI,
-        .credentials.client_id          = s_client_id,
+        .credentials.client_id          = s_client_id,   // MAC-derived, unique per device
         .session.keepalive               = 60,
         .network.reconnect_timeout_ms   = 5000,
         .buffer.size                    = 1024,
-        .buffer.out_size                = 4096,
+        .buffer.out_size                = 6144,
     };
 
     s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
@@ -365,37 +401,32 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
     /*
      * JSON FORMAT:
      * {
-     *   "a": [
-     *     ["2026-03-21T20:49:06.305421Z", x, y, z],
-     *     ...
-     *   ],
-     *   "i": ["2026-03-21T20:49:06.355000Z", x, y, z] | null,
-     *   "T": ["2026-03-21T20:49:06.355000Z", val]      | null
+     *   "t": 123456789,                              // Timestamp (always present)
+     *   "a": [[x,y,z], [x,y,z], ...],                // Accelerometer (always present)
+     *   "i": [x, y, z] OR null,                      // Inclinometer (null if invalid)
+     *   "T": 21.5 OR null                            // Temperature (null if invalid)
      * }
-     *
-     * Every field carries its own ISO-8601 UTC timestamp.
-     * null is used when sensor data is unavailable.
      */
 
     int offset = 0;
 
-    // Open packet, begin accelerometer array
-    offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, "{\"a\":[");
+    // Timestamp
+    offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
+                       "{\"t\":%lu,\"a\":[", (unsigned long)packet->timestamp);
 
-    // Each accel sample is [timestamp, x, y, z]
+    // Accelerometer array (always present)
     for (int i = 0; i < packet->accel_count && i < MQTT_ACCEL_BATCH_SIZE; i++) {
         if (i > 0) {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, ",");
         }
         offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                           "[\"%s\",%.4f,%.4f,%.4f]",
-                           packet->accel[i].ts,
+                           "[%.4f,%.4f,%.4f]",
                            packet->accel[i].x,
                            packet->accel[i].y,
                            packet->accel[i].z);
 
-        if (offset >= JSON_BUFFER_SIZE - 200) {
-            ESP_LOGE(TAG, "JSON buffer overflow at sample %d!", i);
+        if (offset >= JSON_BUFFER_SIZE - 100) {
+            ESP_LOGE(TAG, "JSON buffer overflow!");
             return ESP_ERR_NO_MEM;
         }
     }
@@ -403,12 +434,11 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
     // Close accelerometer array
     offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, "]");
 
-    // Inclinometer: [timestamp, x, y, z] or null
+    // Inclinometer: ALWAYS include field, use null if invalid
     if (packet->has_angle) {
         if (packet->angle_valid) {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                               ",\"i\":[\"%s\",%.4f,%.4f,%.4f]",
-                               packet->angle_ts,
+                               ",\"i\":[%.4f,%.4f,%.4f]",
                                packet->angle_x, packet->angle_y, packet->angle_z);
         } else {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
@@ -416,25 +446,18 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
         }
     }
 
-    // Temperature: [timestamp, value] or null
+    // Temperature ALWAYS include field, use null if invalid
     if (packet->has_temp) {
         if (packet->temp_valid) {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                               ",\"T\":[\"%s\",%.2f]",
-                               packet->temp_ts, packet->temperature);
+                               ",\"T\":%.2f", packet->temperature);
         } else {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
                                ",\"T\":null");
         }
     }
 
-    // Fault log — only appended when faults are pending.
-    // The "f" field is omitted entirely when there are no faults.
-    if (fault_log_has_pending()) {
-        offset = fault_log_append_to_json(s_json_buffer, JSON_BUFFER_SIZE, offset);
-    }
-
-    // Close JSON object
+    // Close JSON
     offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, "}");
 
     // Publish to the serial-number-derived data topic
@@ -444,7 +467,6 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
 
     if (msg_id < 0) {
         ESP_LOGE(TAG, "Failed to publish sensor data");
-        fault_log_record(FAULT_MQTT_PUBLISH_FAIL);
         return ESP_FAIL;
     }
 
@@ -536,4 +558,92 @@ const char *mqtt_get_topic_data(void)
 const char *mqtt_get_topic_status(void)
 {
     return s_topic_status;
+}
+/******************************************************************************
+ * COMMAND SUBSCRIPTION
+ *****************************************************************************/
+
+void mqtt_set_cmd_handler(mqtt_cmd_handler_t handler)
+{
+    s_cmd_handler = handler;
+}
+
+esp_err_t mqtt_subscribe_cmd(void)
+{
+    if (!s_is_connected || s_mqtt_client == NULL) {
+        ESP_LOGE(TAG, "mqtt_subscribe_cmd: not connected");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    snprintf(s_topic_cmd_configure, sizeof(s_topic_cmd_configure),
+             "%s/%s/cmd/configure", MQTT_TOPIC_PREFIX, s_serial_no);
+    snprintf(s_topic_cmd_control,   sizeof(s_topic_cmd_control),
+             "%s/%s/cmd/control",   MQTT_TOPIC_PREFIX, s_serial_no);
+
+    int r1 = esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd_configure, 0);
+    int r2 = esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd_control,   0);
+    int r3 = esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd_all,       0);
+
+    if (r1 < 0 || r2 < 0 || r3 < 0) {
+        ESP_LOGE(TAG, "Subscribe failed (configure=%d control=%d all=%d)", r1, r2, r3);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Subscribed to cmd topics:");
+    ESP_LOGI(TAG, "  %s", s_topic_cmd_configure);
+    ESP_LOGI(TAG, "  %s", s_topic_cmd_control);
+    ESP_LOGI(TAG, "  %s", s_topic_cmd_all);
+    return ESP_OK;
+}
+
+/******************************************************************************
+ * STRUCTURED STATUS PUBLISHER
+ *****************************************************************************/
+
+esp_err_t mqtt_publish_status_json(const char *state_str,
+                                   uint32_t odr_hz,
+                                   uint8_t range,
+                                   uint32_t output_hz,
+                                   bool selftest_ok,
+                                   uint32_t seq_ack,
+                                   const char *error_msg)
+{
+    if (!s_is_connected) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char buf[256];
+    int offset = 0;
+    int range_g = (range == 1) ? 2 : (range == 2) ? 4 : 8;
+
+    offset += snprintf(buf + offset, sizeof(buf) - offset,
+                       "{\"state\":\"%s\","
+                       "\"odr_hz\":%lu,"
+                       "\"range_g\":%d,"
+                       "\"output_hz\":%lu,"
+                       "\"selftest_ok\":%s,"
+                       "\"seq_ack\":%lu",
+                       state_str ? state_str : "unknown",
+                       (unsigned long)odr_hz,
+                       range_g,
+                       (unsigned long)output_hz,
+                       selftest_ok ? "true" : "false",
+                       (unsigned long)seq_ack);
+
+    if (error_msg && error_msg[0] != '\0') {
+        offset += snprintf(buf + offset, sizeof(buf) - offset,
+                           ",\"error\":\"%s\"", error_msg);
+    }
+
+    offset += snprintf(buf + offset, sizeof(buf) - offset, "}");
+
+    int msg_id = esp_mqtt_client_publish(s_mqtt_client, s_topic_status,
+                                         buf, offset, MQTT_PUBLISH_QOS, 0);
+    if (msg_id < 0) {
+        ESP_LOGE(TAG, "Failed to publish status JSON");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Status → %s: %s", s_topic_status, buf);
+    return ESP_OK;
 }
