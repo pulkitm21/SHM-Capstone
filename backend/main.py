@@ -295,7 +295,11 @@ mqtt_status_client = None
 @app.on_event("startup")
 def startup_event():
     global mqtt_status_client
-    mqtt_status_client = start_listener()
+    try:
+        mqtt_status_client = start_listener()
+    except Exception as e:
+        mqtt_status_client = None
+        print(f"[startup] MQTT listener not started: {e}")
 
 # =========================
 # Bulk node position update endpoint
@@ -626,8 +630,9 @@ def read_fault_rows(
     fault_status: Optional[str] = None,
     description: Optional[str] = None,
 ) -> Dict[str, Any]:
+    effective_page_size = page_size if page_size is not None else limit
+
     if not FAULTS_DB.exists():
-        effective_page_size = page_size if page_size is not None else limit
         return {
             "faults": [],
             "page": page,
@@ -642,62 +647,75 @@ def read_fault_rows(
             },
         }
 
-    effective_page_size = page_size if page_size is not None else limit
     safe_page = max(1, page)
     safe_page_size = max(1, effective_page_size)
     offset = (safe_page - 1) * safe_page_size
 
-    con = sqlite3.connect(str(FAULTS_DB))
-    con.row_factory = sqlite3.Row
-    cur = con.cursor()
+    try:
+        con = sqlite3.connect(str(FAULTS_DB))
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
 
-    where_clauses, where_params = _build_fault_where_clauses(
-        serial_number=serial_number,
-        sensor_type=sensor_type,
-        fault_type=fault_type,
-        severity=severity,
-        fault_status=fault_status,
-        description=description,
-    )
-    where_sql = _build_fault_where_sql(where_clauses)
+        where_clauses, where_params = _build_fault_where_clauses(
+            serial_number=serial_number,
+            sensor_type=sensor_type,
+            fault_type=fault_type,
+            severity=severity,
+            fault_status=fault_status,
+            description=description,
+        )
+        where_sql = _build_fault_where_sql(where_clauses)
 
-    cur.execute(
-        f"""
-        SELECT COUNT(*) AS count
-        FROM faults
-        {where_sql}
-        """,
-        where_params,
-    )
-    total_items = int(cur.fetchone()["count"])
-    total_pages = max(1, (total_items + safe_page_size - 1) // safe_page_size)
+        cur.execute(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM faults
+            {where_sql}
+            """,
+            where_params,
+        )
+        total_items = int(cur.fetchone()["count"])
+        total_pages = max(1, (total_items + safe_page_size - 1) // safe_page_size)
 
-    cur.execute(
-        f"""
-        SELECT id, serial_number, sensor_type, fault_type, severity, fault_status, description, ts
-        FROM faults
-        {where_sql}
-        ORDER BY ts DESC
-        LIMIT ? OFFSET ?
-        """,
-        [*where_params, safe_page_size, offset],
-    )
-    rows = [dict(r) for r in cur.fetchall()]
+        cur.execute(
+            f"""
+            SELECT id, serial_number, sensor_type, fault_type, severity, fault_status, description, ts
+            FROM faults
+            {where_sql}
+            ORDER BY ts DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*where_params, safe_page_size, offset],
+        )
+        rows = [dict(r) for r in cur.fetchall()]
 
-    # These dropdown options are read from SQLite, so the frontend does not need
-    # to scan a huge in-memory dataset just to build filter choices.
-    filter_options = _get_fault_filter_options(con=con, serial_number=serial_number)
-    con.close()
+        filter_options = _get_fault_filter_options(con=con, serial_number=serial_number)
+        con.close()
 
-    return {
-        "faults": rows,
-        "page": safe_page,
-        "page_size": safe_page_size,
-        "total_items": total_items,
-        "total_pages": total_pages,
-        "filter_options": filter_options,
-    }
+        return {
+            "faults": rows,
+            "page": safe_page,
+            "page_size": safe_page_size,
+            "total_items": total_items,
+            "total_pages": total_pages,
+            "filter_options": filter_options,
+        }
 
+    except Exception as e:
+        print(f"[faults] Failed to read faults DB: {e}")
+        return {
+            "faults": [],
+            "page": safe_page,
+            "page_size": safe_page_size,
+            "total_items": 0,
+            "total_pages": 1,
+            "filter_options": {
+                "sensor_types": [],
+                "fault_types": [],
+                "severities": [],
+                "statuses": [],
+            },
+        }
 
 @app.get("/api/faults")
 def get_faults(

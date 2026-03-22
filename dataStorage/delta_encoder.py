@@ -22,12 +22,17 @@ from raw_backup import write_raw, close_all as raw_backup_close_all
 BROKER_IP = "localhost"
 PORT = 1883
 TOPIC = "wind_turbine/+/data"
+
 DATA_DIR = "/mnt/ssd/data"
+SSD_AVAILABLE = os.path.isdir("/mnt/ssd") and os.path.ismount("/mnt/ssd")
+
+if SSD_AVAILABLE:
+    os.makedirs(DATA_DIR, exist_ok=True)
+else:
+    print("[delta_encoder] SSD not mounted. Sensor data will not be saved.")
+
 STATUS_TOPIC = "wind_turbine/+/status" ## ADDITION FOR ACK
 
-os.makedirs(DATA_DIR, exist_ok=True)
-
-#init_fault_db()
 
 # -------------------------------------------------------------------
 # Zstandard compression settings
