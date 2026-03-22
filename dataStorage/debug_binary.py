@@ -255,8 +255,7 @@ def pass2_delta_trace(filepath, focus_record=None):
         ss["ts_us"] = ts_us; ss["ts_delta_prev"] = 0
         return ts_us
 
-    def _dod_ts(f, ss, label, show, rec_idx, is_first_sample=False):
-        (dod,)   = read_fmt(f, "<i", label)
+    def _dod_ts(ss, dod, label, show, rec_idx, is_first_sample=False):
         delta_us = ss["ts_delta_prev"] + dod
         ts_us    = ss["ts_us"] + delta_us
         if show:
@@ -275,7 +274,9 @@ def pass2_delta_trace(filepath, focus_record=None):
             _jump_thresh = MAX_TS_JUMP_ACCEL
         if is_first_sample and ss["first_ts_us"] is not None:
             jump_s = (ts_us - ss["first_ts_us"]) / TS_SCALE
-            if abs(jump_s) > _jump_thresh or jump_s < 0:
+            # Ignore tiny negative steps (< 1 ms) — these are µs-level dod
+            # noise around a frozen timestamp (e.g. temp not yet updated by ADC).
+            if abs(jump_s) > _jump_thresh or jump_s < -0.001:
                 msg = f"{label} jump {jump_s:+.3f} s (first-to-first)"
                 issues.append((rec_idx, "DELTA", msg))
                 if show: print(f"    ⚠ {msg}")
@@ -343,38 +344,74 @@ def pass2_delta_trace(filepath, focus_record=None):
 
                     if header & FLAG_ACCEL:
                         (n,) = read_fmt(f, "<B", "accel n")
-                        prev = state["accel"]["xyz_prev"]
+                        ss   = state["accel"]
+                        prev = ss["xyz_prev"]
                         for i in range(n):
-                            ts_us = _dod_ts(f, state["accel"], f"accel[{i}].ts",
-                                            show, idx, is_first_sample=(i == 0))
-                            dx, dy, dz = read_fmt(f, "<hhh", f"accel[{i}] Δxyz")
+                            (changed,) = read_fmt(f, "<B", f"accel[{i}] changed")
+                            if changed & 0x01:
+                                (dod,) = read_fmt(f, "<i", f"accel[{i}].ts")
+                                ts_us  = _dod_ts(ss, dod, f"accel[{i}].ts",
+                                                 show, idx, is_first_sample=(i == 0))
+                            else:
+                                ts_us = ss["ts_us"]
+                                if show: print(f"    accel[{i}].ts: null (unchanged)")
+                            dx = read_fmt(f, "<h", f"accel[{i}] dx")[0] if changed & 0x02 else 0
+                            dy = read_fmt(f, "<h", f"accel[{i}] dy")[0] if changed & 0x04 else 0
+                            dz = read_fmt(f, "<h", f"accel[{i}] dz")[0] if changed & 0x08 else 0
                             cur = [prev[0]+dx, prev[1]+dy, prev[2]+dz]
                             if show:
-                                print(f"    accel[{i}] Δ=({dx},{dy},{dz})  "
+                                dx_s = str(dx) if changed & 0x02 else "null"
+                                dy_s = str(dy) if changed & 0x04 else "null"
+                                dz_s = str(dz) if changed & 0x08 else "null"
+                                print(f"    accel[{i}] changed=0x{changed:02X}  Δ=({dx_s},{dy_s},{dz_s})  "
                                       f"prev={[fmt_a(v) for v in prev]}  "
                                       f"→ now={[fmt_a(v) for v in cur]} g")
                             prev = cur
-                        state["accel"]["xyz_prev"] = prev
+                        ss["xyz_prev"] = prev
 
                     if header & FLAG_INCLIN:
-                        ts_us = _dod_ts(f, state["inclin"], "inclin.ts", show, idx, is_first_sample=True)
-                        dr, dp, dy = read_fmt(f, "<hhh", "inclin Δ")
-                        prev = state["inclin"]["xyz_prev"]
-                        cur  = [prev[0]+dr, prev[1]+dp, prev[2]+dy]
-                        state["inclin"]["xyz_prev"] = cur
+                        ss = state["inclin"]
+                        (changed,) = read_fmt(f, "<B", "inclin changed")
+                        if changed & 0x01:
+                            (dod,) = read_fmt(f, "<i", "inclin.ts")
+                            ts_us  = _dod_ts(ss, dod, "inclin.ts", show, idx, is_first_sample=True)
+                        else:
+                            ts_us = ss["ts_us"]
+                            if show: print(f"    inclin.ts: null (unchanged)")
+                        prev = ss["xyz_prev"]
+                        dr  = read_fmt(f, "<h", "inclin dr")[0]   if changed & 0x02 else 0
+                        dp  = read_fmt(f, "<h", "inclin dp")[0]   if changed & 0x04 else 0
+                        dy_ = read_fmt(f, "<h", "inclin dyaw")[0] if changed & 0x08 else 0
+                        cur = [prev[0]+dr, prev[1]+dp, prev[2]+dy_]
+                        ss["xyz_prev"] = cur
                         if show:
-                            print(f"    inclin Δ=({dr},{dp},{dy})  "
+                            dr_s  = str(dr)  if changed & 0x02 else "null"
+                            dp_s  = str(dp)  if changed & 0x04 else "null"
+                            dy_s  = str(dy_) if changed & 0x08 else "null"
+                            print(f"    inclin changed=0x{changed:02X}  Δ=({dr_s},{dp_s},{dy_s})  "
                                   f"prev={[fmt_i(v) for v in prev]}  "
                                   f"→ now={[fmt_i(v) for v in cur]} °")
 
                     if header & FLAG_TEMP:
-                        ts_us = _dod_ts(f, state["temp"], "temp.ts", show, idx, is_first_sample=True)
-                        (dt,) = read_fmt(f, "<h", "temp Δ")
-                        prev  = state["temp"]["val_prev"]
-                        cur   = prev + dt
-                        state["temp"]["val_prev"] = cur
+                        ss = state["temp"]
+                        (changed,) = read_fmt(f, "<B", "temp changed")
+                        if changed & 0x01:
+                            (dod,) = read_fmt(f, "<i", "temp.ts")
+                            ts_us  = _dod_ts(ss, dod, "temp.ts", show, idx, is_first_sample=True)
+                        else:
+                            ts_us = ss["ts_us"]
+                            if show: print(f"    temp.ts: null (unchanged)")
+                        prev = ss["val_prev"]
+                        if changed & 0x02:
+                            (dt,) = read_fmt(f, "<h", "temp Δ")
+                            cur   = prev + dt
+                            ss["val_prev"] = cur
+                        else:
+                            dt  = None
+                            cur = prev
                         if show:
-                            print(f"    temp Δ={dt} ({dt/TEMP_SCALE:+.2f} °C)  "
+                            dt_s = f"{dt} ({dt/TEMP_SCALE:+.2f} °C)" if dt is not None else "null"
+                            print(f"    temp changed=0x{changed:02X}  Δ={dt_s}  "
                                   f"prev={fmt_t(prev)}  → now={fmt_t(cur)} °C")
 
                 idx += 1

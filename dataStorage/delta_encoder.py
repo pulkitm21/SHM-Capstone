@@ -60,9 +60,18 @@ ZSTD_LEVEL = 3
 #
 # DELTA record:
 #   header(B)
-#   if accel  (bit0): n(B) + n × [ dod_ts(i)  dx(h)  dy(h)  dz(h) ]
-#   if inclin (bit1):             [ dod_ts(i)  dr(h)  dp(h)  dyaw(h)]
-#   if temp   (bit2):             [ dod_ts(i)  dval(h)             ]
+#   if accel  (bit0): n(B) + n × [ changed(B)  dod_ts?(i)  dx?(h)  dy?(h)  dz?(h)  ]
+#   if inclin (bit1):             [ changed(B)  dod_ts?(i)  dr?(h)  dp?(h)  dyaw?(h) ]
+#   if temp   (bit2):             [ changed(B)  dod_ts?(i)  dval?(h)                 ]
+#
+# changed byte bitmask (per sensor):
+#   bit0 = timestamp changed  → dod_ts(i) present
+#   bit1 = x/r/val changed    → dx/dr/dval(h) present
+#   bit2 = y/p changed        → dy/dp(h) present   [accel/inclin only]
+#   bit3 = z/yaw changed      → dz/dyaw(h) present [accel/inclin only]
+# Fields with changed-bit=0 are omitted (null) — decoder keeps prev value.
+# If changed==0x00 the sensor field is still present in header (for state
+# tracking) but contributes 1 byte (the changed byte itself) to the record.
 #
 # ts_abs  : int64 µs  (absolute Unix µs)
 # dod_ts  : int32 µs  (delta-of-delta of that sensor's own timestamp)
@@ -216,13 +225,17 @@ def needs_absolute_record(data: dict, state: dict) -> tuple[bool, str]:
                 return True, f"inclin {name} delta {d} would clip int16"
 
     if "T" in data:
-        ts_s = float(data["T"][0])
-        gap  = ts_s - state["temp"]["ts_us"] / TS_SCALE
-        if abs(gap) > MAX_DELTA_S:
-            return True, f"temp timestamp gap {gap:.1f} s"
-        d = int(float(data["T"][1]) * TEMP_SCALE) - state["temp"]["val_prev"]
-        if abs(d) >= INT16_MAX:
-            return True, f"temp delta {d} would clip int16"
+        ts_s      = float(data["T"][0])
+        ts_us_new = int(ts_s * TS_SCALE)
+        # If timestamp hasn't changed, this reading will be skipped in the
+        # encoder — no need to check for overflow on a value that won't be written.
+        if ts_us_new != state["temp"]["ts_us"]:
+            gap = ts_s - state["temp"]["ts_us"] / TS_SCALE
+            if abs(gap) > MAX_DELTA_S:
+                return True, f"temp timestamp gap {gap:.1f} s"
+            d = int(float(data["T"][1]) * TEMP_SCALE) - state["temp"]["val_prev"]
+            if abs(d) >= INT16_MAX:
+                return True, f"temp delta {d} would clip int16"
 
     return False, ""
 
@@ -300,52 +313,117 @@ def encode_first_record(data: dict, state: dict) -> bytes:
 # DELTA record encoder
 # -------------------------------------------------------------------
 
+def _pack_delta(value: int, nbytes: int = 2) -> bytes:
+    """Clamp and pack a signed delta as int16."""
+    return struct.pack("<h", max(-32768, min(32767, value)))
+
+
 def encode_delta_record(data: dict, state: dict) -> bytes:
-    """Encode a DELTA record using integer accumulation throughout."""
+    """
+    Encode a DELTA record.
+    Each sensor field is preceded by a 'changed' bitmask byte:
+      bit0 = timestamp delta-of-delta present
+      bit1 = first value axis (x/roll/val) changed
+      bit2 = second value axis (y/pitch) changed   [accel/inclin]
+      bit3 = third value axis (z/yaw) changed      [accel/inclin]
+    Only fields whose bit is set are written; zero-delta fields are null/omitted.
+    """
     header = 0
     body   = bytearray()
 
+    # ── Accelerometer ─────────────────────────────────────────────
     if "a" in data and len(data["a"]) > 0:
         header |= 0x01
         samples = data["a"]
         body   += struct.pack("<B", len(samples))
         prev    = state["accel"]["xyz_prev"]
+        ss      = state["accel"]
         for s in samples:
             xi = int(float(s[1]) * ACCEL_SCALE)
             yi = int(float(s[2]) * ACCEL_SCALE)
             zi = int(float(s[3]) * ACCEL_SCALE)
             dx, dy, dz = xi - prev[0], yi - prev[1], zi - prev[2]
-            body += _delta_ts_bytes(float(s[0]), state["accel"])
-            body += struct.pack("<hhh",
-                max(-32768, min(32767, dx)),
-                max(-32768, min(32767, dy)),
-                max(-32768, min(32767, dz)))
+
+            # Compute dod_ts without committing state yet
+            ts_us_new  = int(float(s[0]) * TS_SCALE)
+            delta_us   = ts_us_new - ss["ts_us"]
+            dod_us     = delta_us - ss["ts_delta_prev"]
+
+            changed = 0
+            if dod_us  != 0: changed |= 0x01
+            if dx      != 0: changed |= 0x02
+            if dy      != 0: changed |= 0x04
+            if dz      != 0: changed |= 0x08
+
+            body += struct.pack("<B", changed)
+            if changed & 0x01: body += struct.pack("<i", dod_us)
+            if changed & 0x02: body += _pack_delta(dx)
+            if changed & 0x04: body += _pack_delta(dy)
+            if changed & 0x08: body += _pack_delta(dz)
+
+            # Commit timestamp state
+            ss["ts_us"]         = ts_us_new
+            ss["ts_delta_prev"] = delta_us
             prev = [xi, yi, zi]
         state["accel"]["xyz_prev"] = prev
 
+    # ── Inclinometer ──────────────────────────────────────────────
     if "i" in data:
         header |= 0x02
         iv   = data["i"]
+        ss   = state["inclin"]
         ri   = int(float(iv[1]) * INCLIN_SCALE)
         pi   = int(float(iv[2]) * INCLIN_SCALE)
         yi   = int(float(iv[3]) * INCLIN_SCALE)
-        prev = state["inclin"]["xyz_prev"]
+        prev = ss["xyz_prev"]
         dr, dp, dy = ri - prev[0], pi - prev[1], yi - prev[2]
-        body += _delta_ts_bytes(float(iv[0]), state["inclin"])
-        body += struct.pack("<hhh",
-            max(-32768, min(32767, dr)),
-            max(-32768, min(32767, dp)),
-            max(-32768, min(32767, dy)))
-        state["inclin"]["xyz_prev"] = [ri, pi, yi]
 
+        ts_us_new  = int(float(iv[0]) * TS_SCALE)
+        delta_us   = ts_us_new - ss["ts_us"]
+        dod_us     = delta_us - ss["ts_delta_prev"]
+
+        changed = 0
+        if dod_us != 0: changed |= 0x01
+        if dr     != 0: changed |= 0x02
+        if dp     != 0: changed |= 0x04
+        if dy     != 0: changed |= 0x08
+
+        body += struct.pack("<B", changed)
+        if changed & 0x01: body += struct.pack("<i", dod_us)
+        if changed & 0x02: body += _pack_delta(dr)
+        if changed & 0x04: body += _pack_delta(dp)
+        if changed & 0x08: body += _pack_delta(dy)
+
+        ss["ts_us"]         = ts_us_new
+        ss["ts_delta_prev"] = delta_us
+        ss["xyz_prev"]      = [ri, pi, yi]
+
+    # ── Temperature ───────────────────────────────────────────────
     if "T" in data:
-        header |= 0x04
-        tv = data["T"]
-        vi = int(float(tv[1]) * TEMP_SCALE)
-        dt = vi - state["temp"]["val_prev"]
-        body += _delta_ts_bytes(float(tv[0]), state["temp"])
-        body += struct.pack("<h", max(-32768, min(32767, dt)))
-        state["temp"]["val_prev"] = vi
+        tv        = data["T"]
+        ss        = state["temp"]
+        vi        = int(float(tv[1]) * TEMP_SCALE)
+        ts_us_new = int(float(tv[0]) * TS_SCALE)
+        delta_us  = ts_us_new - ss["ts_us"]
+        dod_us    = delta_us - ss["ts_delta_prev"]
+        dt        = vi - ss["val_prev"]
+
+        # Skip entirely if nothing changed (frozen firmware reading)
+        if ts_us_new == ss["ts_us"] and vi == ss["val_prev"]:
+            pass
+        else:
+            header |= 0x04
+            changed = 0
+            if dod_us != 0: changed |= 0x01
+            if dt     != 0: changed |= 0x02
+
+            body += struct.pack("<B", changed)
+            if changed & 0x01: body += struct.pack("<i", dod_us)
+            if changed & 0x02: body += _pack_delta(dt)
+
+            ss["ts_us"]         = ts_us_new
+            ss["ts_delta_prev"] = delta_us
+            ss["val_prev"]      = vi
 
     return struct.pack("<B", header) + bytes(body)
 

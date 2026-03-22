@@ -9,9 +9,11 @@ Binary format recap:
       inclin: ts(q) r(i) p(i) yaw(i)
       temp:   ts(q) val(i)
   DELTA:  header(B)
-      accel:  n(B) + n×[dod_ts(i) dx(h) dy(h) dz(h)]
-      inclin: dod_ts(i) dr(h) dp(h) dyaw(h)
-      temp:   dod_ts(i) dval(h)
+      accel:  n(B) + n×[changed(B) dod_ts?(i) dx?(h) dy?(h) dz?(h)]
+      inclin: changed(B) dod_ts?(i) dr?(h) dp?(h) dyaw?(h)
+      temp:   changed(B) dod_ts?(i) dval?(h)
+  changed byte: bit0=ts, bit1=x/r/val, bit2=y/p, bit3=z/yaw
+  Fields with bit=0 are omitted; decoder keeps previous value.
 
 Usage:
     python decode_binary.py <file.zst>
@@ -115,15 +117,6 @@ def _reconstruct_abs_ts(f, ss: dict) -> int:
     ss["ts_delta_prev"] = 0
     return ts_us
 
-def _reconstruct_delta_ts(f, ss: dict) -> int:
-    """Read dod int32, reconstruct ts_us, update sensor state, return ts_us."""
-    (dod,)   = read_fmt(f, "<i", "dod timestamp")
-    delta_us = ss["ts_delta_prev"] + dod
-    ts_us    = ss["ts_us"] + delta_us
-    ss["ts_us"]         = ts_us
-    ss["ts_delta_prev"] = delta_us
-    return ts_us
-
 
 # ── Record decoders ───────────────────────────────────────────────
 
@@ -141,14 +134,27 @@ def _decode_accel_abs(f, state):
 def _decode_accel_delta(f, state):
     (n,) = read_fmt(f, "<B", "accel n")
     out  = []
-    prev = state["accel"]["xyz_prev"]
+    ss   = state["accel"]
+    prev = ss["xyz_prev"]
     for _ in range(n):
-        ts_us = _reconstruct_delta_ts(f, state["accel"])
-        dx, dy, dz = read_fmt(f, "<hhh", "accel delta xyz")
+        (changed,) = read_fmt(f, "<B", "accel changed")
+        # Timestamp
+        if changed & 0x01:
+            (dod,)   = read_fmt(f, "<i", "accel dod_ts")
+            delta_us = ss["ts_delta_prev"] + dod
+            ts_us    = ss["ts_us"] + delta_us
+            ss["ts_us"]         = ts_us
+            ss["ts_delta_prev"] = delta_us
+        else:
+            ts_us = ss["ts_us"]
+        # Values — keep prev if bit not set (null delta)
+        (dx,) = read_fmt(f, "<h", "accel dx") if changed & 0x02 else ((0,),)[0]
+        (dy,) = read_fmt(f, "<h", "accel dy") if changed & 0x04 else ((0,),)[0]
+        (dz,) = read_fmt(f, "<h", "accel dz") if changed & 0x08 else ((0,),)[0]
         cur = [prev[0]+dx, prev[1]+dy, prev[2]+dz]
         out.append((ts_us / TS_SCALE, cur[0]/ACCEL_SCALE, cur[1]/ACCEL_SCALE, cur[2]/ACCEL_SCALE))
         prev = cur
-    state["accel"]["xyz_prev"] = prev
+    ss["xyz_prev"] = prev
     return out or None
 
 def _decode_inclin_abs(f, state):
@@ -158,11 +164,22 @@ def _decode_inclin_abs(f, state):
     return (ts_us / TS_SCALE, r / INCLIN_SCALE, p / INCLIN_SCALE, y / INCLIN_SCALE)
 
 def _decode_inclin_delta(f, state):
-    ts_us    = _reconstruct_delta_ts(f, state["inclin"])
-    dr,dp,dy = read_fmt(f, "<hhh", "inclin delta")
-    prev     = state["inclin"]["xyz_prev"]
-    cur      = [prev[0]+dr, prev[1]+dp, prev[2]+dy]
-    state["inclin"]["xyz_prev"] = cur
+    ss = state["inclin"]
+    (changed,) = read_fmt(f, "<B", "inclin changed")
+    if changed & 0x01:
+        (dod,)   = read_fmt(f, "<i", "inclin dod_ts")
+        delta_us = ss["ts_delta_prev"] + dod
+        ts_us    = ss["ts_us"] + delta_us
+        ss["ts_us"]         = ts_us
+        ss["ts_delta_prev"] = delta_us
+    else:
+        ts_us = ss["ts_us"]
+    prev = ss["xyz_prev"]
+    (dr,) = read_fmt(f, "<h", "inclin dr") if changed & 0x02 else ((0,),)[0]
+    (dp,) = read_fmt(f, "<h", "inclin dp") if changed & 0x04 else ((0,),)[0]
+    (dy,) = read_fmt(f, "<h", "inclin dy") if changed & 0x08 else ((0,),)[0]
+    cur   = [prev[0]+dr, prev[1]+dp, prev[2]+dy]
+    ss["xyz_prev"] = cur
     return (ts_us / TS_SCALE, cur[0]/INCLIN_SCALE, cur[1]/INCLIN_SCALE, cur[2]/INCLIN_SCALE)
 
 def _decode_temp_abs(f, state):
@@ -172,11 +189,20 @@ def _decode_temp_abs(f, state):
     return (ts_us / TS_SCALE, val / TEMP_SCALE)
 
 def _decode_temp_delta(f, state):
-    ts_us  = _reconstruct_delta_ts(f, state["temp"])
-    (dt,)  = read_fmt(f, "<h", "temp delta")
-    val    = state["temp"]["val_prev"] + dt
-    state["temp"]["val_prev"] = val
-    return (ts_us / TS_SCALE, val / TEMP_SCALE)
+    ss = state["temp"]
+    (changed,) = read_fmt(f, "<B", "temp changed")
+    if changed & 0x01:
+        (dod,)   = read_fmt(f, "<i", "temp dod_ts")
+        delta_us = ss["ts_delta_prev"] + dod
+        ts_us    = ss["ts_us"] + delta_us
+        ss["ts_us"]         = ts_us
+        ss["ts_delta_prev"] = delta_us
+    else:
+        ts_us = ss["ts_us"]
+    if changed & 0x02:
+        (dt,) = read_fmt(f, "<h", "temp dval")
+        ss["val_prev"] = ss["val_prev"] + dt
+    return (ts_us / TS_SCALE, ss["val_prev"] / TEMP_SCALE)
 
 
 # ── File decoder ──────────────────────────────────────────────────
