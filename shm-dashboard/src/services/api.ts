@@ -123,6 +123,13 @@ export type BulkNodePositionsResponse = {
   [key: string]: unknown;
 };
 
+export type SystemActionResponse = {
+  ok: boolean;
+  action: string;
+  status: string;
+  time: string;
+};
+
 export function getHealth(signal?: AbortSignal) {
   return request<HealthResponse>("/health", { signal });
 }
@@ -344,6 +351,20 @@ export function sendNodeControl(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal,
+  });
+}
+
+export function rebootPi(signal?: AbortSignal) {
+  return request<SystemActionResponse>("/api/system/reboot", {
+    method: "POST",
+    signal,
+  });
+}
+
+export function unmountStorage(signal?: AbortSignal) {
+  return request<SystemActionResponse>("/api/storage/unmount", {
+    method: "POST",
     signal,
   });
 }
