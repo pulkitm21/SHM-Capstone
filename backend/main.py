@@ -127,7 +127,7 @@ def _unmount_ssd():
     Unmount the SSD mount path.
     """
     subprocess.run(["sudo", "umount", str(DATA_DIR)], check=True)
-    
+
 def is_ssd_available() -> bool:
     return bool(get_ssd_mount_status()["available"])
 
@@ -367,6 +367,53 @@ def get_storage_status():
     Returns SSD mount diagnostic information for the dashboard.
     """
     return get_ssd_mount_status()
+
+@app.post("/api/system/reboot")
+def reboot_system(background_tasks: BackgroundTasks):
+    """
+    Reboot the Raspberry Pi.
+    Scheduled after response so frontend gets acknowledgement.
+    """
+    background_tasks.add_task(_reboot_pi)
+
+    return {
+        "ok": True,
+        "action": "reboot",
+        "status": "scheduled",
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
+
+@app.post("/api/storage/unmount")
+def unmount_storage():
+    """
+    Unmount the SSD safely.
+    """
+    mount_status = get_ssd_mount_status()
+
+    if not mount_status["mounted"]:
+        return {
+            "ok": True,
+            "action": "unmount",
+            "status": "already_unmounted",
+            "ssd_status": mount_status,
+            "time": datetime.now(timezone.utc).isoformat(),
+        }
+
+    try:
+        _unmount_ssd()
+    except subprocess.CalledProcessError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to unmount SSD: {exc}",
+        )
+
+    return {
+        "ok": True,
+        "action": "unmount",
+        "status": "completed",
+        "ssd_status": get_ssd_mount_status(),
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @app.get("/api/nodes")
