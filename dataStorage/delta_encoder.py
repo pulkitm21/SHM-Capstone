@@ -7,7 +7,7 @@ import paho.mqtt.client as mqtt
 import queue
 import threading
 
-#from fault_logger import init_fault_db, log_fault_codes
+from fault_logger import log_fault_codes
 import zstandard as zstd
 
 ## Addition for ACK
@@ -22,8 +22,8 @@ from raw_backup import write_raw, close_all as raw_backup_close_all
 BROKER_IP = "localhost"
 PORT = 1883
 TOPIC = "wind_turbine/+/data"
-
 DATA_DIR = "/mnt/ssd/data"
+
 SSD_AVAILABLE = os.path.isdir("/mnt/ssd") and os.path.ismount("/mnt/ssd")
 
 if SSD_AVAILABLE:
@@ -33,6 +33,7 @@ else:
 
 STATUS_TOPIC = "wind_turbine/+/status" ## ADDITION FOR ACK
 
+os.makedirs(DATA_DIR, exist_ok=True)
 
 # -------------------------------------------------------------------
 # Zstandard compression settings
@@ -583,9 +584,21 @@ def handle_status_message(topic: str, payload_bytes: bytes) -> None:
 # -------------------------------------------------------------------
 
 def on_connect(client, userdata, flags, reason_code, properties):
-    print("Connected with result code", reason_code)
+    if reason_code == 0:
+        print("[MQTT] Connected to broker")
+    else:
+        print(f"[MQTT] Connection failed: reason_code={reason_code} — will retry automatically")
+        return   # paho will retry; don't subscribe on a failed connect
     client.subscribe(TOPIC)
-    client.subscribe(STATUS_TOPIC) # Subscribe to status topic for ACKs
+    client.subscribe(STATUS_TOPIC)
+
+
+def on_disconnect(client, userdata, flags, reason_code, properties):
+    if reason_code == 0:
+        print("[MQTT] Disconnected cleanly")
+    else:
+        print(f"[MQTT] Unexpected disconnect (reason_code={reason_code}) — "
+              f"paho will reconnect automatically with exponential back-off")
 
 
 def on_message(client, userdata, msg):
@@ -624,17 +637,21 @@ def on_message(client, userdata, msg):
             if mqtt_ts is None:
                 raise ValueError("Fault packet missing timestamp 't'")
 
-            #log_fault_codes(
+            log_fault_codes(
                 serial_number=node_id,
                 fault_codes=fault_codes,
                 mqtt_ts=mqtt_ts,
-            #)
+            )
 
         # Keep your existing timestamp normalization for sensor payloads.
         if not normalise_sensor_timestamps(data, node_id):
             return
 
-        data_buffer.put((node_id, data))
+        try:
+            data_buffer.put_nowait((node_id, data))
+        except queue.Full:
+            print(f"[{node_id}] WARNING: queue full ({QUEUE_MAX_SIZE} items) — "
+                  f"packet dropped. Check if consumer is stalled (disk full/unmounted?).")
 
     except Exception as e:
         print(f"Error processing MQTT message on {msg.topic}: {e}")
@@ -645,11 +662,20 @@ def on_message(client, userdata, msg):
 # -------------------------------------------------------------------
 
 client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-client.on_connect = on_connect
-client.on_message = on_message
+client.on_connect    = on_connect
+client.on_disconnect = on_disconnect
+client.on_message    = on_message
 
-client.connect(BROKER_IP, PORT, 60)
+# Enable automatic reconnection with exponential back-off.
+# paho will wait 1 s after the first disconnect, then double the delay
+# on each subsequent failure up to MAX_RECONNECT_DELAY_S.
+client.reconnect_delay_set(min_delay=1, max_delay=MAX_RECONNECT_DELAY_S)
+
 try:
-    client.loop_forever()
+    client.connect(BROKER_IP, PORT, keepalive=KEEPALIVE_S)
+    client.loop_forever(retry_first_connection=True)
+except Exception as e:
+    print(f"[MQTT] Fatal connection error: {e}")
+    raise
 finally:
     raw_backup_close_all()
