@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fault_codes import get_fault_definition
-from fault_logger import log_fault_codes
+from fault_logger import log_fault_events
 
 
 def now_iso() -> str:
@@ -88,7 +88,7 @@ def log_faults_from_packet(
     Resolve timestamps for packet-level fault codes and forward them to the existing logger.
 
     This keeps fault timestamp logic outside delta_encoder.py while still reusing
-    fault_logger.log_fault_codes(), which accepts one timestamp per call.
+    fault_logger.log_fault_events(), which accepts one timestamp per call.
     """
     fault_codes = packet.get("f", [])
     if not isinstance(fault_codes, list) or not fault_codes:
@@ -110,7 +110,7 @@ def log_faults_from_packet(
         codes_by_timestamp.setdefault(resolved_ts, []).append(code)
 
     for resolved_ts, grouped_codes in codes_by_timestamp.items():
-        log_fault_codes(
+        log_fault_events(
             serial_number=serial_number,
             fault_codes=grouped_codes,
             mqtt_ts=resolved_ts,
