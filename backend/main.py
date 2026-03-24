@@ -16,11 +16,6 @@ from mqtt_listener import start_listener
 
 from settings_schema import SettingsModel, to_dict, copy_deep
 
-import subprocess
-from fastapi import BackgroundTasks
-
-# NOTE:
-# The imports below are commented out because they belong to the pending/ack system.
 from settings_store import (
     load_settings,
     save_settings,
@@ -35,6 +30,8 @@ from settings_store import (
 
 from node_registry import list_nodes, get_node_by_id, update_node_position
 from mqtt_commands import publish_accelerometer_config, publish_node_control
+
+import subprocess
 
 app = FastAPI()
 
@@ -114,14 +111,6 @@ def get_ssd_mount_status() -> Dict[str, Any]:
         "status": "mounted" if available else "unavailable",
         "time": datetime.now(timezone.utc).isoformat(),
     }
-
-
-def _reboot_pi():
-    """
-    Reboot the Raspberry Pi.
-    Runs after response is returned.
-    """
-    subprocess.run(["sudo", "reboot"], check=True)
 
 
 def _unmount_ssd():
@@ -370,22 +359,6 @@ def get_storage_status():
     Returns SSD mount diagnostic information for the dashboard.
     """
     return get_ssd_mount_status()
-
-
-@app.post("/api/system/reboot")
-def reboot_system(background_tasks: BackgroundTasks):
-    """
-    Reboot the Raspberry Pi.
-    Scheduled after response so frontend gets acknowledgement.
-    """
-    background_tasks.add_task(_reboot_pi)
-
-    return {
-        "ok": True,
-        "action": "reboot",
-        "status": "scheduled",
-        "time": datetime.now(timezone.utc).isoformat(),
-    }
 
 
 @app.post("/api/storage/unmount")

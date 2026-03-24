@@ -308,7 +308,6 @@ export type ApplyAccelerometerConfigResponse = {
   };
   status: string;
 
-
   // ACK / SEQ fields intentionally removed from the frontend contract.
 };
 
@@ -349,13 +348,6 @@ export function sendNodeControl(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-    signal,
-  });
-}
-
-export function rebootPi(signal?: AbortSignal) {
-  return request<SystemActionResponse>("/api/system/reboot", {
-    method: "POST",
     signal,
   });
 }

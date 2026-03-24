@@ -8,7 +8,6 @@ import {
   getNodes,
   getStorage,
   getStorageStatus,
-  rebootPi,
   unmountStorage,
   type FaultRow,
   type NodeRecord,
@@ -43,23 +42,7 @@ export default function Home() {
 
   const [warningSerials, setWarningSerials] = useState<string[]>([]);
 
-  const [rebooting, setRebooting] = useState<boolean>(false);
   const [unmounting, setUnmounting] = useState<boolean>(false);
-
-  async function handleReboot() {
-    const confirmed = window.confirm(
-      "This will reboot the Raspberry Pi. Continue?"
-    );
-    if (!confirmed) return;
-
-    try {
-      setRebooting(true);
-      await rebootPi();
-    } catch (err: any) {
-      alert(`Reboot failed: ${err?.message ?? "Unknown error"}`);
-      setRebooting(false);
-    }
-  }
 
   async function handleUnmount() {
     const confirmed = window.confirm(
@@ -138,7 +121,6 @@ export default function Home() {
         if (!mounted) return;
 
         setBackendOnline(false);
-        setRebooting(false);
 
         eventSource?.close();
 
@@ -266,15 +248,6 @@ export default function Home() {
             </div>
 
             <div className="home-card-actions">
-              <button
-                className="home-action-btn"
-                onClick={handleReboot}
-                disabled={rebooting}
-                type="button"
-              >
-                {rebooting ? "Rebooting..." : "Reboot"}
-              </button>
-
               <span className={`status-pill ${backendOnline ? "info" : "high"}`}>
                 {backendOnline ? "Online" : "Offline"}
               </span>
