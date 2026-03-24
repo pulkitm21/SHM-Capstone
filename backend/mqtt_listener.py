@@ -18,6 +18,9 @@ BROKER_HOST = "localhost"
 BROKER_PORT = 1883
 STATUS_TOPIC = "wind_turbine/+/status"
 
+# Track live MQTT listener connection health.
+MQTT_CONNECTED = False
+
 
 # ----------------------------
 # Helpers (mapping firmware to backend)
@@ -147,11 +150,22 @@ def handle_status(topic: str, payload_raw: str):
 # ----------------------------
 
 def on_connect(client, userdata, flags, rc):
+    global MQTT_CONNECTED
+
     if rc == 0:
+        MQTT_CONNECTED = True
         print("[MQTT] Connected")
         client.subscribe(STATUS_TOPIC)
     else:
+        MQTT_CONNECTED = False
         print(f"[MQTT] Connection failed: {rc}")
+
+
+# Mark listener health false on disconnect.
+def on_disconnect(client, userdata, rc):
+    global MQTT_CONNECTED
+    MQTT_CONNECTED = False
+    print(f"[MQTT] Disconnected: rc={rc}")
 
 
 def on_message(client, userdata, msg):
@@ -167,6 +181,7 @@ def on_message(client, userdata, msg):
 def start_listener():
     client = mqtt.Client()
     client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
     client.on_message = on_message
 
     client.connect(BROKER_HOST, BROKER_PORT, 60)

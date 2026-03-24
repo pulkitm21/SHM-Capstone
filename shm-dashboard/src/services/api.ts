@@ -50,8 +50,11 @@ export type UpdateSiteNameRequest = {
 };
 
 export type HealthResponse = {
-  status?: string;
+  status?: "OK" | "DEGRADED";
   time?: string;
+  mqtt?: boolean;
+  ssd?: boolean;
+  fault_db?: boolean;
   [key: string]: unknown;
 };
 

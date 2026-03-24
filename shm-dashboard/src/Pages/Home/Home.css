@@ -13,6 +13,12 @@
   padding: 4px 2px 2px;
 }
 
+/* ✅ FIX: allow hero content to expand full width */
+.home-hero > div {
+  flex: 1;
+  min-width: 0;
+}
+
 .home-title {
   margin: 0;
   font-size: 32px;
@@ -27,6 +33,46 @@
   font-size: 15px;
   line-height: 1.6;
   color: #5c6f7f;
+}
+
+/* Rounded warning alert shown below the page title */
+.home-warning-alert {
+  margin-top: 12px;
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 14px;
+  background: #fff7db;
+  border: 1px solid #f1d27a;
+  color: #7a5a00;
+  flex-wrap: wrap;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.home-warning-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 24px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: #f4c542;
+  color: #5b4300;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.home-warning-text {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.5;
+  color: #7a5a00;
 }
 
 .home-grid {
@@ -235,14 +281,12 @@
   font-weight: 700;
 }
 
-/* Make Recent Faults span across the full page width */
 .home-faults-card {
   grid-column: 1 / -1;
   display: flex;
   flex-direction: column;
 }
 
-/* Give the fault table more room */
 .home-faults-card .home-card-body {
   width: 100%;
 }
@@ -317,5 +361,9 @@
   .home-card-actions {
     width: 100%;
     justify-content: flex-start;
+  }
+
+  .home-warning-alert {
+    width: 100%;
   }
 }

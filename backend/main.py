@@ -12,6 +12,7 @@ import shutil
 import os
 from pathlib import Path
 
+import mqtt_listener
 from mqtt_listener import start_listener
 
 from settings_schema import SettingsModel, to_dict, copy_deep
@@ -122,6 +123,24 @@ def _unmount_ssd():
 
 def is_ssd_available() -> bool:
     return bool(get_ssd_mount_status()["available"])
+
+
+# Build one lightweight backend health snapshot for REST and SSE.
+def get_system_health() -> Dict[str, Any]:
+    ssd_status = get_ssd_mount_status()
+    mqtt_ok = bool(mqtt_listener.MQTT_CONNECTED)
+    ssd_ok = bool(ssd_status["available"])
+    fault_db_ok = bool(ssd_ok and FAULTS_DB.exists())
+
+    overall_ok = mqtt_ok and ssd_ok and fault_db_ok
+
+    return {
+        "status": "OK" if overall_ok else "DEGRADED",
+        "mqtt": mqtt_ok,
+        "ssd": ssd_ok,
+        "fault_db": fault_db_ok,
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def empty_fault_response(page: int = 1, page_size: int = 15) -> Dict[str, Any]:
@@ -284,10 +303,7 @@ def root():
 @app.get("/health")
 def health():
     # Testing/manual health check endpoint only. SSE is used for backend status updates in the dashboard.
-    return {
-        "status": "OK",
-        "time": datetime.now(timezone.utc).isoformat(),
-    }
+    return get_system_health()
 
 
 @app.get("/api/events/health")
@@ -299,10 +315,7 @@ async def health_events(request: Request):
             if await request.is_disconnected():
                 break
 
-            payload = {
-                "status": "OK",
-                "time": datetime.now(timezone.utc).isoformat(),
-            }
+            payload = get_system_health()
 
             yield f"data: {json.dumps(payload)}\n\n"
             await asyncio.sleep(5)
