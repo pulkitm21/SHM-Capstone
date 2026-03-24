@@ -24,85 +24,52 @@ from raw_backup import write_raw, close_all as raw_backup_close_all
 BROKER_IP = "localhost"
 PORT = 1883
 TOPIC = "wind_turbine/+/data"
+STATUS_TOPIC = "wind_turbine/+/status"  # MQTT status topic for ACK/state updates
 
 DATA_DIR = "/mnt/ssd/data"
 SSD_AVAILABLE = os.path.isdir("/mnt/ssd") and os.path.ismount("/mnt/ssd")
+
+# Queue/backoff settings used by the MQTT consumer path.
+QUEUE_MAX_SIZE = 1000
+KEEPALIVE_S = 60
+MAX_RECONNECT_DELAY_S = 30
 
 if SSD_AVAILABLE:
     os.makedirs(DATA_DIR, exist_ok=True)
 else:
     print("[delta_encoder] SSD not mounted. Sensor data will not be saved.")
 
-STATUS_TOPIC = "wind_turbine/+/status" ## ADDITION FOR ACK
-
-
 # -------------------------------------------------------------------
 # Zstandard compression settings
 #
 # Each hourly .bin file is written as plain binary while the hour is
-# active (simple append, zero compression overhead on the hot path).
-# When the hour rolls over the file is closed, compressed to .zst in
-# one pass (best ratio — full file context), and the .bin is deleted.
-#
-# ZSTD_LEVEL : 1 (fastest) … 22 (smallest).
-#              Level 3 is a good balance for sensor data.
+# active. When the hour rolls over the file is compressed to .zst and
+# the original .bin is deleted.
 # -------------------------------------------------------------------
 ZSTD_LEVEL = 3
 
 # -------------------------------------------------------------------
 # Packet format (JSON input):
 #   {"a": [[t,x,y,z], ...], "i": [t,x,y,z], "T": [t,val]}
-#   Each sensor carries its own ISO 8601 UTC timestamp string,
-#   e.g. "2026-03-21T21:26:57.519349Z".
-#   parse_iso_timestamp() converts these to Unix seconds (float)
-#   before any further processing.
+#   Each sensor carries its own ISO 8601 UTC timestamp string.
 #
-# Binary format — each sensor tracks its OWN timestamps independently:
-#
-# ABSOLUTE record (first in file, or forced after gap/overflow/clip):
-#   sentinel(0xFF) | header(B)
-#   if accel  (bit0): n(B) + n × [ ts_abs(q)  x(i)   y(i)   z(i)  ]
-#   if inclin (bit1):             [ ts_abs(q)  r(i)   p(i)   yaw(i)]
-#   if temp   (bit2):             [ ts_abs(q)  val(i)              ]
-#
-# DELTA record:
-#   header(B)
-#   if accel  (bit0): n(B) + n × [ changed(B)  delta_ts?(i)  dx?(h)  dy?(h)  dz?(h)  ]
-#   if inclin (bit1):             [ changed(B)  delta_ts?(i)  dr?(h)  dp?(h)  dyaw?(h) ]
-#   if temp   (bit2):             [ changed(B)  delta_ts?(i)  dval?(h)                 ]
-#
-# changed byte bitmask (per sensor):
-#   bit0 = timestamp changed  → delta_ts(i) present
-#   bit1 = x/r/val changed    → dx/dr/dval(h) present
-#   bit2 = y/p changed        → dy/dp(h) present   [accel/inclin]
-#   bit3 = z/yaw changed      → dz/dyaw(h) present [accel/inclin]
-# Fields with changed-bit=0 are omitted (null) — decoder keeps prev value.
-# If changed==0x00 the sensor field is still present in header (for state
-# tracking) but contributes 1 byte (the changed byte itself) to the record.
-#
-# ts_abs    : int64 µs  (absolute Unix µs)
-# delta_ts  : int32 µs  (ts_current - ts_previous for that sensor)
-# sensor values : int16, scaled (see ACCEL_SCALE / INCLIN_SCALE / TEMP_SCALE)
+# Binary format — each sensor tracks its own timestamps independently.
 # -------------------------------------------------------------------
 
-TEMP_SCALE    = 100        # 0.01 °C  → int16
-ACCEL_SCALE   = 10000      # 0.0001 g → int16
-INCLIN_SCALE  = 10000      # 0.0001 ° → int16
-TS_SCALE      = 1_000_000  # seconds  → µs
+TEMP_SCALE = 100        # 0.01 °C  -> int
+ACCEL_SCALE = 10000     # 0.0001 g -> int
+INCLIN_SCALE = 10000    # 0.0001 ° -> int
+TS_SCALE = 1_000_000    # seconds  -> µs
 
-# Binary file format version — first byte of every .bin file.
-#   v1 = legacy (raw dod_ts, no changed byte)
-#   v2 = current (changed byte prefix, simple delta_ts)
 FILE_FORMAT_VERSION = 2
 
-MAX_DELTA_S   = 60.0       # force ABSOLUTE if sensor timestamp gap > this
-INT16_MAX     = 32767
+MAX_DELTA_S = 60.0
+INT16_MAX = 32767
 
-TS_MIN          = 1_577_836_800.0   # 2020-01-01
-TS_MAX          = 4_102_444_800.0   # 2100-01-01
-_clock_warn_interval              = 10.0
+TS_MIN = 1_577_836_800.0   # 2020-01-01
+TS_MAX = 4_102_444_800.0   # 2100-01-01
+_clock_warn_interval = 10.0
 _last_clock_warn: dict[str, float] = {}
-
 
 # -------------------------------------------------------------------
 # Timestamp helpers
@@ -111,20 +78,14 @@ _last_clock_warn: dict[str, float] = {}
 def parse_iso_timestamp(raw_t: str, node_id: str) -> float | None:
     """
     Parse an ISO 8601 UTC timestamp string to Unix seconds (float).
-    Accepts the format produced by the sensor firmware:
-        "2026-03-21T21:26:57.519349Z"
-    Returns None (and emits a rate-limited warning) if:
-      - the string cannot be parsed, or
-      - the resulting Unix time is outside TS_MIN … TS_MAX
-        (indicates the node clock was not synced at boot).
+    Returns None if parsing fails or the timestamp is implausible.
     """
     try:
-        # Strip trailing Z and parse as UTC
         ts = datetime.strptime(
             raw_t.rstrip("Z"), "%Y-%m-%dT%H:%M:%S.%f"
         ).replace(tzinfo=__import__("datetime").timezone.utc).timestamp()
     except (ValueError, AttributeError):
-        now  = time.monotonic()
+        now = time.monotonic()
         last = _last_clock_warn.get(node_id, 0.0)
         if now - last >= _clock_warn_interval:
             _last_clock_warn[node_id] = now
@@ -132,7 +93,7 @@ def parse_iso_timestamp(raw_t: str, node_id: str) -> float | None:
         return None
 
     if not (TS_MIN <= ts <= TS_MAX):
-        now  = time.monotonic()
+        now = time.monotonic()
         last = _last_clock_warn.get(node_id, 0.0)
         if now - last >= _clock_warn_interval:
             _last_clock_warn[node_id] = now
@@ -140,8 +101,10 @@ def parse_iso_timestamp(raw_t: str, node_id: str) -> float | None:
                 date_str = datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d")
             except Exception:
                 date_str = "?"
-            print(f"[{node_id}] WARNING: implausible timestamp {raw_t!r} "
-                  f"({date_str}) — clock not synced, packet dropped.")
+            print(
+                f"[{node_id}] WARNING: implausible timestamp {raw_t!r} "
+                f"({date_str}) — clock not synced, packet dropped."
+            )
         return None
 
     return ts
@@ -149,10 +112,8 @@ def parse_iso_timestamp(raw_t: str, node_id: str) -> float | None:
 
 def normalise_sensor_timestamps(data: dict, node_id: str) -> bool:
     """
-    Parse ISO 8601 timestamp strings in-place to Unix seconds (float).
-    Returns False if ANY sensor timestamp is invalid (whole packet dropped).
-    Format: a=[[t,x,y,z],...],  i=[t,x,y,z],  T=[t,val]
-    where t is "YYYY-MM-DDTHH:MM:SS.ffffffZ".
+    Parse ISO 8601 timestamps in-place to Unix seconds (float).
+    Returns False if any sensor timestamp is invalid.
     """
     if "a" in data:
         for sample in data["a"]:
@@ -176,28 +137,33 @@ def normalise_sensor_timestamps(data: dict, node_id: str) -> bool:
     return True
 
 
+def now_iso() -> str:
+    """Build a UTC ISO timestamp for ACK bookkeeping and fault fallbacks."""
+    return datetime.utcnow().isoformat() + "Z"
+
+
 # -------------------------------------------------------------------
 # Per-node encoding state
 # -------------------------------------------------------------------
 
-node_state:  dict         = {}
-data_buffer: queue.Queue  = queue.Queue()
+node_state: dict = {}
+data_buffer: queue.Queue = queue.Queue(maxsize=QUEUE_MAX_SIZE)
 
 
 def _fresh_state() -> dict:
-    # Fresh per-node encoder state at process start or file rollover.
+    """Create fresh per-node encoder state."""
     return {
-        "accel":  {"ts_us": 0, "xyz_prev": [0, 0, 0]},
+        "accel": {"ts_us": 0, "xyz_prev": [0, 0, 0]},
         "inclin": {"ts_us": 0, "xyz_prev": [0, 0, 0]},
-        "temp":   {"ts_us": 0, "val_prev": 0},
-        "file_hour":      None,
-        "is_first":       True,
+        "temp": {"ts_us": 0, "val_prev": 0},
+        "file_hour": None,
+        "is_first": True,
         "header_written": False,
     }
 
 
 def get_hourly_filepath(node_id: str) -> tuple[str, str]:
-    # Build the active hourly .bin path for one node.
+    """Build the active hourly .bin path for one node."""
     hour_str = datetime.now().strftime("%Y%m%d_%H")
     return hour_str, os.path.join(DATA_DIR, f"data_{node_id}_{hour_str}.bin")
 
@@ -208,27 +174,25 @@ def get_hourly_filepath(node_id: str) -> tuple[str, str]:
 
 def needs_absolute_record(data: dict, state: dict) -> tuple[bool, str]:
     """Return (True, reason) if any sensor would overflow delta_ts or clip int16."""
-
     if "a" in data and len(data["a"]) > 0:
         ts_s = float(data["a"][0][0])
-        gap  = ts_s - state["accel"]["ts_us"] / TS_SCALE
+        gap = ts_s - state["accel"]["ts_us"] / TS_SCALE
         if abs(gap) > MAX_DELTA_S:
             return True, f"accel timestamp gap {gap:.1f} s"
-        # Check all samples — prev advances through the burst so each sample
-        # is compared against the one before it, exactly as encode_delta_record does.
+
         prev = state["accel"]["xyz_prev"]
         for s in data["a"]:
             xi = int(float(s[1]) * ACCEL_SCALE)
             yi = int(float(s[2]) * ACCEL_SCALE)
             zi = int(float(s[3]) * ACCEL_SCALE)
-            for d, name in ((xi-prev[0],"x"),(yi-prev[1],"y"),(zi-prev[2],"z")):
+            for d, name in ((xi - prev[0], "x"), (yi - prev[1], "y"), (zi - prev[2], "z")):
                 if abs(d) >= INT16_MAX:
                     return True, f"accel {name} delta {d} would clip int16"
             prev = [xi, yi, zi]
 
     if "i" in data:
         ts_s = float(data["i"][0])
-        gap  = ts_s - state["inclin"]["ts_us"] / TS_SCALE
+        gap = ts_s - state["inclin"]["ts_us"] / TS_SCALE
         if abs(gap) > MAX_DELTA_S:
             return True, f"inclin timestamp gap {gap:.1f} s"
         prev = state["inclin"]["xyz_prev"]
@@ -236,13 +200,10 @@ def needs_absolute_record(data: dict, state: dict) -> tuple[bool, str]:
             d = int(float(data["i"][idx + 1]) * INCLIN_SCALE) - prev[idx]
             if abs(d) >= INT16_MAX:
                 return True, f"inclin {name} delta {d} would clip int16"
-        # yaw is int32 — no clip guard needed
 
     if "T" in data:
-        ts_s      = float(data["T"][0])
+        ts_s = float(data["T"][0])
         ts_us_new = int(ts_s * TS_SCALE)
-        # If timestamp hasn't changed, this reading will be skipped in the
-        # encoder — no need to check for overflow on a value that won't be written.
         if ts_us_new != state["temp"]["ts_us"]:
             gap = ts_s - state["temp"]["ts_us"] / TS_SCALE
             if abs(gap) > MAX_DELTA_S:
@@ -259,18 +220,15 @@ def needs_absolute_record(data: dict, state: dict) -> tuple[bool, str]:
 # -------------------------------------------------------------------
 
 def _abs_ts_bytes(ts_s: float, ss: dict) -> bytes:
-    """Encode absolute timestamp, update sensor-state ss."""
+    """Encode absolute timestamp and update sensor state."""
     ts_us = int(ts_s * TS_SCALE)
     ss["ts_us"] = ts_us
     return struct.pack("<q", ts_us)
 
 
-def _delta_ts_bytes(ts_s: float, ss: dict) -> bytes:
-    """Encode simple delta timestamp (current - previous), update sensor-state ss."""
-    ts_us    = int(ts_s * TS_SCALE)
-    delta_us = ts_us - ss["ts_us"]
-    ss["ts_us"] = ts_us
-    return struct.pack("<i", delta_us)
+def _pack_delta(value: int) -> bytes:
+    """Clamp and pack a signed delta as int16."""
+    return struct.pack("<h", max(-32768, min(32767, value)))
 
 
 # -------------------------------------------------------------------
@@ -278,14 +236,14 @@ def _delta_ts_bytes(ts_s: float, ss: dict) -> bytes:
 # -------------------------------------------------------------------
 
 def encode_first_record(data: dict, state: dict) -> bytes:
-    """Encode an ABSOLUTE record. All values and timestamps stored as integers."""
+    """Encode an ABSOLUTE record."""
     header = 0
-    body   = bytearray()
+    body = bytearray()
 
     if "a" in data and len(data["a"]) > 0:
         header |= 0x01
         samples = data["a"]
-        body   += struct.pack("<B", len(samples))
+        body += struct.pack("<B", len(samples))
         for s in samples:
             xi = int(float(s[1]) * ACCEL_SCALE)
             yi = int(float(s[2]) * ACCEL_SCALE)
@@ -324,40 +282,26 @@ def encode_first_record(data: dict, state: dict) -> bytes:
 # DELTA record encoder
 # -------------------------------------------------------------------
 
-def _pack_delta(value: int, nbytes: int = 2) -> bytes:
-    """Clamp and pack a signed delta as int16."""
-    return struct.pack("<h", max(-32768, min(32767, value)))
-
-
 def encode_delta_record(data: dict, state: dict) -> bytes:
-    """
-    Encode a DELTA record.
-    Each sensor field is preceded by a 'changed' bitmask byte:
-      bit0 = timestamp delta-of-delta present
-      bit1 = first value axis (x/roll/val) changed
-      bit2 = second value axis (y/pitch) changed   [accel/inclin]
-      bit3 = third value axis (z/yaw) changed      [accel/inclin]
-    Only fields whose bit is set are written; zero-delta fields are null/omitted.
-    """
+    """Encode a DELTA record using changed-bit masks."""
     header = 0
-    body   = bytearray()
+    body = bytearray()
 
-    # ── Accelerometer ─────────────────────────────────────────────
     if "a" in data and len(data["a"]) > 0:
         header |= 0x01
         samples = data["a"]
-        body   += struct.pack("<B", len(samples))
-        prev    = state["accel"]["xyz_prev"]
-        ss      = state["accel"]
+        body += struct.pack("<B", len(samples))
+        prev = state["accel"]["xyz_prev"]
+        ss = state["accel"]
+
         for s in samples:
             xi = int(float(s[1]) * ACCEL_SCALE)
             yi = int(float(s[2]) * ACCEL_SCALE)
             zi = int(float(s[3]) * ACCEL_SCALE)
             dx, dy, dz = xi - prev[0], yi - prev[1], zi - prev[2]
 
-            # Compute delta_ts (simple difference)
             ts_us_new = int(float(s[0]) * TS_SCALE)
-            delta_us  = ts_us_new - ss["ts_us"]
+            delta_us = ts_us_new - ss["ts_us"]
 
             changed = 0
             if delta_us != 0:
@@ -381,21 +325,21 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
 
             ss["ts_us"] = ts_us_new
             prev = [xi, yi, zi]
+
         state["accel"]["xyz_prev"] = prev
 
-    # ── Inclinometer ──────────────────────────────────────────────
     if "i" in data:
         header |= 0x02
-        iv   = data["i"]
-        ss   = state["inclin"]
-        ri   = int(float(iv[1]) * INCLIN_SCALE)
-        pi   = int(float(iv[2]) * INCLIN_SCALE)
-        yi   = int(float(iv[3]) * INCLIN_SCALE)
+        iv = data["i"]
+        ss = state["inclin"]
+        ri = int(float(iv[1]) * INCLIN_SCALE)
+        pi = int(float(iv[2]) * INCLIN_SCALE)
+        yi = int(float(iv[3]) * INCLIN_SCALE)
         prev = ss["xyz_prev"]
         dr, dp, dy = ri - prev[0], pi - prev[1], yi - prev[2]
 
         ts_us_new = int(float(iv[0]) * TS_SCALE)
-        delta_us  = ts_us_new - ss["ts_us"]
+        delta_us = ts_us_new - ss["ts_us"]
 
         changed = 0
         if delta_us != 0:
@@ -420,16 +364,14 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
         ss["ts_us"] = ts_us_new
         ss["xyz_prev"] = [ri, pi, yi]
 
-    # ── Temperature ───────────────────────────────────────────────
     if "T" in data:
-        tv        = data["T"]
-        ss        = state["temp"]
-        vi        = int(float(tv[1]) * TEMP_SCALE)
+        tv = data["T"]
+        ss = state["temp"]
+        vi = int(float(tv[1]) * TEMP_SCALE)
         ts_us_new = int(float(tv[0]) * TS_SCALE)
         delta_us = ts_us_new - ss["ts_us"]
-        dt       = vi - ss["val_prev"]
+        dt = vi - ss["val_prev"]
 
-        # Skip entirely if frozen (same timestamp and value as last write)
         is_frozen = (ts_us_new == ss["ts_us"] and vi == ss["val_prev"])
         ss["ts_us"] = ts_us_new
 
@@ -457,20 +399,19 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
 # -------------------------------------------------------------------
 
 def compress_and_replace(node_id: str, bin_path: str):
-    """
-    Compress a closed .bin file to .zst (single Zstd frame, best ratio)
-    and delete the original. Called only after the file is fully written.
-    """
+    """Compress a closed .bin file to .zst and delete the original."""
     zst_path = bin_path[:-4] + ".zst"
     try:
         file_size = os.path.getsize(bin_path)
         cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL, write_content_size=True)
         with open(bin_path, "rb") as f_in, open(zst_path, "wb") as f_out:
             cctx.copy_stream(f_in, f_out, size=file_size)
+
         original_size = os.path.getsize(bin_path)
         compressed_size = os.path.getsize(zst_path)
         ratio = compressed_size / original_size * 100 if original_size else 0
         os.remove(bin_path)
+
         print(
             f"[{node_id}] Compressed {os.path.basename(bin_path)} → "
             f"{os.path.basename(zst_path)} "
@@ -478,10 +419,10 @@ def compress_and_replace(node_id: str, bin_path: str):
         )
     except Exception as e:
         print(f"[{node_id}] WARNING: compression failed for {bin_path}: {e}")
-        # Leave .bin intact so data is not lost
 
 
 def write_record(node_id: str, data: dict):
+    """Write one normalized packet into the active hourly binary file."""
     hour_str, filepath = get_hourly_filepath(node_id)
 
     if node_id not in node_state:
@@ -489,13 +430,13 @@ def write_record(node_id: str, data: dict):
     state = node_state[node_id]
 
     if state["file_hour"] != hour_str:
-        # Hour boundary: compress the just-closed .bin file, then start fresh.
         if state["file_hour"] is not None:
             old_bin = os.path.join(DATA_DIR, f"data_{node_id}_{state['file_hour']}.bin")
             if os.path.exists(old_bin):
                 compress_and_replace(node_id, old_bin)
-        state["file_hour"]      = hour_str
-        state["is_first"]       = True
+
+        state["file_hour"] = hour_str
+        state["is_first"] = True
         state["header_written"] = False
         print(f"[{node_id}] New hourly file: {filepath}")
 
@@ -511,7 +452,6 @@ def write_record(node_id: str, data: dict):
     else:
         record = encode_delta_record(data, state)
 
-    # Append directly to .bin — no buffering needed
     with open(filepath, "ab") as f:
         if not state["header_written"]:
             f.write(struct.pack("<B", FILE_FORMAT_VERSION))
@@ -524,6 +464,7 @@ def write_record(node_id: str, data: dict):
 # -------------------------------------------------------------------
 
 def consumer_worker():
+    """Background worker that writes queued sensor packets to disk."""
     while True:
         node_id, data = data_buffer.get()
         try:
@@ -537,16 +478,13 @@ def consumer_worker():
 consumer_thread = threading.Thread(target=consumer_worker, daemon=True)
 consumer_thread.start()
 
+
 # -------------------------------------------------------------------
-# Additional MQTT handling for status messages and ACKs
+# Status/ACK handling
 # -------------------------------------------------------------------
 
-def now_iso() -> str:
-    # Build a UTC ISO timestamp for ACK bookkeeping and fault fallback timestamps.
-    return datetime.utcnow().isoformat() + "Z"
-
-# Process node status messages and update backend config/runtime state.
 def handle_status_message(topic: str, payload_bytes: bytes) -> None:
+    """Process node status messages and update backend config/runtime state."""
     try:
         serial = serial_from_topic(topic)
         register_serial(serial)
@@ -567,7 +505,6 @@ def handle_status_message(topic: str, payload_bytes: bytes) -> None:
             key in payload for key in ("odr_index", "range", "hpf_corner")
         )
 
-        # Full config ACK from the ESP32
         if applied and seq_ack is not None and has_full_config:
             apply_accelerometer_config_ack(
                 node_id=node["node_id"],
@@ -581,7 +518,6 @@ def handle_status_message(topic: str, payload_bytes: bytes) -> None:
             print(f"[status] Applied config ACK for {serial} seq={seq_ack}")
             return
 
-        # State-only ACK, e.g. { "state": "recording" }
         update_accelerometer_runtime_state(
             node_id=node["node_id"],
             current_state=current_state,
@@ -592,48 +528,72 @@ def handle_status_message(topic: str, payload_bytes: bytes) -> None:
     except Exception as e:
         print(f"Failed to process status message on {topic}: {e}")
 
+
 # -------------------------------------------------------------------
 # MQTT callbacks
 # -------------------------------------------------------------------
 
 def on_connect(client, userdata, flags, reason_code, properties):
-    print("Connected with result code", reason_code)
+    """Subscribe to data and status topics on successful MQTT connect."""
+    if reason_code == 0:
+        print("[MQTT] Connected to broker")
+    else:
+        print(f"[MQTT] Connection failed: reason_code={reason_code} — will retry automatically")
+        return
+
     client.subscribe(TOPIC)
-    client.subscribe(STATUS_TOPIC) # Subscribe to status topic for ACKs
+    client.subscribe(STATUS_TOPIC)
+
+
+def on_disconnect(client, userdata, flags, reason_code, properties):
+    """Log disconnect events. Paho handles reconnect backoff."""
+    if reason_code == 0:
+        print("[MQTT] Disconnected cleanly")
+    else:
+        print(
+            f"[MQTT] Unexpected disconnect (reason_code={reason_code}) — "
+            f"paho will reconnect automatically with exponential back-off"
+        )
 
 
 def on_message(client, userdata, msg):
+    """Handle incoming MQTT packets for status updates and sensor data."""
     try:
-        if msg.topic.endswith("/status"):  # Handle status messages separately for ACKs and state updates
+        if msg.topic.endswith("/status"):
             handle_status_message(msg.topic, msg.payload)
             return
 
         if not msg.topic.endswith("/data"):
             return
-        
+
         topic_parts = msg.topic.split("/")
         node_id = topic_parts[1]
         register_serial(node_id)
 
-        # ── Raw backup — written FIRST, before any validation or processing ──
-        # Captures exactly what the sensor sent, including packets that will
-        # be dropped below (bad clock, missing fields, etc).
-        write_raw(node_id, msg.payload)  # raw_backup: verbatim, before processing
+        # Raw backup is written first so the original packet is preserved.
+        write_raw(node_id, msg.payload)
 
+        # Parse the JSON payload.
         data = json.loads(msg.payload.decode())
 
-        # Fault logging is handled in a separate helper so delta_encoder stays focused on storage.
+        # Fault logging is handled in a separate helper so this file stays focused on storage.
         log_faults_from_packet(
             serial_number=node_id,
             packet=data,
             receive_iso=now_iso(),
         )
 
-        # Sensor timestamps are normalized only for binary storage.
+        # Normalize sensor timestamps only for binary storage.
         if not normalise_sensor_timestamps(data, node_id):
             return
 
-        data_buffer.put((node_id, data))
+        try:
+            data_buffer.put_nowait((node_id, data))
+        except queue.Full:
+            print(
+                f"[{node_id}] WARNING: queue full ({QUEUE_MAX_SIZE} items) — "
+                f"packet dropped. Check if consumer is stalled (disk full/unmounted?)."
+            )
 
     except Exception as e:
         print(f"Error processing MQTT message on {msg.topic}: {e}")
@@ -645,10 +605,17 @@ def on_message(client, userdata, msg):
 
 client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 client.on_connect = on_connect
+client.on_disconnect = on_disconnect
 client.on_message = on_message
 
-client.connect(BROKER_IP, PORT, 60)
+# Enable automatic reconnect backoff.
+client.reconnect_delay_set(min_delay=1, max_delay=MAX_RECONNECT_DELAY_S)
+
 try:
-    client.loop_forever()
+    client.connect(BROKER_IP, PORT, keepalive=KEEPALIVE_S)
+    client.loop_forever(retry_first_connection=True)
+except Exception as e:
+    print(f"[MQTT] Fatal connection error: {e}")
+    raise
 finally:
     raw_backup_close_all()
