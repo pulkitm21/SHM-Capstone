@@ -11,7 +11,9 @@ async function request<T>(
     try {
       const text = await res.text();
       if (text) msg += ` - ${text}`;
-    } catch {}
+    } catch {
+      // Ignore response parse errors here and throw the HTTP status instead.
+    }
     throw new Error(msg);
   }
 
@@ -48,8 +50,11 @@ export type UpdateSiteNameRequest = {
 };
 
 export type HealthResponse = {
-  status?: string;
+  status?: "OK" | "DEGRADED";
   time?: string;
+  mqtt?: boolean;
+  ssd?: boolean;
+  fault_db?: boolean;
   [key: string]: unknown;
 };
 
@@ -277,9 +282,15 @@ export function getFaults(params?: FaultsQueryParams, signal?: AbortSignal) {
 
 export type AccelerometerOdrIndex = 0 | 1 | 2;
 export type AccelerometerRange = 1 | 2 | 3;
-export type ConfigSyncStatus = "unknown" | "synced" | "pending" | "failed";
-export type NodeState = "unknown" | "idle" | "configured" | "recording" | "reconfig" | "error";
-export type ControlStatus = "idle" | "pending" | "acked" | "failed";
+
+export type NodeState =
+  | "unknown"
+  | "idle"
+  | "configured"
+  | "recording"
+  | "reconfig"
+  | "error";
+
 export type ControlCommand = "start" | "stop";
 
 export type ApplyAccelerometerConfigBody = {
@@ -298,16 +309,9 @@ export type ApplyAccelerometerConfigResponse = {
     range: AccelerometerRange;
     hpf_corner: number;
   };
-  applied: {
-    odr_index: AccelerometerOdrIndex | null;
-    range: AccelerometerRange | null;
-    hpf_corner: number | null;
-  };
-  current_state: NodeState;
-  pending_seq: number | null;
-  applied_seq: number | null;
-  sync_status: ConfigSyncStatus;
-  acked_at?: string | null;
+  status: string;
+
+  // ACK / SEQ fields intentionally removed from the frontend contract.
 };
 
 export type NodeControlBody = {
@@ -319,11 +323,7 @@ export type NodeControlResponse = {
   node_id: number;
   serial: string;
   cmd: ControlCommand;
-  seq: number;
   status: string;
-  control_status: ControlStatus;
-  pending_control_cmd: ControlCommand | null;
-  pending_control_seq: number | null;
 };
 
 export function applyAccelerometerConfig(
@@ -351,13 +351,6 @@ export function sendNodeControl(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-    signal,
-  });
-}
-
-export function rebootPi(signal?: AbortSignal) {
-  return request<SystemActionResponse>("/api/system/reboot", {
-    method: "POST",
     signal,
   });
 }

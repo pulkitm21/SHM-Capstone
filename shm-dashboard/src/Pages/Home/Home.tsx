@@ -8,7 +8,7 @@ import {
   getNodes,
   getStorage,
   getStorageStatus,
-  rebootPi,
+  type HealthResponse,
   unmountStorage,
   type FaultRow,
   type NodeRecord,
@@ -22,11 +22,43 @@ function isActiveFault(fault: FaultRow) {
   return String(fault.fault_status ?? "").toLowerCase() !== "resolved";
 }
 
+type BackendHealthBadgeState = "OK" | "DEGRADED" | "OFFLINE";
+
+function getBackendPillClass(state: BackendHealthBadgeState) {
+  if (state === "OK") return "info";
+  if (state === "DEGRADED") return "warning";
+  return "high";
+}
+
+function getBackendBadgeLabel(state: BackendHealthBadgeState) {
+  if (state === "OK") return "Online";
+  if (state === "DEGRADED") return "Degraded";
+  return "Offline";
+}
+
+function formatSubsystemHealth(value: boolean) {
+  return value ? "Healthy" : "Unavailable";
+}
+
+function getBackendWarningMessage(state: BackendHealthBadgeState) {
+  if (state === "OFFLINE") {
+    return "Backend unavailable. Live status, node updates, and storage data may be stale.";
+  }
+
+  if (state === "DEGRADED") {
+    return "Backend degraded. Some live services may be unavailable.";
+  }
+
+  return "";
+}
+
 export default function Home() {
   const navigate = useNavigate();
 
-  const [backendOnline, setBackendOnline] = useState<boolean>(false);
-  const [lastOnline, setLastOnline] = useState<string>("");
+  const [backendHealthState, setBackendHealthState] =
+    useState<BackendHealthBadgeState>("OFFLINE");
+  const [mqttHealthy, setMqttHealthy] = useState<boolean>(false);
+  const [faultDbHealthy, setFaultDbHealthy] = useState<boolean>(false);
   const [lastUpdate, setLastUpdate] = useState<string>("");
 
   const [nodes, setNodes] = useState<NodeRecord[]>([]);
@@ -43,23 +75,7 @@ export default function Home() {
 
   const [warningSerials, setWarningSerials] = useState<string[]>([]);
 
-  const [rebooting, setRebooting] = useState<boolean>(false);
   const [unmounting, setUnmounting] = useState<boolean>(false);
-
-  async function handleReboot() {
-    const confirmed = window.confirm(
-      "This will reboot the Raspberry Pi. Continue?"
-    );
-    if (!confirmed) return;
-
-    try {
-      setRebooting(true);
-      await rebootPi();
-    } catch (err: any) {
-      alert(`Reboot failed: ${err?.message ?? "Unknown error"}`);
-      setRebooting(false);
-    }
-  }
 
   async function handleUnmount() {
     const confirmed = window.confirm(
@@ -96,40 +112,28 @@ export default function Home() {
     let eventSource: EventSource | null = null;
     let reconnectTimeoutId: number | null = null;
 
-    function formatLocalDateTime(value: string) {
-      const date = new Date(value);
-      if (Number.isNaN(date.getTime())) return value;
-      return date.toLocaleString();
-    }
-
     function connectBackendStatusSSE() {
       eventSource = new EventSource(
         `${import.meta.env.VITE_API_BASE_URL}/api/events/health`
       );
 
-      eventSource.onopen = () => {
-        if (!mounted) return;
-        setBackendOnline(true);
-      };
-
       eventSource.onmessage = (event) => {
         if (!mounted) return;
 
         try {
-          const data = JSON.parse(event.data);
+          const data: HealthResponse = JSON.parse(event.data);
           const receivedAt = new Date().toLocaleString();
-          const onlineTime = data.time
-            ? formatLocalDateTime(data.time)
-            : receivedAt;
 
-          setBackendOnline(true);
-          setLastOnline(onlineTime);
+          setBackendHealthState(data.status === "OK" ? "OK" : "DEGRADED");
+          setMqttHealthy(Boolean(data.mqtt));
+          setFaultDbHealthy(Boolean(data.fault_db));
           setLastUpdate(receivedAt);
         } catch {
           const receivedAt = new Date().toLocaleString();
 
-          setBackendOnline(true);
-          setLastOnline(receivedAt);
+          setBackendHealthState("DEGRADED");
+          setMqttHealthy(false);
+          setFaultDbHealthy(false);
           setLastUpdate(receivedAt);
         }
       };
@@ -137,8 +141,9 @@ export default function Home() {
       eventSource.onerror = () => {
         if (!mounted) return;
 
-        setBackendOnline(false);
-        setRebooting(false);
+        setBackendHealthState("OFFLINE");
+        setMqttHealthy(false);
+        setFaultDbHealthy(false);
 
         eventSource?.close();
 
@@ -250,11 +255,21 @@ export default function Home() {
     [nodes]
   );
 
+  const backendWarningMessage = getBackendWarningMessage(backendHealthState);
+  const showBackendWarning = backendHealthState !== "OK";
+
   return (
     <div className="home-page">
       <div className="home-hero">
         <div>
           <h1 className="home-title">System Overview</h1>
+
+          {showBackendWarning && (
+            <div className="home-warning-alert" role="status" aria-live="polite">
+              <span className="home-warning-pill">Warning</span>
+              <span className="home-warning-text">{backendWarningMessage}</span>
+            </div>
+          )}
         </div>
       </div>
 
@@ -266,17 +281,8 @@ export default function Home() {
             </div>
 
             <div className="home-card-actions">
-              <button
-                className="home-action-btn"
-                onClick={handleReboot}
-                disabled={rebooting}
-                type="button"
-              >
-                {rebooting ? "Rebooting..." : "Reboot"}
-              </button>
-
-              <span className={`status-pill ${backendOnline ? "info" : "high"}`}>
-                {backendOnline ? "Online" : "Offline"}
+              <span className={`status-pill ${getBackendPillClass(backendHealthState)}`}>
+                {getBackendBadgeLabel(backendHealthState)}
               </span>
             </div>
           </div>
@@ -284,9 +290,16 @@ export default function Home() {
           <div className="sc-card-body home-card-body">
             <div className="home-detail-list">
               <div className="home-detail-row">
-                <span>Last Online</span>
+                <span>MQTT Listener</span>
                 <span className="mono home-detail-value">
-                  {lastOnline || "—"}
+                  {formatSubsystemHealth(mqttHealthy)}
+                </span>
+              </div>
+
+              <div className="home-detail-row">
+                <span>Fault DB</span>
+                <span className="mono home-detail-value">
+                  {formatSubsystemHealth(faultDbHealthy)}
                 </span>
               </div>
 
@@ -300,7 +313,7 @@ export default function Home() {
               <div className="home-detail-row">
                 <span>Nodes Online</span>
                 <span className="mono home-detail-value">
-                  {onlineNodeCount}
+                  {onlineNodeCount} / {nodes.length}
                 </span>
               </div>
             </div>

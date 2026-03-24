@@ -1,6 +1,5 @@
 # Publish Pi-side MQTT commands for node configuration and control.
 import json
-from typing import Literal
 
 import paho.mqtt.publish as mqtt_publish
 
@@ -20,18 +19,19 @@ def control_topic(serial: str) -> str:
 
 
 # Publish an accelerometer configuration command to the target node.
+# seq/ack support is intentionally disabled for now.
 def publish_accelerometer_config(
     serial: str,
     odr_index: int,
     range_value: int,
     hpf_corner: int,
-    seq: int,
+    # seq: int,
 ) -> None:
     payload = {
         "odr_index": odr_index,
         "range": range_value,
         "hpf_corner": hpf_corner,
-        "seq": seq,
+        # "seq": seq,  # Disabled 
     }
 
     mqtt_publish.single(
@@ -45,10 +45,19 @@ def publish_accelerometer_config(
 
 
 # Publish a runtime control command to the target node.
-def publish_node_control(serial: str, cmd: str, seq: int | None = None) -> None:
-    payload = {"cmd": cmd}
-    if seq is not None:
-        payload["seq"] = seq
+# publish only the command and do not include seq.
+def publish_node_control(
+    serial: str,
+    cmd: str,
+    # seq: int | None = None,
+) -> None:
+    payload = {
+        "cmd": cmd,
+    }
+
+    # Old Pass 2 logic kept here for later:
+    # if seq is not None:
+    #     payload["seq"] = seq
 
     mqtt_publish.single(
         topic=control_topic(serial),

@@ -12,28 +12,27 @@ import shutil
 import os
 from pathlib import Path
 
+import mqtt_listener
 from mqtt_listener import start_listener
 
 from settings_schema import SettingsModel, to_dict, copy_deep
 
-import subprocess
-from fastapi import BackgroundTasks
-
-# Import config ACK helpers and MQTT command publishers
 from settings_store import (
     load_settings,
     save_settings,
     ensure_node_defaults,
-    update_accelerometer_config_request,
-    mark_accelerometer_config_failed,
+    # update_accelerometer_config_request,
+    # mark_accelerometer_config_failed,
     get_site_name,
     update_site_name,
-    update_node_control_request,
-    mark_node_control_failed,
+    # update_node_control_request,
+    # mark_node_control_failed,
 )
 
 from node_registry import list_nodes, get_node_by_id, update_node_position
 from mqtt_commands import publish_accelerometer_config, publish_node_control
+
+import subprocess
 
 app = FastAPI()
 
@@ -114,13 +113,6 @@ def get_ssd_mount_status() -> Dict[str, Any]:
         "time": datetime.now(timezone.utc).isoformat(),
     }
 
-def _reboot_pi():
-    """
-    Reboot the Raspberry Pi.
-    Runs after response is returned.
-    """
-    subprocess.run(["sudo", "reboot"], check=True)
-
 
 def _unmount_ssd():
     """
@@ -128,8 +120,27 @@ def _unmount_ssd():
     """
     subprocess.run(["sudo", "umount", str(DATA_DIR)], check=True)
 
+
 def is_ssd_available() -> bool:
     return bool(get_ssd_mount_status()["available"])
+
+
+# Build one lightweight backend health snapshot for REST and SSE.
+def get_system_health() -> Dict[str, Any]:
+    ssd_status = get_ssd_mount_status()
+    mqtt_ok = bool(mqtt_listener.MQTT_CONNECTED)
+    ssd_ok = bool(ssd_status["available"])
+    fault_db_ok = bool(ssd_ok and FAULTS_DB.exists())
+
+    overall_ok = mqtt_ok and ssd_ok and fault_db_ok
+
+    return {
+        "status": "OK" if overall_ok else "DEGRADED",
+        "mqtt": mqtt_ok,
+        "ssd": ssd_ok,
+        "fault_db": fault_db_ok,
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def empty_fault_response(page: int = 1, page_size: int = 15) -> Dict[str, Any]:
@@ -292,10 +303,7 @@ def root():
 @app.get("/health")
 def health():
     # Testing/manual health check endpoint only. SSE is used for backend status updates in the dashboard.
-    return {
-        "status": "OK",
-        "time": datetime.now(timezone.utc).isoformat(),
-    }
+    return get_system_health()
 
 
 @app.get("/api/events/health")
@@ -307,10 +315,7 @@ async def health_events(request: Request):
             if await request.is_disconnected():
                 break
 
-            payload = {
-                "status": "OK",
-                "time": datetime.now(timezone.utc).isoformat(),
-            }
+            payload = get_system_health()
 
             yield f"data: {json.dumps(payload)}\n\n"
             await asyncio.sleep(5)
@@ -368,20 +373,6 @@ def get_storage_status():
     """
     return get_ssd_mount_status()
 
-@app.post("/api/system/reboot")
-def reboot_system(background_tasks: BackgroundTasks):
-    """
-    Reboot the Raspberry Pi.
-    Scheduled after response so frontend gets acknowledgement.
-    """
-    background_tasks.add_task(_reboot_pi)
-
-    return {
-        "ok": True,
-        "action": "reboot",
-        "status": "scheduled",
-        "time": datetime.now(timezone.utc).isoformat(),
-    }
 
 @app.post("/api/storage/unmount")
 def unmount_storage():
@@ -532,7 +523,8 @@ def api_put_site_name(payload: SiteNameUpdate):
     return {"ok": True, "site_name": updated_name}
 
 
-# Store desired config, publish MQTT command, and return pending sync state.
+# Publish config immediately without seq/ack tracking.
+# The older pending-sync workflow is intentionally commented out for now.
 @app.post("/api/nodes/{node_id}/config/accelerometer/apply")
 def apply_accelerometer_config(node_id: int, payload: AccelerometerConfigApplyRequest):
     node = get_node_by_id(node_id, timeout_seconds=60)
@@ -541,15 +533,16 @@ def apply_accelerometer_config(node_id: int, payload: AccelerometerConfigApplyRe
 
     ensure_node_defaults(node_id)
 
-    seq = int(datetime.now(timezone.utc).timestamp() * 1000)
-
-    updated = update_accelerometer_config_request(
-        node_id=node_id,
-        odr_index=payload.odr_index,
-        range_value=payload.range,
-        hpf_corner=payload.hpf_corner,
-        seq=seq,
-    )
+    # Old ACK/SEQ flow disabled:
+    # seq = int(datetime.now(timezone.utc).timestamp() * 1000)
+    #
+    # updated = update_accelerometer_config_request(
+    #     node_id=node_id,
+    #     odr_index=payload.odr_index,
+    #     range_value=payload.range,
+    #     hpf_corner=payload.hpf_corner,
+    #     seq=seq,
+    # )
 
     try:
         publish_accelerometer_config(
@@ -557,10 +550,11 @@ def apply_accelerometer_config(node_id: int, payload: AccelerometerConfigApplyRe
             odr_index=payload.odr_index,
             range_value=payload.range,
             hpf_corner=payload.hpf_corner,
-            seq=seq,
+            # seq=seq,
         )
     except Exception as exc:
-        mark_accelerometer_config_failed(node_id)
+        # Old ACK/SEQ failure tracking disabled
+        # mark_accelerometer_config_failed(node_id)
         raise HTTPException(
             status_code=503,
             detail=f"Failed to publish configure command: {exc}",
@@ -572,24 +566,16 @@ def apply_accelerometer_config(node_id: int, payload: AccelerometerConfigApplyRe
         "serial": node["serial"],
         "sensor": "accelerometer",
         "desired": {
-            "odr_index": updated.desired_odr_index,
-            "range": updated.desired_range,
-            "hpf_corner": updated.desired_hpf_corner,
+            "odr_index": payload.odr_index,
+            "range": payload.range,
+            "hpf_corner": payload.hpf_corner,
         },
-        "applied": {
-            "odr_index": updated.applied_odr_index,
-            "range": updated.applied_range,
-            "hpf_corner": updated.applied_hpf_corner,
-        },
-        "current_state": updated.current_state,
-        "pending_seq": updated.pending_seq,
-        "applied_seq": updated.applied_seq,
-        "sync_status": updated.sync_status,
-        "acked_at": updated.last_ack_at,
+        # no ACK-based applied/pending state yet.
+        "status": "accepted",
     }
 
 
-# Publish runtime control commands to the node through MQTT.
+# Publish runtime control commands immediately without seq/ack tracking.
 @app.post("/api/nodes/{node_id}/control")
 def control_node(node_id: int, payload: NodeControlRequest):
     node = get_node_by_id(node_id, timeout_seconds=60)
@@ -598,34 +584,36 @@ def control_node(node_id: int, payload: NodeControlRequest):
 
     ensure_node_defaults(node_id)
 
-    seq = int(datetime.now(timezone.utc).timestamp() * 1000)
-
-    try:
-        control_cfg = update_node_control_request(
-            node_id=node_id,
-            cmd=payload.cmd,
-            seq=seq,
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to store pending control request: {exc}",
-        )
+    # Old ACK/SEQ flow disabled for:
+    # seq = int(datetime.now(timezone.utc).timestamp() * 1000)
+    #
+    # try:
+    #     control_cfg = update_node_control_request(
+    #         node_id=node_id,
+    #         cmd=payload.cmd,
+    #         seq=seq,
+    #     )
+    # except Exception as exc:
+    #     raise HTTPException(
+    #         status_code=500,
+    #         detail=f"Failed to store pending control request: {exc}",
+    #     )
 
     try:
         publish_node_control(
             serial=node["serial"],
             cmd=payload.cmd,
-            seq=seq,
+            # seq=seq,
         )
     except Exception as exc:
-        try:
-            mark_node_control_failed(
-                node_id=node_id,
-                error_msg=f"MQTT publish failed: {exc}",
-            )
-        except Exception:
-            pass
+        # Old ACK/SEQ failure tracking disabled
+        # try:
+        #     mark_node_control_failed(
+        #         node_id=node_id,
+        #         error_msg=f"MQTT publish failed: {exc}",
+        #     )
+        # except Exception:
+        #     pass
 
         raise HTTPException(
             status_code=503,
@@ -637,11 +625,7 @@ def control_node(node_id: int, payload: NodeControlRequest):
         "node_id": node["node_id"],
         "serial": node["serial"],
         "cmd": payload.cmd,
-        "seq": seq,
         "status": "accepted",
-        "control_status": control_cfg.get("control_status"),
-        "pending_control_cmd": control_cfg.get("pending_control_cmd"),
-        "pending_control_seq": control_cfg.get("pending_control_seq"),
     }
 
 
