@@ -9,24 +9,23 @@ FAULT_DB_PATH = Path("/mnt/ssd/fault/faults.db")
 SSD_ROOT = Path("/mnt/ssd")
 
 
-def log_fault_codes(
+def log_fault_events(
     serial_number: str,
-    fault_codes: Iterable[int],
-    mqtt_ts: Any,
-):
-    unique_codes = list(dict.fromkeys(int(c) for c in fault_codes))
-    if not unique_codes:
+    fault_events: Iterable[tuple[int, Any]],
+) -> None:
+    # Remove duplicate fault code + timestamp pairs from the same packet.
+    unique_events = list(dict.fromkeys((int(code), str(ts)) for code, ts in fault_events))
+    if not unique_events:
         return
 
+    # Skip fault logging if the SSD is not mounted.
     if not SSD_ROOT.exists() or not os.path.ismount(SSD_ROOT):
         print("[fault_logger] SSD not mounted. Skipping fault log.")
         return
 
-    ts = str(mqtt_ts)
-
     try:
         with sqlite3.connect(FAULT_DB_PATH) as conn:
-            for code in unique_codes:
+            for code, ts in unique_events:
                 f = get_fault_definition(code)
 
                 conn.execute(
