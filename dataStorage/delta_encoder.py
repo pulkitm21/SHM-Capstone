@@ -7,8 +7,10 @@ import paho.mqtt.client as mqtt
 import queue
 import threading
 
-#from fault_logger import init_fault_db, log_fault_codes
 import zstandard as zstd
+
+# Fault logging helper moved out of this file.
+from fault_event_ts import log_faults_from_packet
 
 ## Addition for ACK
 from node_registry import register_serial, serial_from_topic, get_node_by_serial
@@ -178,19 +180,12 @@ def normalise_sensor_timestamps(data: dict, node_id: str) -> bool:
 # Per-node encoding state
 # -------------------------------------------------------------------
 
-# state[node_id] = {
-#   "accel":  { "ts_us": int, "xyz_prev": [int,int,int] },
-#   "inclin": { "ts_us": int, "xyz_prev": [int,int,int] },
-#   "temp":   { "ts_us": int, "val_prev": int           },
-#   "file_hour": str | None,
-#   "is_first":  bool,
-# }
-
 node_state:  dict         = {}
 data_buffer: queue.Queue  = queue.Queue()
 
 
 def _fresh_state() -> dict:
+    # Fresh per-node encoder state at process start or file rollover.
     return {
         "accel":  {"ts_us": 0, "xyz_prev": [0, 0, 0]},
         "inclin": {"ts_us": 0, "xyz_prev": [0, 0, 0]},
@@ -202,6 +197,7 @@ def _fresh_state() -> dict:
 
 
 def get_hourly_filepath(node_id: str) -> tuple[str, str]:
+    # Build the active hourly .bin path for one node.
     hour_str = datetime.now().strftime("%Y%m%d_%H")
     return hour_str, os.path.join(DATA_DIR, f"data_{node_id}_{hour_str}.bin")
 
@@ -364,16 +360,24 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
             delta_us  = ts_us_new - ss["ts_us"]
 
             changed = 0
-            if delta_us != 0: changed |= 0x01
-            if dx       != 0: changed |= 0x02
-            if dy       != 0: changed |= 0x04
-            if dz       != 0: changed |= 0x08
+            if delta_us != 0:
+                changed |= 0x01
+            if dx != 0:
+                changed |= 0x02
+            if dy != 0:
+                changed |= 0x04
+            if dz != 0:
+                changed |= 0x08
 
             body += struct.pack("<B", changed)
-            if changed & 0x01: body += struct.pack("<i", delta_us)
-            if changed & 0x02: body += _pack_delta(dx)
-            if changed & 0x04: body += _pack_delta(dy)
-            if changed & 0x08: body += _pack_delta(dz)
+            if changed & 0x01:
+                body += struct.pack("<i", delta_us)
+            if changed & 0x02:
+                body += _pack_delta(dx)
+            if changed & 0x04:
+                body += _pack_delta(dy)
+            if changed & 0x08:
+                body += _pack_delta(dz)
 
             ss["ts_us"] = ts_us_new
             prev = [xi, yi, zi]
@@ -394,18 +398,26 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
         delta_us  = ts_us_new - ss["ts_us"]
 
         changed = 0
-        if delta_us != 0: changed |= 0x01
-        if dr       != 0: changed |= 0x02
-        if dp       != 0: changed |= 0x04
-        if dy       != 0: changed |= 0x08
+        if delta_us != 0:
+            changed |= 0x01
+        if dr != 0:
+            changed |= 0x02
+        if dp != 0:
+            changed |= 0x04
+        if dy != 0:
+            changed |= 0x08
 
         body += struct.pack("<B", changed)
-        if changed & 0x01: body += struct.pack("<i", delta_us)
-        if changed & 0x02: body += _pack_delta(dr)
-        if changed & 0x04: body += _pack_delta(dp)
-        if changed & 0x08: body += _pack_delta(dy)
+        if changed & 0x01:
+            body += struct.pack("<i", delta_us)
+        if changed & 0x02:
+            body += _pack_delta(dr)
+        if changed & 0x04:
+            body += _pack_delta(dp)
+        if changed & 0x08:
+            body += _pack_delta(dy)
 
-        ss["ts_us"]    = ts_us_new
+        ss["ts_us"] = ts_us_new
         ss["xyz_prev"] = [ri, pi, yi]
 
     # ── Temperature ───────────────────────────────────────────────
@@ -424,12 +436,16 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
         if not is_frozen:
             header |= 0x04
             changed = 0
-            if delta_us != 0: changed |= 0x01
-            if dt       != 0: changed |= 0x02
+            if delta_us != 0:
+                changed |= 0x01
+            if dt != 0:
+                changed |= 0x02
 
             body += struct.pack("<B", changed)
-            if changed & 0x01: body += struct.pack("<i", delta_us)
-            if changed & 0x02: body += _pack_delta(dt)
+            if changed & 0x01:
+                body += struct.pack("<i", delta_us)
+            if changed & 0x02:
+                body += _pack_delta(dt)
 
             ss["val_prev"] = vi
 
@@ -443,23 +459,23 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
 def compress_and_replace(node_id: str, bin_path: str):
     """
     Compress a closed .bin file to .zst (single Zstd frame, best ratio)
-    and delete the original.  Called only after the file is fully written.
+    and delete the original. Called only after the file is fully written.
     """
-    zst_path = bin_path[:-4] + ".zst"   # strip ".bin", add ".zst"
+    zst_path = bin_path[:-4] + ".zst"
     try:
-        # write_size=True embeds the content size in the frame header so
-        # decompressors can use dctx.decompress() without needing stream_reader.
         file_size = os.path.getsize(bin_path)
         cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL, write_content_size=True)
         with open(bin_path, "rb") as f_in, open(zst_path, "wb") as f_out:
             cctx.copy_stream(f_in, f_out, size=file_size)
-        original_size   = os.path.getsize(bin_path)
+        original_size = os.path.getsize(bin_path)
         compressed_size = os.path.getsize(zst_path)
         ratio = compressed_size / original_size * 100 if original_size else 0
         os.remove(bin_path)
-        print(f"[{node_id}] Compressed {os.path.basename(bin_path)} → "
-              f"{os.path.basename(zst_path)} "
-              f"({original_size:,} → {compressed_size:,} bytes, {ratio:.1f}%)")
+        print(
+            f"[{node_id}] Compressed {os.path.basename(bin_path)} → "
+            f"{os.path.basename(zst_path)} "
+            f"({original_size:,} → {compressed_size:,} bytes, {ratio:.1f}%)"
+        )
     except Exception as e:
         print(f"[{node_id}] WARNING: compression failed for {bin_path}: {e}")
         # Leave .bin intact so data is not lost
@@ -473,10 +489,9 @@ def write_record(node_id: str, data: dict):
     state = node_state[node_id]
 
     if state["file_hour"] != hour_str:
-        # Hour boundary: compress the just-closed .bin file, then start fresh
+        # Hour boundary: compress the just-closed .bin file, then start fresh.
         if state["file_hour"] is not None:
-            old_bin = os.path.join(
-                DATA_DIR, f"data_{node_id}_{state['file_hour']}.bin")
+            old_bin = os.path.join(DATA_DIR, f"data_{node_id}_{state['file_hour']}.bin")
             if os.path.exists(old_bin):
                 compress_and_replace(node_id, old_bin)
         state["file_hour"]      = hour_str
@@ -526,10 +541,9 @@ consumer_thread.start()
 # Additional MQTT handling for status messages and ACKs
 # -------------------------------------------------------------------
 
-# Build a UTC ISO timestamp for ACK bookkeeping
 def now_iso() -> str:
+    # Build a UTC ISO timestamp for ACK bookkeeping and fault fallback timestamps.
     return datetime.utcnow().isoformat() + "Z"
-
 
 # Process node status messages and update backend config/runtime state.
 def handle_status_message(topic: str, payload_bytes: bytes) -> None:
@@ -608,29 +622,14 @@ def on_message(client, userdata, msg):
 
         data = json.loads(msg.payload.decode())
 
-        # ---------------------------------------------------------------
-        # Fault logging
-        # ---------------------------------------------------------------
-        # The ESP32 may include an "f" field with a list of fault codes.
-        # Example: "f": [1, 4]
-        #
-        # We log each code as its own row in faults.db using backend
-        # receive time, since packet field "t" may not be a true UTC time.
-        # ---------------------------------------------------------------
-        fault_codes = data.get("f", [])
-        mqtt_ts = data.get("t")
+        # Fault logging is handled in a separate helper so delta_encoder stays focused on storage.
+        log_faults_from_packet(
+            serial_number=node_id,
+            packet=data,
+            receive_iso=now_iso(),
+        )
 
-        if isinstance(fault_codes, list) and fault_codes:
-            if mqtt_ts is None:
-                raise ValueError("Fault packet missing timestamp 't'")
-
-            #log_fault_codes(
-                serial_number=node_id,
-                fault_codes=fault_codes,
-                mqtt_ts=mqtt_ts,
-            #)
-
-        # Keep your existing timestamp normalization for sensor payloads.
+        # Sensor timestamps are normalized only for binary storage.
         if not normalise_sensor_timestamps(data, node_id):
             return
 
