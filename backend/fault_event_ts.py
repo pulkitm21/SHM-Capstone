@@ -85,19 +85,21 @@ def log_faults_from_packet(
     receive_iso: str | None = None,
 ) -> None:
     """
-    Resolve timestamps for packet-level fault codes and forward them to the existing logger.
+    Resolve timestamps for packet-level fault codes and forward them to the logger.
 
-    This keeps fault timestamp logic outside delta_encoder.py while still reusing
-    fault_logger.log_fault_events(), which accepts one timestamp per call.
+    The MQTT packet carries faults as:
+        "f": [code, code, code]
+    with no timestamps attached to those fault codes.
+
+    This helper derives a timestamp for each fault code from the sensor data
+    already present in the packet, then passes resolved fault events onward.
     """
     fault_codes = packet.get("f", [])
     if not isinstance(fault_codes, list) or not fault_codes:
         return
 
     fallback_receive_iso = receive_iso or now_iso()
-
-    # Group fault codes by their resolved timestamp so the existing logger can stay unchanged.
-    codes_by_timestamp: dict[str, list[int]] = {}
+    fault_events: list[tuple[int, str]] = []
 
     for raw_code in fault_codes:
         try:
@@ -107,11 +109,12 @@ def log_faults_from_packet(
             continue
 
         resolved_ts = _resolve_fault_timestamp(packet, code, fallback_receive_iso)
-        codes_by_timestamp.setdefault(resolved_ts, []).append(code)
+        fault_events.append((code, resolved_ts))
 
-    for resolved_ts, grouped_codes in codes_by_timestamp.items():
-        log_fault_events(
-            serial_number=serial_number,
-            fault_codes=grouped_codes,
-            mqtt_ts=resolved_ts,
-        )
+    if not fault_events:
+        return
+
+    log_fault_events(
+        serial_number=serial_number,
+        fault_events=fault_events,
+    )

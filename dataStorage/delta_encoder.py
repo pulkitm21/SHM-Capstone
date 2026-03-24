@@ -1,7 +1,7 @@
 import json
 import os
 import struct
-from datetime import datetime
+from datetime import datetime, UTC
 import time
 import paho.mqtt.client as mqtt
 import queue
@@ -138,8 +138,7 @@ def normalise_sensor_timestamps(data: dict, node_id: str) -> bool:
 
 
 def now_iso() -> str:
-    """Build a UTC ISO timestamp for ACK bookkeeping and fault fallbacks."""
-    return datetime.utcnow().isoformat() + "Z"
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 # -------------------------------------------------------------------
