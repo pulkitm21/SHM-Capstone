@@ -311,14 +311,18 @@ async def health_events(request: Request):
     # SSE code for backend status live updates on the frontend dashboard.
     # This endpoint should remain independent of SSD availability.
     async def event_generator():
-        while True:
-            if await request.is_disconnected():
-                break
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
 
-            payload = get_system_health()
+                payload = get_system_health()
+                yield f"data: {json.dumps(payload)}\n\n"
+                await asyncio.sleep(5)
 
-            yield f"data: {json.dumps(payload)}\n\n"
-            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            # Expected when the client disconnects or the backend shuts down.
+            return
 
     return StreamingResponse(
         event_generator(),
@@ -442,12 +446,32 @@ def startup_event():
         print(f"[startup] MQTT listener not started: {e}")
 
 
+@app.on_event("shutdown")
+def shutdown_event():
+    global mqtt_status_client
+
+    if mqtt_status_client is None:
+        return
+
+    try:
+        if hasattr(mqtt_status_client, "loop_stop"):
+            mqtt_status_client.loop_stop()
+
+        if hasattr(mqtt_status_client, "disconnect"):
+            mqtt_status_client.disconnect()
+
+    except Exception as e:
+        print(f"[shutdown] MQTT listener cleanup failed: {e}")
+
+    finally:
+        mqtt_status_client = None
+
+
 # =========================
 # Bulk node position update endpoint
 # Allows frontend to save all node positions in a single request
 # Used for "Edit -> Move -> Save" workflow in NodeMap
 # =========================
-
 class BulkNodePositionItem(BaseModel):
     node_id: int
     x: float = Field(..., ge=0.0, le=1.0)
@@ -813,6 +837,8 @@ def read_fault_rows(
         )
         rows = [dict(r) for r in cur.fetchall()]
 
+        # Filter dropdowns are read from SQLite so the frontend does not need
+        # to scan a large in-memory dataset just to build filter choices.
         filter_options = _get_fault_filter_options(con=con, serial_number=serial_number)
 
         return {
@@ -867,17 +893,25 @@ async def fault_events(
     # SSE code for live fault log updates on the frontend dashboard.
     # This should degrade cleanly when SSD/fault DB is unavailable.
     async def event_generator():
-        while True:
-            if await request.is_disconnected():
-                break
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
 
-            payload = {
-                "faults": read_fault_rows(serial_number=serial_number, limit=limit)["faults"],
-                "time": datetime.now(timezone.utc).isoformat(),
-            }
+                payload = {
+                    "faults": read_fault_rows(
+                        serial_number=serial_number,
+                        limit=limit,
+                    )["faults"],
+                    "time": datetime.now(timezone.utc).isoformat(),
+                }
 
-            yield f"data: {json.dumps(payload)}\n\n"
-            await asyncio.sleep(5)
+                yield f"data: {json.dumps(payload)}\n\n"
+                await asyncio.sleep(5)
+
+        except asyncio.CancelledError:
+            # Expected when the client disconnects or the backend shuts down.
+            return
 
     return StreamingResponse(
         event_generator(),
@@ -897,7 +931,13 @@ def get_accel_data(
 ):
     channel = channel.lower()
     pts = read_accel_points(minutes=minutes, channel=channel)
-    return {"sensor": "accelerometer", "unit": "g", "node": node, "channel": channel, "points": pts}
+    return {
+        "sensor": "accelerometer",
+        "unit": "g",
+        "node": node,
+        "channel": channel,
+        "points": pts,
+    }
 
 
 @app.get("/api/inclinometer")
@@ -908,7 +948,13 @@ def api_inclinometer(
 ):
     channel = channel.lower()
     pts = read_inclinometer_points(minutes=minutes, channel=channel)
-    return {"sensor": "inclinometer", "unit": "deg", "node": node, "channel": channel, "points": pts}
+    return {
+        "sensor": "inclinometer",
+        "unit": "deg",
+        "node": node,
+        "channel": channel,
+        "points": pts,
+    }
 
 
 @app.get("/api/temperature")
@@ -917,4 +963,9 @@ def api_temperature(
     minutes: int = Query(60, ge=1, le=1440),
 ):
     pts = read_temperature_points(minutes=minutes)
-    return {"sensor": "temperature", "unit": "C", "node": node, "points": pts}
+    return {
+        "sensor": "temperature",
+        "unit": "C",
+        "node": node,
+        "points": pts,
+    }
