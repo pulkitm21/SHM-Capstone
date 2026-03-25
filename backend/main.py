@@ -32,6 +32,8 @@ from settings_store import (
 from node_registry import list_nodes, get_node_by_id, update_node_position
 from mqtt_commands import publish_accelerometer_config, publish_node_control
 
+from export_routes import router as export_router
+
 import subprocess
 
 app = FastAPI()
@@ -46,6 +48,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(export_router)
 
 DATA_DIR = Path("/mnt/ssd")
 
