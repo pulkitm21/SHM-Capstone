@@ -446,6 +446,27 @@ def startup_event():
         print(f"[startup] MQTT listener not started: {e}")
 
 
+@app.on_event("shutdown")
+def shutdown_event():
+    global mqtt_status_client
+
+    if mqtt_status_client is None:
+        return
+
+    try:
+        if hasattr(mqtt_status_client, "loop_stop"):
+            mqtt_status_client.loop_stop()
+
+        if hasattr(mqtt_status_client, "disconnect"):
+            mqtt_status_client.disconnect()
+
+    except Exception as e:
+        print(f"[shutdown] MQTT listener cleanup failed: {e}")
+
+    finally:
+        mqtt_status_client = None
+
+
 # =========================
 # Bulk node position update endpoint
 # Allows frontend to save all node positions in a single request
