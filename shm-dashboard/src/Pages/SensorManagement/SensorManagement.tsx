@@ -111,16 +111,18 @@ const EMPTY_SENSOR_CONFIG: SensorConfig = {
   applied_range: null,
   applied_hpf_corner: null,
   current_state: "unknown",
+
+  // ACK/SEQ fields intentionally not used by the page anymore.
   pending_seq: null,
   applied_seq: null,
   last_ack_at: null,
-  sync_status: "unknown",
+  sync_status: null,
   pending_control_cmd: null,
   pending_control_seq: null,
   last_control_cmd: null,
   last_control_seq: null,
   last_control_ack_at: null,
-  control_status: "idle",
+  control_status: null,
 };
 
 const FALLBACK_CONFIG: Record<SensorValue, SensorConfig> = {
@@ -211,23 +213,30 @@ function normalizeSensorConfig(raw: any): SensorConfig {
     odr_index: raw?.odr_index ?? 2,
     range: raw?.range ?? 1,
     hpf_corner: raw?.hpf_corner ?? 0,
+
+    // Use desired config as the UI source of truth.
     desired_odr_index: raw?.desired_odr_index ?? raw?.odr_index ?? 2,
     desired_range: raw?.desired_range ?? raw?.range ?? 1,
     desired_hpf_corner: raw?.desired_hpf_corner ?? raw?.hpf_corner ?? 0,
-    applied_odr_index: raw?.applied_odr_index ?? null,
-    applied_range: raw?.applied_range ?? null,
-    applied_hpf_corner: raw?.applied_hpf_corner ?? null,
+
+    // ACK-driven applied values are not used
+    applied_odr_index: null,
+    applied_range: null,
+    applied_hpf_corner: null,
+
     current_state: raw?.current_state ?? "unknown",
-    pending_seq: raw?.pending_seq ?? null,
-    applied_seq: raw?.applied_seq ?? null,
-    last_ack_at: raw?.last_ack_at ?? raw?.acked_at ?? null,
-    sync_status: raw?.sync_status ?? "unknown",
-    pending_control_cmd: raw?.pending_control_cmd ?? null,
-    pending_control_seq: raw?.pending_control_seq ?? null,
-    last_control_cmd: raw?.last_control_cmd ?? null,
-    last_control_seq: raw?.last_control_seq ?? null,
-    last_control_ack_at: raw?.last_control_ack_at ?? null,
-    control_status: raw?.control_status ?? "idle",
+
+    // Kept as inert compatibility fields.
+    pending_seq: null,
+    applied_seq: null,
+    last_ack_at: null,
+    sync_status: null,
+    pending_control_cmd: null,
+    pending_control_seq: null,
+    last_control_cmd: null,
+    last_control_seq: null,
+    last_control_ack_at: null,
+    control_status: null,
   };
 }
 
@@ -433,19 +442,15 @@ export default function SensorManagement() {
     if (!nodeId || !selectedNode) return;
 
     const currentNodeConfig = configByNode[nodeId] ?? FALLBACK_CONFIG;
-    const currentAccelConfig = currentNodeConfig.accelerometer ?? EMPTY_SENSOR_CONFIG;
 
     const optimisticAccelConfig: SensorConfig = {
-      ...currentAccelConfig,
+      ...(currentNodeConfig.accelerometer ?? EMPTY_SENSOR_CONFIG),
       odr_index: updated.odr_index,
       range: updated.range,
       hpf_corner: updated.hpf_corner,
       desired_odr_index: updated.odr_index,
       desired_range: updated.range,
       desired_hpf_corner: updated.hpf_corner,
-      sync_status: UI_PREVIEW_MODE ? "synced" : "pending",
-      last_ack_at: UI_PREVIEW_MODE ? new Date().toISOString() : currentAccelConfig.last_ack_at,
-      current_state: currentAccelConfig.current_state ?? "unknown",
     };
 
     const nextConfigByNode: Record<number, Record<SensorValue, SensorConfig>> = {
@@ -464,59 +469,12 @@ export default function SensorManagement() {
 
     try {
       setConfigByNode(nextConfigByNode);
-      setSettingsStatus(selectedNode.online ? "Applying accelerometer config…" : "Saving desired config…");
+      setSettingsStatus(selectedNode.online ? "Sending accelerometer config…" : "Saving desired config…");
 
-      const res = await applyAccelerometerConfig(nodeId, updated);
+      await applyAccelerometerConfig(nodeId, updated);
 
-      const appliedAccelConfig: SensorConfig = {
-        ...currentAccelConfig,
-        odr_index: res.desired.odr_index,
-        range: res.desired.range,
-        hpf_corner: res.desired.hpf_corner,
-        desired_odr_index: res.desired.odr_index,
-        desired_range: res.desired.range,
-        desired_hpf_corner: res.desired.hpf_corner,
-        applied_odr_index: res.applied.odr_index,
-        applied_range: res.applied.range,
-        applied_hpf_corner: res.applied.hpf_corner,
-        current_state: res.current_state,
-        pending_seq: res.pending_seq,
-        applied_seq: res.applied_seq,
-        last_ack_at: res.acked_at ?? null,
-        sync_status: res.sync_status,
-        pending_control_cmd: currentAccelConfig.pending_control_cmd ?? null,
-        pending_control_seq: currentAccelConfig.pending_control_seq ?? null,
-        last_control_cmd: currentAccelConfig.last_control_cmd ?? null,
-        last_control_seq: currentAccelConfig.last_control_seq ?? null,
-        last_control_ack_at: currentAccelConfig.last_control_ack_at ?? null,
-        control_status: currentAccelConfig.control_status ?? "idle",
-      };
-
-      setConfigByNode((prev) => ({
-        ...prev,
-        [nodeId]: {
-          ...(prev[nodeId] ?? FALLBACK_CONFIG),
-          accelerometer: appliedAccelConfig,
-        },
-      }));
-
-      setSettingsStatus("Accelerometer config request accepted.");
-
-      window.setTimeout(() => {
-        void refreshSettingsFromBackend().catch(() => {});
-      }, 1000);
+      setSettingsStatus("Accelerometer config sent.");
     } catch (e: any) {
-      setConfigByNode((prev) => ({
-        ...prev,
-        [nodeId]: {
-          ...(prev[nodeId] ?? FALLBACK_CONFIG),
-          accelerometer: {
-            ...optimisticAccelConfig,
-            sync_status: "failed",
-          },
-        },
-      }));
-
       setSettingsStatus(`Accelerometer config apply failed: ${e?.message ?? "Unknown error"}`);
     }
   }
@@ -532,12 +490,6 @@ export default function SensorManagement() {
           accelerometer: {
             ...(prev[nodeId]?.accelerometer ?? EMPTY_SENSOR_CONFIG),
             current_state: cmd === "start" ? "recording" : "configured",
-            control_status: "acked",
-            last_control_cmd: cmd,
-            last_control_seq: Date.now(),
-            last_control_ack_at: new Date().toISOString(),
-            pending_control_cmd: null,
-            pending_control_seq: null,
           },
         },
       }));
@@ -546,62 +498,26 @@ export default function SensorManagement() {
       return;
     }
 
-    const currentNodeConfig = configByNode[nodeId] ?? FALLBACK_CONFIG;
-    const currentAccelConfig = currentNodeConfig.accelerometer ?? EMPTY_SENSOR_CONFIG;
-
-    setConfigByNode((prev) => ({
-      ...prev,
-      [nodeId]: {
-        ...(prev[nodeId] ?? FALLBACK_CONFIG),
-        accelerometer: {
-          ...(prev[nodeId]?.accelerometer ?? EMPTY_SENSOR_CONFIG),
-          control_status: "pending",
-          pending_control_cmd: cmd,
-        },
-      },
-    }));
-
     try {
       setSettingsStatus(`${cmd === "start" ? "Starting" : "Stopping"} node…`);
 
-      const res = await sendNodeControl(nodeId, { cmd });
+      await sendNodeControl(nodeId, { cmd });
 
+
+      //  No pending / ack fields.
       setConfigByNode((prev) => ({
         ...prev,
         [nodeId]: {
           ...(prev[nodeId] ?? FALLBACK_CONFIG),
           accelerometer: {
             ...(prev[nodeId]?.accelerometer ?? EMPTY_SENSOR_CONFIG),
-            current_state:
-              cmd === "start"
-                ? currentAccelConfig.current_state
-                : currentAccelConfig.current_state,
-            control_status: res.control_status ?? "pending",
-            pending_control_cmd: res.pending_control_cmd ?? cmd,
-            pending_control_seq: res.pending_control_seq ?? res.seq ?? null,
+            current_state: cmd === "start" ? "recording" : "configured",
           },
         },
       }));
 
-      setSettingsStatus(`Node ${res.cmd} request accepted.`);
-
-      window.setTimeout(() => {
-        void refreshSettingsFromBackend().catch(() => {});
-      }, 1000);
+      setSettingsStatus(`Node ${cmd} command sent.`);
     } catch (e: any) {
-      setConfigByNode((prev) => ({
-        ...prev,
-        [nodeId]: {
-          ...(prev[nodeId] ?? FALLBACK_CONFIG),
-          accelerometer: {
-            ...(prev[nodeId]?.accelerometer ?? EMPTY_SENSOR_CONFIG),
-            control_status: "failed",
-            pending_control_cmd: null,
-            pending_control_seq: null,
-          },
-        },
-      }));
-
       setSettingsStatus(`Node ${cmd} failed: ${e?.message ?? "Unknown error"}`);
     }
   }
@@ -610,26 +526,7 @@ export default function SensorManagement() {
     ? configByNode[nodeId]?.accelerometer ?? EMPTY_SENSOR_CONFIG
     : EMPTY_SENSOR_CONFIG;
 
-  useEffect(() => {
-    if (UI_PREVIEW_MODE || !selectedNode) return;
-
-    const isPending =
-      selectedAccelConfig.sync_status === "pending" ||
-      selectedAccelConfig.control_status === "pending";
-
-    if (!isPending) return;
-
-    const intervalId = window.setInterval(() => {
-      void refreshSettingsFromBackend().catch(() => {});
-    }, 1500);
-
-    return () => window.clearInterval(intervalId);
-  }, [
-    selectedNode,
-    selectedAccelConfig.sync_status,
-    selectedAccelConfig.control_status,
-    refreshSettingsFromBackend,
-  ]);
+  // Polling for pending config/control ACK is intentionally removed.
 
   useEffect(() => {
     if (UI_PREVIEW_MODE) {

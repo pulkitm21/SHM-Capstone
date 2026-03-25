@@ -8,6 +8,8 @@ import {
   getNodes,
   getStorage,
   getStorageStatus,
+  type HealthResponse,
+  unmountStorage,
   type FaultRow,
   type NodeRecord,
   type StorageResponse,
@@ -20,11 +22,43 @@ function isActiveFault(fault: FaultRow) {
   return String(fault.fault_status ?? "").toLowerCase() !== "resolved";
 }
 
+type BackendHealthBadgeState = "OK" | "DEGRADED" | "OFFLINE";
+
+function getBackendPillClass(state: BackendHealthBadgeState) {
+  if (state === "OK") return "info";
+  if (state === "DEGRADED") return "warning";
+  return "high";
+}
+
+function getBackendBadgeLabel(state: BackendHealthBadgeState) {
+  if (state === "OK") return "Online";
+  if (state === "DEGRADED") return "Degraded";
+  return "Offline";
+}
+
+function formatSubsystemHealth(value: boolean) {
+  return value ? "Healthy" : "Unavailable";
+}
+
+function getBackendWarningMessage(state: BackendHealthBadgeState) {
+  if (state === "OFFLINE") {
+    return "Backend unavailable. Live status, node updates, and storage data may be stale.";
+  }
+
+  if (state === "DEGRADED") {
+    return "Backend degraded. Some live services may be unavailable.";
+  }
+
+  return "";
+}
+
 export default function Home() {
   const navigate = useNavigate();
 
-  const [backendOnline, setBackendOnline] = useState<boolean>(false);
-  const [lastOnline, setLastOnline] = useState<string>("");
+  const [backendHealthState, setBackendHealthState] =
+    useState<BackendHealthBadgeState>("OFFLINE");
+  const [mqttHealthy, setMqttHealthy] = useState<boolean>(false);
+  const [faultDbHealthy, setFaultDbHealthy] = useState<boolean>(false);
   const [lastUpdate, setLastUpdate] = useState<string>("");
 
   const [nodes, setNodes] = useState<NodeRecord[]>([]);
@@ -41,44 +75,65 @@ export default function Home() {
 
   const [warningSerials, setWarningSerials] = useState<string[]>([]);
 
+  const [unmounting, setUnmounting] = useState<boolean>(false);
+
+  async function handleUnmount() {
+    const confirmed = window.confirm(
+      "This will unmount the SSD and stop data storage. Continue?"
+    );
+    if (!confirmed) return;
+
+    try {
+      setUnmounting(true);
+      await unmountStorage();
+
+      const [storageRes, storageStatusRes] = await Promise.all([
+        getStorage(),
+        getStorageStatus(),
+      ]);
+
+      setStorageUsed(Number(storageRes.used_gb ?? 0));
+      setStorageFree(Number(storageRes.free_gb ?? 0));
+      setStorageTotal(Number(storageRes.total_gb ?? 0));
+      setStoragePercent(Number(storageRes.usage_percent ?? 0));
+
+      setSsdMounted(Boolean(storageStatusRes.mounted));
+      setSsdAvailable(Boolean(storageStatusRes.available));
+      setSsdMountPath(String(storageStatusRes.mount_path ?? "/mnt/ssd"));
+    } catch (err: any) {
+      alert(`Unmount failed: ${err?.message ?? "Unknown error"}`);
+    } finally {
+      setUnmounting(false);
+    }
+  }
+
   useEffect(() => {
     let mounted = true;
     let eventSource: EventSource | null = null;
     let reconnectTimeoutId: number | null = null;
 
-    function formatLocalDateTime(value: string) {
-      const date = new Date(value);
-      if (Number.isNaN(date.getTime())) return value;
-      return date.toLocaleString();
-    }
-
     function connectBackendStatusSSE() {
-      // SSE code for backend status live updates on the frontend dashboard.
       eventSource = new EventSource(
         `${import.meta.env.VITE_API_BASE_URL}/api/events/health`
       );
-
-      eventSource.onopen = () => {
-        if (!mounted) return;
-        setBackendOnline(true);
-      };
 
       eventSource.onmessage = (event) => {
         if (!mounted) return;
 
         try {
-          const data = JSON.parse(event.data);
+          const data: HealthResponse = JSON.parse(event.data);
           const receivedAt = new Date().toLocaleString();
-          const onlineTime = data.time ? formatLocalDateTime(data.time) : receivedAt;
 
-          setBackendOnline(true);
-          setLastOnline(onlineTime);
+          setBackendHealthState(data.status === "OK" ? "OK" : "DEGRADED");
+          setMqttHealthy(Boolean(data.mqtt));
+          setFaultDbHealthy(Boolean(data.fault_db));
           setLastUpdate(receivedAt);
         } catch {
           const receivedAt = new Date().toLocaleString();
 
-          setBackendOnline(true);
-          setLastOnline(receivedAt);
+          setBackendHealthState("DEGRADED");
+          setMqttHealthy(false);
+          setFaultDbHealthy(false);
           setLastUpdate(receivedAt);
         }
       };
@@ -86,7 +141,9 @@ export default function Home() {
       eventSource.onerror = () => {
         if (!mounted) return;
 
-        setBackendOnline(false);
+        setBackendHealthState("OFFLINE");
+        setMqttHealthy(false);
+        setFaultDbHealthy(false);
 
         eventSource?.close();
 
@@ -193,17 +250,26 @@ export default function Home() {
     };
   }, []);
 
-  // Count online nodes for quick dashboard context.
   const onlineNodeCount = useMemo(
     () => nodes.filter((node) => node.online).length,
     [nodes]
   );
+
+  const backendWarningMessage = getBackendWarningMessage(backendHealthState);
+  const showBackendWarning = backendHealthState !== "OK";
 
   return (
     <div className="home-page">
       <div className="home-hero">
         <div>
           <h1 className="home-title">System Overview</h1>
+
+          {showBackendWarning && (
+            <div className="home-warning-alert" role="status" aria-live="polite">
+              <span className="home-warning-pill">Warning</span>
+              <span className="home-warning-text">{backendWarningMessage}</span>
+            </div>
+          )}
         </div>
       </div>
 
@@ -214,17 +280,26 @@ export default function Home() {
               <div className="sc-card-title">Backend Status</div>
             </div>
 
-            <span className={`status-pill ${backendOnline ? "info" : "high"}`}>
-              {backendOnline ? "Online" : "Offline"}
-            </span>
+            <div className="home-card-actions">
+              <span className={`status-pill ${getBackendPillClass(backendHealthState)}`}>
+                {getBackendBadgeLabel(backendHealthState)}
+              </span>
+            </div>
           </div>
 
           <div className="sc-card-body home-card-body">
             <div className="home-detail-list">
               <div className="home-detail-row">
-                <span>Last Online</span>
+                <span>MQTT Listener</span>
                 <span className="mono home-detail-value">
-                  {lastOnline || "—"}
+                  {formatSubsystemHealth(mqttHealthy)}
+                </span>
+              </div>
+
+              <div className="home-detail-row">
+                <span>Fault DB</span>
+                <span className="mono home-detail-value">
+                  {formatSubsystemHealth(faultDbHealthy)}
                 </span>
               </div>
 
@@ -238,7 +313,7 @@ export default function Home() {
               <div className="home-detail-row">
                 <span>Nodes Online</span>
                 <span className="mono home-detail-value">
-                  {onlineNodeCount}
+                  {onlineNodeCount} / {nodes.length}
                 </span>
               </div>
             </div>
@@ -251,9 +326,20 @@ export default function Home() {
               <div className="sc-card-title">SSD Health</div>
             </div>
 
-            <span className={`status-pill ${ssdAvailable ? "info" : "high"}`}>
-              {ssdAvailable ? "Available" : "Unavailable"}
-            </span>
+            <div className="home-card-actions">
+              <button
+                className="home-action-btn"
+                onClick={handleUnmount}
+                disabled={unmounting || !ssdMounted}
+                type="button"
+              >
+                {unmounting ? "Unmounting..." : "Unmount"}
+              </button>
+
+              <span className={`status-pill ${ssdAvailable ? "info" : "high"}`}>
+                {ssdAvailable ? "Available" : "Unavailable"}
+              </span>
+            </div>
           </div>
 
           <div className="sc-card-body home-card-body">
@@ -277,11 +363,15 @@ export default function Home() {
             <div className="storage-bar">
               <div
                 className="storage-fill"
-                style={{ width: `${Math.max(0, Math.min(100, storagePercent))}%` }}
+                style={{
+                  width: `${Math.max(0, Math.min(100, storagePercent))}%`,
+                }}
               />
             </div>
 
-            <div className="storage-percent">{storagePercent.toFixed(1)}% used</div>
+            <div className="storage-percent">
+              {storagePercent.toFixed(1)}% used
+            </div>
 
             <div className="home-detail-list compact">
               <div className="home-detail-row">
@@ -314,7 +404,9 @@ export default function Home() {
                 nodes={nodes}
                 warningSerials={warningSerials}
                 onNodeClick={(node) =>
-                  navigate(`/sensor-management?serial=${encodeURIComponent(node.serial)}`)
+                  navigate(
+                    `/sensor-management?serial=${encodeURIComponent(node.serial)}`
+                  )
                 }
               />
             )}

@@ -12,16 +12,25 @@ import shutil
 import os
 from pathlib import Path
 
+import mqtt_listener
+from mqtt_listener import start_listener
+
 from settings_schema import SettingsModel, to_dict, copy_deep
+
 from settings_store import (
     load_settings,
     save_settings,
     ensure_node_defaults,
-    update_accelerometer_config_request,
+    # update_accelerometer_config_request,
+    # mark_accelerometer_config_failed,
     get_site_name,
     update_site_name,
+    # update_node_control_request,
+    # mark_node_control_failed,
 )
 from node_registry import list_nodes, get_node_by_id, update_node_position
+
+import subprocess
 
 app = FastAPI()
 
@@ -103,8 +112,33 @@ def get_ssd_mount_status() -> Dict[str, Any]:
     }
 
 
+def _unmount_ssd():
+    """
+    Unmount the SSD mount path.
+    """
+    subprocess.run(["sudo", "umount", str(DATA_DIR)], check=True)
+
+
 def is_ssd_available() -> bool:
     return bool(get_ssd_mount_status()["available"])
+
+
+# Build one lightweight backend health snapshot for REST and SSE.
+def get_system_health() -> Dict[str, Any]:
+    ssd_status = get_ssd_mount_status()
+    mqtt_ok = bool(mqtt_listener.MQTT_CONNECTED)
+    ssd_ok = bool(ssd_status["available"])
+    fault_db_ok = bool(ssd_ok and FAULTS_DB.exists())
+
+    overall_ok = mqtt_ok and ssd_ok and fault_db_ok
+
+    return {
+        "status": "OK" if overall_ok else "DEGRADED",
+        "mqtt": mqtt_ok,
+        "ssd": ssd_ok,
+        "fault_db": fault_db_ok,
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def empty_fault_response(page: int = 1, page_size: int = 15) -> Dict[str, Any]:
@@ -183,10 +217,8 @@ def read_accel_points(
         for (ts, ax, ay, az) in struct.iter_unpack(ACCEL_FORMAT, data):
             if ts < cutoff_s:
                 continue
-
             val = (ts, ax, ay, az)[idx]
             points.append({"ts": _iso_from_epoch_seconds(ts), "value": float(val)})
-
     except struct.error:
         return []
 
@@ -222,10 +254,8 @@ def read_inclinometer_points(
         for (ts, pitch, roll) in struct.iter_unpack(INCL_FORMAT, data):
             if ts < cutoff_s:
                 continue
-
             val = (ts, pitch, roll)[idx]
             points.append({"ts": _iso_from_epoch_seconds(ts), "value": float(val)})
-
     except struct.error:
         return []
 
@@ -256,9 +286,7 @@ def read_temperature_points(
         for (ts, temp) in struct.iter_unpack(TEMP_FORMAT, data):
             if ts < cutoff_s:
                 continue
-
             points.append({"ts": _iso_from_epoch_seconds(ts), "value": float(temp)})
-
     except struct.error:
         return []
 
@@ -272,26 +300,20 @@ def root():
 
 @app.get("/health")
 def health():
-    # Testing/manual health check endpoint only.
-    # SSE is used for backend status updates in the dashboard.
-    return {
-        "status": "OK",
-        "time": datetime.now(timezone.utc).isoformat(),
-    }
+    # Testing/manual health check endpoint only. SSE is used for backend status updates in the dashboard.
+    return get_system_health()
 
 
 @app.get("/api/events/health")
 async def health_events(request: Request):
-    # Backend liveness SSE. This should stay independent of SSD state.
+    # SSE code for backend status live updates on the frontend dashboard.
+    # This endpoint should remain independent of SSD availability.
     async def event_generator():
         while True:
             if await request.is_disconnected():
                 break
 
-            payload = {
-                "status": "OK",
-                "time": datetime.now(timezone.utc).isoformat(),
-            }
+            payload = get_system_health()
 
             yield f"data: {json.dumps(payload)}\n\n"
             await asyncio.sleep(5)
@@ -350,6 +372,39 @@ def get_storage_status():
     return get_ssd_mount_status()
 
 
+@app.post("/api/storage/unmount")
+def unmount_storage():
+    """
+    Unmount the SSD safely.
+    """
+    mount_status = get_ssd_mount_status()
+
+    if not mount_status["mounted"]:
+        return {
+            "ok": True,
+            "action": "unmount",
+            "status": "already_unmounted",
+            "ssd_status": mount_status,
+            "time": datetime.now(timezone.utc).isoformat(),
+        }
+
+    try:
+        _unmount_ssd()
+    except subprocess.CalledProcessError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to unmount SSD: {exc}",
+        )
+
+    return {
+        "ok": True,
+        "action": "unmount",
+        "status": "completed",
+        "ssd_status": get_ssd_mount_status(),
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @app.get("/api/nodes")
 def get_nodes():
     return {"nodes": list_nodes(timeout_seconds=60)}
@@ -371,10 +426,24 @@ def put_node_position(node_id: int, payload: NodePositionUpdate):
     return {"ok": True, "node": updated}
 
 
+# Start MQTT listener on app startup and store client reference for potential future use.
+mqtt_status_client = None
+
+
+@app.on_event("startup")
+def startup_event():
+    global mqtt_status_client
+    try:
+        mqtt_status_client = start_listener()
+    except Exception as e:
+        mqtt_status_client = None
+        print(f"[startup] MQTT listener not started: {e}")
+
+
 # =========================
 # Bulk node position update endpoint
 # Allows frontend to save all node positions in a single request
-# Used for "Edit → Move → Save" workflow in NodeMap
+# Used for "Edit -> Move -> Save" workflow in NodeMap
 # =========================
 class BulkNodePositionItem(BaseModel):
     node_id: int
@@ -451,6 +520,8 @@ def api_put_site_name(payload: SiteNameUpdate):
     return {"ok": True, "site_name": updated_name}
 
 
+# Publish config immediately without seq/ack tracking.
+# The older pending-sync workflow is intentionally commented out for now.
 @app.post("/api/nodes/{node_id}/config/accelerometer/apply")
 def apply_accelerometer_config(node_id: int, payload: AccelerometerConfigApplyRequest):
     node = get_node_by_id(node_id, timeout_seconds=60)
@@ -459,49 +530,93 @@ def apply_accelerometer_config(node_id: int, payload: AccelerometerConfigApplyRe
 
     ensure_node_defaults(node_id)
 
-    seq = int(datetime.now(timezone.utc).timestamp() * 1000)
+    # Old ACK/SEQ flow disabled:
+    # seq = int(datetime.now(timezone.utc).timestamp() * 1000)
+    #
+    # updated = update_accelerometer_config_request(
+    #     node_id=node_id,
+    #     odr_index=payload.odr_index,
+    #     range_value=payload.range,
+    #     hpf_corner=payload.hpf_corner,
+    #     seq=seq,
+    # )
 
-    updated = update_accelerometer_config_request(
-        node_id=node_id,
-        odr_index=payload.odr_index,
-        range_value=payload.range,
-        hpf_corner=payload.hpf_corner,
-        seq=seq,
-    )
+    try:
+        publish_accelerometer_config(
+            serial=node["serial"],
+            odr_index=payload.odr_index,
+            range_value=payload.range,
+            hpf_corner=payload.hpf_corner,
+            # seq=seq,
+        )
+    except Exception as exc:
+        # Old ACK/SEQ failure tracking disabled
+        # mark_accelerometer_config_failed(node_id)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to publish configure command: {exc}",
+        )
 
-    # Phase 1 only: store the request and return it.
-    # MQTT publish will be added in Phase 2.
     return {
         "ok": True,
         "node_id": node["node_id"],
         "serial": node["serial"],
         "sensor": "accelerometer",
         "desired": {
-            "odr_index": updated.desired_odr_index,
-            "range": updated.desired_range,
-            "hpf_corner": updated.desired_hpf_corner,
+            "odr_index": payload.odr_index,
+            "range": payload.range,
+            "hpf_corner": payload.hpf_corner,
         },
-        "applied": {
-            "odr_index": updated.applied_odr_index,
-            "range": updated.applied_range,
-            "hpf_corner": updated.applied_hpf_corner,
-        },
-        "current_state": updated.current_state,
-        "pending_seq": updated.pending_seq,
-        "applied_seq": updated.applied_seq,
-        "sync_status": updated.sync_status,
-        "acked_at": updated.last_ack_at,
+        # no ACK-based applied/pending state yet.
+        "status": "accepted",
     }
 
 
+# Publish runtime control commands immediately without seq/ack tracking.
 @app.post("/api/nodes/{node_id}/control")
 def control_node(node_id: int, payload: NodeControlRequest):
     node = get_node_by_id(node_id, timeout_seconds=60)
     if node is None:
         raise HTTPException(status_code=404, detail="Node not found")
 
-    # Phase 1 only: backend accepts the request shape.
-    # MQTT control publish will be added in Phase 2.
+    ensure_node_defaults(node_id)
+
+    # Old ACK/SEQ flow disabled for:
+    # seq = int(datetime.now(timezone.utc).timestamp() * 1000)
+    #
+    # try:
+    #     control_cfg = update_node_control_request(
+    #         node_id=node_id,
+    #         cmd=payload.cmd,
+    #         seq=seq,
+    #     )
+    # except Exception as exc:
+    #     raise HTTPException(
+    #         status_code=500,
+    #         detail=f"Failed to store pending control request: {exc}",
+    #     )
+
+    try:
+        publish_node_control(
+            serial=node["serial"],
+            cmd=payload.cmd,
+            # seq=seq,
+        )
+    except Exception as exc:
+        # Old ACK/SEQ failure tracking disabled
+        # try:
+        #     mark_node_control_failed(
+        #         node_id=node_id,
+        #         error_msg=f"MQTT publish failed: {exc}",
+        #     )
+        # except Exception:
+        #     pass
+
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to publish control command: {exc}",
+        )
+
     return {
         "ok": True,
         "node_id": node["node_id"],
@@ -708,7 +823,8 @@ def read_fault_rows(
             "filter_options": filter_options,
         }
 
-    except sqlite3.Error:
+    except sqlite3.Error as e:
+        print(f"[faults] Failed to read faults DB: {e}")
         return empty_fault_response(page=safe_page, page_size=safe_page_size)
 
     finally:
@@ -747,7 +863,8 @@ async def fault_events(
     serial_number: Optional[str] = Query(default=None),
     limit: int = Query(default=200, ge=1, le=5000),
 ):
-    # Fault SSE should also degrade cleanly if SSD or DB is unavailable.
+    # SSE code for live fault log updates on the frontend dashboard.
+    # This should degrade cleanly when SSD/fault DB is unavailable.
     async def event_generator():
         while True:
             if await request.is_disconnected():

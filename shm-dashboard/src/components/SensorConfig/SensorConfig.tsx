@@ -3,8 +3,6 @@ import "./SensorConfig.css";
 
 export type AccelerometerOdrIndex = 0 | 1 | 2;
 export type AccelerometerRange = 1 | 2 | 3;
-export type ConfigSyncStatus = "unknown" | "synced" | "pending" | "failed";
-export type ControlStatus = "idle" | "pending" | "acked" | "failed";
 export type ControlCommand = "start" | "stop";
 export type NodeState = "unknown" | "idle" | "configured" | "recording" | "reconfig" | "error";
 
@@ -22,17 +20,21 @@ export type SensorConfig = {
   applied_hpf_corner: number | null;
 
   current_state: NodeState;
+
+
+  // These are kept optional for compatibility with any cached/settings payloads,
+  // but the UI no longer depends on them.
   pending_seq?: number | null;
   applied_seq?: number | null;
   last_ack_at?: string | null;
-  sync_status: ConfigSyncStatus;
+  sync_status?: string | null;
 
   pending_control_cmd?: ControlCommand | null;
   pending_control_seq?: number | null;
   last_control_cmd?: ControlCommand | null;
   last_control_seq?: number | null;
   last_control_ack_at?: string | null;
-  control_status?: ControlStatus;
+  control_status?: string | null;
 };
 
 const DEFAULT_CONFIG: SensorConfig = {
@@ -46,16 +48,18 @@ const DEFAULT_CONFIG: SensorConfig = {
   applied_range: null,
   applied_hpf_corner: null,
   current_state: "unknown",
+
+  // ACK/SEQ fields retained only as inert compatibility fields.
   pending_seq: null,
   applied_seq: null,
   last_ack_at: null,
-  sync_status: "unknown",
+  sync_status: null,
   pending_control_cmd: null,
   pending_control_seq: null,
   last_control_cmd: null,
   last_control_seq: null,
   last_control_ack_at: null,
-  control_status: "idle",
+  control_status: null,
 };
 
 function withDefaults(cfg?: Partial<SensorConfig> | null): SensorConfig {
@@ -72,6 +76,8 @@ function withDefaults(cfg?: Partial<SensorConfig> | null): SensorConfig {
     applied_range: cfg?.applied_range ?? DEFAULT_CONFIG.applied_range,
     applied_hpf_corner: cfg?.applied_hpf_corner ?? DEFAULT_CONFIG.applied_hpf_corner,
     current_state: cfg?.current_state ?? DEFAULT_CONFIG.current_state,
+
+    //compatibility defaults only.
     pending_seq: cfg?.pending_seq ?? DEFAULT_CONFIG.pending_seq,
     applied_seq: cfg?.applied_seq ?? DEFAULT_CONFIG.applied_seq,
     last_ack_at: cfg?.last_ack_at ?? DEFAULT_CONFIG.last_ack_at,
@@ -105,32 +111,6 @@ function prettyRange(value: AccelerometerRange | null) {
   return "±8g";
 }
 
-function prettySyncStatus(value: ConfigSyncStatus) {
-  switch (value) {
-    case "synced":
-      return "Synced";
-    case "pending":
-      return "Pending";
-    case "failed":
-      return "Failed";
-    default:
-      return "Unknown";
-  }
-}
-
-function prettyControlStatus(value: ControlStatus) {
-  switch (value) {
-    case "acked":
-      return "Acked";
-    case "pending":
-      return "Pending";
-    case "failed":
-      return "Failed";
-    default:
-      return "Idle";
-  }
-}
-
 function prettyState(value: NodeState) {
   switch (value) {
     case "idle":
@@ -148,32 +128,6 @@ function prettyState(value: NodeState) {
   }
 }
 
-function pillClassForSyncStatus(status: ConfigSyncStatus) {
-  switch (status) {
-    case "synced":
-      return "sc-pill sc-pill-success";
-    case "pending":
-      return "sc-pill sc-pill-warning";
-    case "failed":
-      return "sc-pill sc-pill-danger";
-    default:
-      return "sc-pill";
-  }
-}
-
-function pillClassForControlStatus(status: ControlStatus) {
-  switch (status) {
-    case "acked":
-      return "sc-pill sc-pill-success";
-    case "pending":
-      return "sc-pill sc-pill-warning";
-    case "failed":
-      return "sc-pill sc-pill-danger";
-    default:
-      return "sc-pill";
-  }
-}
-
 function pillClassForNodeState(state: NodeState) {
   switch (state) {
     case "recording":
@@ -186,15 +140,6 @@ function pillClassForNodeState(state: NodeState) {
     default:
       return "sc-pill";
   }
-}
-
-function formatAckTime(value?: string | null, empty = "No ACK yet") {
-  if (!value) return empty;
-
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "Invalid ACK time";
-
-  return date.toLocaleString();
 }
 
 export default function SensorConfigCard({
@@ -242,33 +187,21 @@ export default function SensorConfigCard({
     draftRange !== safeConfig.desired_range ||
     draftHpf !== safeConfig.desired_hpf_corner;
 
-  const displayConfig =
-    safeConfig.sync_status === "synced"
-      ? {
-          odr: safeConfig.applied_odr_index ?? safeConfig.desired_odr_index,
-          range: safeConfig.applied_range ?? safeConfig.desired_range,
-          hpf: safeConfig.applied_hpf_corner ?? safeConfig.desired_hpf_corner,
-        }
-      : {
-          odr: safeConfig.desired_odr_index,
-          range: safeConfig.desired_range,
-          hpf: safeConfig.desired_hpf_corner,
-        };
+  
+  // Always show desired/local config. We are not switching display state based on ACK.
+  const displayConfig = {
+    odr: safeConfig.desired_odr_index,
+    range: safeConfig.desired_range,
+    hpf: safeConfig.desired_hpf_corner,
+  };
 
   const startDisabled =
-    disabled ||
-    isEditing ||
-    safeConfig.control_status === "pending" ||
-    safeConfig.current_state === "recording";
+    disabled || isEditing || safeConfig.current_state === "recording";
 
   const stopDisabled =
-    disabled ||
-    isEditing ||
-    safeConfig.control_status === "pending" ||
-    safeConfig.current_state !== "recording";
+    disabled || isEditing || safeConfig.current_state !== "recording";
 
-  const applyDisabled =
-    disabled || !isDirty || safeConfig.sync_status === "pending";
+  const applyDisabled = disabled || !isDirty;
 
   function handleCancelEdit() {
     setDraftOdr(safeConfig.desired_odr_index);
@@ -291,7 +224,9 @@ export default function SensorConfigCard({
       <div className="sc-topbar">
         <div>
           <h2 className="sc-title">{title}</h2>
-          <p className="sc-subtitle">Live configuration and acquisition status for the selected node.</p>
+          <p className="sc-subtitle">
+            Live configuration and acquisition status for the selected node.
+          </p>
         </div>
 
         <div className="sc-topbar-actions">
@@ -299,13 +234,9 @@ export default function SensorConfigCard({
             {prettyState(safeConfig.current_state)}
           </span>
 
-          <span className={pillClassForSyncStatus(safeConfig.sync_status)}>
-            Config {prettySyncStatus(safeConfig.sync_status)}
-          </span>
-
-          <span className={pillClassForControlStatus(safeConfig.control_status ?? "idle")}>
-            Control {prettyControlStatus(safeConfig.control_status ?? "idle")}
-          </span>
+          {/* 
+              Config/Control ACK pills intentionally removed.
+              Old UI depended on sync_status and control_status. */}
 
           {!disabled && !isEditing && (
             <button
@@ -378,49 +309,9 @@ export default function SensorConfigCard({
       </div>
 
       <div className="sc-footer-row">
-        <div className="sc-runtime-group">
-          <div className="sc-runtime-chip">
-            <span className="sc-runtime-label">Pending Config Seq</span>
-            <span className="sc-runtime-value">{safeConfig.pending_seq ?? "—"}</span>
-          </div>
-
-          <div className="sc-runtime-chip">
-            <span className="sc-runtime-label">Applied Config Seq</span>
-            <span className="sc-runtime-value">{safeConfig.applied_seq ?? "—"}</span>
-          </div>
-
-          <div className="sc-runtime-chip">
-            <span className="sc-runtime-label">Pending Control</span>
-            <span className="sc-runtime-value">
-              {safeConfig.pending_control_cmd
-                ? `${safeConfig.pending_control_cmd} (${safeConfig.pending_control_seq ?? "—"})`
-                : "—"}
-            </span>
-          </div>
-
-          <div className="sc-runtime-chip">
-            <span className="sc-runtime-label">Last Control</span>
-            <span className="sc-runtime-value">
-              {safeConfig.last_control_cmd
-                ? `${safeConfig.last_control_cmd} (${safeConfig.last_control_seq ?? "—"})`
-                : "—"}
-            </span>
-          </div>
-
-          <div className="sc-runtime-chip sc-runtime-chip-wide">
-            <span className="sc-runtime-label">Config ACK</span>
-            <span className="sc-runtime-value sc-runtime-value-muted">
-              {formatAckTime(safeConfig.last_ack_at)}
-            </span>
-          </div>
-
-          <div className="sc-runtime-chip sc-runtime-chip-wide">
-            <span className="sc-runtime-label">Control ACK</span>
-            <span className="sc-runtime-value sc-runtime-value-muted">
-              {formatAckTime(safeConfig.last_control_ack_at, "No control ACK yet")}
-            </span>
-          </div>
-        </div>
+        {/* 
+            Runtime ACK/SEQ chips intentionally removed.
+            The old section displayed pending seq, applied seq, ACK timestamps, etc. */}
 
         <div className="sc-action-group">
           {isEditing ? (
