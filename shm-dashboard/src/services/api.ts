@@ -361,3 +361,74 @@ export function unmountStorage(signal?: AbortSignal) {
     signal,
   });
 }
+
+export type FaultExportParams = {
+  start_day?: string;
+  end_day?: string;
+  serial_number?: string;
+  sensor_type?: string;
+  fault_type?: string;
+  severity?: number;
+  fault_status?: string;
+  description?: string;
+};
+
+function parseFilenameFromDisposition(headerValue: string | null): string | null {
+  if (!headerValue) return null;
+
+  const utf8Match = headerValue.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    return decodeURIComponent(utf8Match[1]);
+  }
+
+  const basicMatch = headerValue.match(/filename="?([^"]+)"?/i);
+  return basicMatch?.[1] ?? null;
+}
+
+export async function downloadFaultExport(
+  params: FaultExportParams,
+  signal?: AbortSignal
+) {
+  const qs = new URLSearchParams();
+
+  if (params.start_day) qs.set("start_day", params.start_day);
+  if (params.end_day) qs.set("end_day", params.end_day);
+  if (params.serial_number) qs.set("serial_number", params.serial_number);
+  if (params.sensor_type) qs.set("sensor_type", params.sensor_type);
+  if (params.fault_type) qs.set("fault_type", params.fault_type);
+  if (params.severity !== undefined) qs.set("severity", String(params.severity));
+  if (params.fault_status) qs.set("fault_status", params.fault_status);
+  if (params.description) qs.set("description", params.description);
+
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  const res = await fetch(`${API_BASE}/api/exports/faults${suffix}`, { signal });
+
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try {
+      const text = await res.text();
+      if (text) msg += ` - ${text}`;
+    } catch {
+      // ignore body parse issues and use HTTP status only
+    }
+    throw new Error(msg);
+  }
+
+  const blob = await res.blob();
+  const filename =
+    parseFilenameFromDisposition(res.headers.get("Content-Disposition")) ??
+    "fault_export.csv";
+
+  const objectUrl = window.URL.createObjectURL(blob);
+
+  try {
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  } finally {
+    window.URL.revokeObjectURL(objectUrl);
+  }
+}
