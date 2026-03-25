@@ -28,7 +28,9 @@ from settings_store import (
     # update_node_control_request,
     # mark_node_control_failed,
 )
+
 from node_registry import list_nodes, get_node_by_id, update_node_position
+from mqtt_commands import publish_accelerometer_config, publish_node_control
 
 import subprocess
 
@@ -309,14 +311,18 @@ async def health_events(request: Request):
     # SSE code for backend status live updates on the frontend dashboard.
     # This endpoint should remain independent of SSD availability.
     async def event_generator():
-        while True:
-            if await request.is_disconnected():
-                break
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
 
-            payload = get_system_health()
+                payload = get_system_health()
+                yield f"data: {json.dumps(payload)}\n\n"
+                await asyncio.sleep(5)
 
-            yield f"data: {json.dumps(payload)}\n\n"
-            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            # Expected when the client disconnects or the backend shuts down.
+            return
 
     return StreamingResponse(
         event_generator(),
@@ -866,17 +872,25 @@ async def fault_events(
     # SSE code for live fault log updates on the frontend dashboard.
     # This should degrade cleanly when SSD/fault DB is unavailable.
     async def event_generator():
-        while True:
-            if await request.is_disconnected():
-                break
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
 
-            payload = {
-                "faults": read_fault_rows(serial_number=serial_number, limit=limit)["faults"],
-                "time": datetime.now(timezone.utc).isoformat(),
-            }
+                payload = {
+                    "faults": read_fault_rows(
+                        serial_number=serial_number,
+                        limit=limit,
+                    )["faults"],
+                    "time": datetime.now(timezone.utc).isoformat(),
+                }
 
-            yield f"data: {json.dumps(payload)}\n\n"
-            await asyncio.sleep(5)
+                yield f"data: {json.dumps(payload)}\n\n"
+                await asyncio.sleep(5)
+
+        except asyncio.CancelledError:
+            # Expected when the client disconnects or the backend shuts down.
+            return
 
     return StreamingResponse(
         event_generator(),
