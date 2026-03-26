@@ -36,6 +36,9 @@ from export_routes import router as export_router
 
 import subprocess
 
+from export_utils import find_sensor_files_for_serial
+from sensor_export_decoder import iter_decoded_records_for_export
+
 app = FastAPI()
 
 app.add_middleware(
@@ -930,16 +933,13 @@ async def fault_events(
 @app.get("/api/accel")
 def get_accel_data(
     node: int = Query(1, ge=1),
-    channel: str = Query("x"),
     minutes: int = Query(60, ge=1, le=1440),
 ):
-    channel = channel.lower()
-    pts = read_accel_points(minutes=minutes, channel=channel)
+    pts = read_accel_points(node_id=node, minutes=minutes)
     return {
         "sensor": "accelerometer",
         "unit": "g",
         "node": node,
-        "channel": channel,
         "points": pts,
     }
 
@@ -947,16 +947,13 @@ def get_accel_data(
 @app.get("/api/inclinometer")
 def api_inclinometer(
     node: int = Query(1, ge=1),
-    channel: str = Query("pitch"),
     minutes: int = Query(60, ge=1, le=1440),
 ):
-    channel = channel.lower()
-    pts = read_inclinometer_points(minutes=minutes, channel=channel)
+    pts = read_inclinometer_points(node_id=node, minutes=minutes)
     return {
         "sensor": "inclinometer",
         "unit": "deg",
         "node": node,
-        "channel": channel,
         "points": pts,
     }
 
@@ -966,10 +963,174 @@ def api_temperature(
     node: int = Query(1, ge=1),
     minutes: int = Query(60, ge=1, le=1440),
 ):
-    pts = read_temperature_points(minutes=minutes)
+    pts = read_temperature_points(node_id=node, minutes=minutes)
     return {
         "sensor": "temperature",
         "unit": "C",
         "node": node,
         "points": pts,
     }
+
+from collections import deque
+from datetime import datetime, timezone, timedelta
+
+def _iso_from_epoch_seconds(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _get_plot_node_serial(node_id: int) -> str:
+    node = get_node_by_id(node_id, timeout_seconds=300)
+    if node is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    serial = str(node.get("serial") or "").strip()
+    if not serial:
+        raise HTTPException(status_code=400, detail="Node has no serial number")
+
+    return serial
+
+
+def _plot_time_window(minutes: int) -> tuple[float, float, str, str]:
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(minutes=minutes)
+
+    return (
+        start_dt.timestamp(),
+        end_dt.timestamp(),
+        start_dt.isoformat(),
+        end_dt.isoformat(),
+    )
+
+
+def _target_plot_points(sensor_name: str) -> int:
+    if sensor_name == "accelerometer":
+        return 1200
+    if sensor_name == "inclinometer":
+        return 1200
+    return 2000
+
+
+def _min_spacing_seconds(minutes: int, target_points: int) -> float:
+    window_seconds = max(1, minutes * 60)
+    return max(0.0, window_seconds / max(1, target_points))
+
+
+def read_accel_points(node_id: int, minutes: int, limit: int = 1200):
+    if not is_ssd_available():
+        return []
+
+    serial = _get_plot_node_serial(node_id)
+    start_ts, end_ts, start_iso, end_iso = _plot_time_window(minutes)
+
+    files = find_sensor_files_for_serial(
+        serial=serial,
+        start_iso=start_iso,
+        end_exclusive_iso=end_iso,
+    )
+
+    points = deque(maxlen=limit)
+    min_spacing = _min_spacing_seconds(minutes, limit)
+    last_kept_ts = None
+
+    for sensor_file in files:
+        for rec in iter_decoded_records_for_export(str(sensor_file)):
+            accel_samples = rec.get("accel_samples")
+            if not accel_samples:
+                continue
+
+            for ts, x, y, z in accel_samples:
+                if ts < start_ts or ts >= end_ts:
+                    continue
+
+                if last_kept_ts is not None and (ts - last_kept_ts) < min_spacing:
+                    continue
+
+                points.append(
+                    {
+                        "ts": _iso_from_epoch_seconds(ts),
+                        "x": float(x),
+                        "y": float(y),
+                        "z": float(z),
+                    }
+                )
+                last_kept_ts = ts
+
+    return list(points)
+
+
+def read_inclinometer_points(node_id: int, minutes: int, limit: int = 1200):
+    if not is_ssd_available():
+        return []
+
+    serial = _get_plot_node_serial(node_id)
+    start_ts, end_ts, start_iso, end_iso = _plot_time_window(minutes)
+
+    files = find_sensor_files_for_serial(
+        serial=serial,
+        start_iso=start_iso,
+        end_exclusive_iso=end_iso,
+    )
+
+    points = deque(maxlen=limit)
+    min_spacing = _min_spacing_seconds(minutes, limit)
+    last_kept_ts = None
+
+    for sensor_file in files:
+        for rec in iter_decoded_records_for_export(str(sensor_file)):
+            inclin = rec.get("inclin")
+            if not inclin:
+                continue
+
+            ts, roll, pitch, yaw = inclin
+            if ts < start_ts or ts >= end_ts:
+                continue
+
+            if last_kept_ts is not None and (ts - last_kept_ts) < min_spacing:
+                continue
+
+            points.append(
+                {
+                    "ts": _iso_from_epoch_seconds(ts),
+                    "roll": float(roll),
+                    "pitch": float(pitch),
+                    "yaw": float(yaw),
+                }
+            )
+            last_kept_ts = ts
+
+    return list(points)
+
+
+def read_temperature_points(node_id: int, minutes: int, limit: int = 2000):
+    if not is_ssd_available():
+        return []
+
+    serial = _get_plot_node_serial(node_id)
+    start_ts, end_ts, start_iso, end_iso = _plot_time_window(minutes)
+
+    files = find_sensor_files_for_serial(
+        serial=serial,
+        start_iso=start_iso,
+        end_exclusive_iso=end_iso,
+    )
+
+    points = deque(maxlen=limit)
+
+    for sensor_file in files:
+        for rec in iter_decoded_records_for_export(str(sensor_file)):
+            temp = rec.get("temp")
+            if not temp:
+                continue
+
+            ts, value = temp
+            if ts < start_ts or ts >= end_ts:
+                continue
+
+            points.append(
+                {
+                    "ts": _iso_from_epoch_seconds(ts),
+                    "value": float(value),
+                }
+            )
+
+    return list(points)
