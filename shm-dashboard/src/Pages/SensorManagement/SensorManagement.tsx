@@ -58,21 +58,6 @@ const TIMEFRAME_OPTIONS = [
   { label: "1 day", minutes: 1440 },
 ] as const;
 
-const CHANNELS_BY_SENSOR: Record<SensorValue, { label: string; value: string }[]> = {
-  accelerometer: [
-    { label: "All", value: "all" },
-    { label: "X", value: "x" },
-    { label: "Y", value: "y" },
-    { label: "Z", value: "z" },
-  ],
-  inclinometer: [
-    { label: "All", value: "all" },
-    { label: "Pitch", value: "pitch" },
-    { label: "Roll", value: "roll" },
-  ],
-  temperature: [{ label: "All", value: "all" }],
-};
-
 const ENDPOINT_BY_SENSOR: Record<SensorValue, string> = {
   accelerometer: "/api/accel",
   inclinometer: "/api/inclinometer",
@@ -90,7 +75,7 @@ const FALLBACK_META: Record<SensorValue, SensorMeta> = {
     model: "SCL3300",
     serial: "—",
     installationDate: "—",
-    orientation: "Pitch / Roll",
+    orientation: "Pitch / Roll / Yaw",
   },
   temperature: {
     model: "ADT7420",
@@ -111,8 +96,6 @@ const EMPTY_SENSOR_CONFIG: SensorConfig = {
   applied_range: null,
   applied_hpf_corner: null,
   current_state: "unknown",
-
-  // ACK/SEQ fields intentionally not used by the page anymore.
   pending_seq: null,
   applied_seq: null,
   last_ack_at: null,
@@ -169,9 +152,8 @@ function plotCacheKey(params: {
   nodeKey: string;
   sensor: SensorValue;
   minutes: number;
-  channel: string;
 }) {
-  return `${params.nodeKey}|${params.sensor}|${params.minutes}|${params.channel}`;
+  return `${params.nodeKey}|${params.sensor}|${params.minutes}`;
 }
 
 function loadPlotCache(): Record<string, PlotCacheRecord> {
@@ -184,6 +166,10 @@ function loadPlotCache(): Record<string, PlotCacheRecord> {
   } catch {
     return {};
   }
+}
+
+function hasPlotPoints(data: ApiResponse | null): boolean {
+  return !!data && Array.isArray(data.points) && data.points.length > 0;
 }
 
 function savePlotCacheEntry(key: string, data: ApiResponse) {
@@ -213,20 +199,13 @@ function normalizeSensorConfig(raw: any): SensorConfig {
     odr_index: raw?.odr_index ?? 2,
     range: raw?.range ?? 1,
     hpf_corner: raw?.hpf_corner ?? 0,
-
-    // Use desired config as the UI source of truth.
     desired_odr_index: raw?.desired_odr_index ?? raw?.odr_index ?? 2,
     desired_range: raw?.desired_range ?? raw?.range ?? 1,
     desired_hpf_corner: raw?.desired_hpf_corner ?? raw?.hpf_corner ?? 0,
-
-    // ACK-driven applied values are not used
     applied_odr_index: null,
     applied_range: null,
     applied_hpf_corner: null,
-
     current_state: raw?.current_state ?? "unknown",
-
-    // Kept as inert compatibility fields.
     pending_seq: null,
     applied_seq: null,
     last_ack_at: null,
@@ -272,7 +251,6 @@ export default function SensorManagement() {
 
   const [sensor, setSensor] = useState<SensorValue>("accelerometer");
   const [timeframeMin, setTimeframeMin] = useState<number>(60);
-  const [channel, setChannel] = useState<string>("all");
 
   const [nodes, setNodes] = useState<NodeRecord[]>([]);
   const [nodesStatus, setNodesStatus] = useState<string>("");
@@ -295,10 +273,6 @@ export default function SensorManagement() {
 
   const [apiData, setApiData] = useState<ApiResponse | null>(null);
   const [plotStatus, setPlotStatus] = useState("Loading…");
-
-  useEffect(() => {
-    setChannel("all");
-  }, [sensor]);
 
   const refreshSettingsFromBackend = useCallback(async () => {
     const json = await getSettings();
@@ -470,9 +444,7 @@ export default function SensorManagement() {
     try {
       setConfigByNode(nextConfigByNode);
       setSettingsStatus(selectedNode.online ? "Sending accelerometer config…" : "Saving desired config…");
-
       await applyAccelerometerConfig(nodeId, updated);
-
       setSettingsStatus("Accelerometer config sent.");
     } catch (e: any) {
       setSettingsStatus(`Accelerometer config apply failed: ${e?.message ?? "Unknown error"}`);
@@ -500,11 +472,8 @@ export default function SensorManagement() {
 
     try {
       setSettingsStatus(`${cmd === "start" ? "Starting" : "Stopping"} node…`);
-
       await sendNodeControl(nodeId, { cmd });
 
-
-      //  No pending / ack fields.
       setConfigByNode((prev) => ({
         ...prev,
         [nodeId]: {
@@ -521,12 +490,6 @@ export default function SensorManagement() {
       setSettingsStatus(`Node ${cmd} failed: ${e?.message ?? "Unknown error"}`);
     }
   }
-
-  const selectedAccelConfig = nodeId
-    ? configByNode[nodeId]?.accelerometer ?? EMPTY_SENSOR_CONFIG
-    : EMPTY_SENSOR_CONFIG;
-
-  // Polling for pending config/control ACK is intentionally removed.
 
   useEffect(() => {
     if (UI_PREVIEW_MODE) {
@@ -646,16 +609,15 @@ export default function SensorManagement() {
         nodeKey,
         sensor,
         minutes: timeframeMin,
-        channel,
       });
 
       const cache = loadPlotCache();
       const cachedEntry = cache[cacheKey];
 
-      if (cachedEntry?.data?.points?.length) {
-        setApiData(cachedEntry.data);
+      if (hasPlotPoints(cachedEntry?.data ?? null)) {
+        setApiData(cachedEntry!.data);
         setPlotStatus(
-          `Using cached plot (last synced: ${new Date(cachedEntry.savedAt).toLocaleString()})`
+          `Using cached plot (last synced: ${new Date(cachedEntry!.savedAt).toLocaleString()})`
         );
       } else {
         setPlotStatus("Loading…");
@@ -667,17 +629,16 @@ export default function SensorManagement() {
         const json = await getSensorData(endpoint, {
           node: nodeId,
           minutes: timeframeMin,
-          channel,
         });
 
         setApiData(json);
         setPlotStatus("Loaded");
         savePlotCacheEntry(cacheKey, json);
       } catch (err: any) {
-        if (cachedEntry?.data?.points?.length) {
+        if (hasPlotPoints(cachedEntry?.data ?? null)) {
           setPlotStatus(
             `Backend unreachable — showing cached plot (last synced: ${new Date(
-              cachedEntry.savedAt
+              cachedEntry!.savedAt
             ).toLocaleString()})`
           );
           return;
@@ -689,11 +650,10 @@ export default function SensorManagement() {
     }
 
     void loadPlot();
-  }, [nodeId, nodeKey, sensor, channel, timeframeMin]);
+  }, [nodeId, nodeKey, sensor, timeframeMin]);
 
   const metaForNode = nodeId ? (metaByNode[nodeId] ?? FALLBACK_META) : FALLBACK_META;
   const configForNode = nodeId ? (configByNode[nodeId] ?? FALLBACK_CONFIG) : FALLBACK_CONFIG;
-
   const config = configForNode[sensor];
 
   const sensorCards = useMemo(() => {
@@ -778,36 +738,16 @@ export default function SensorManagement() {
                       ))}
                     </select>
                   </div>
-
-                  <div className="sm-filter-group">
-                    <label htmlFor="sm-channel">Channel</label>
-                    <select
-                      id="sm-channel"
-                      value={channel}
-                      onChange={(e) => setChannel(e.target.value)}
-                    >
-                      {CHANNELS_BY_SENSOR[sensor].map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
                 </div>
               </div>
 
               <div className="sm-plot-status">{plotStatus}</div>
 
               <div className="sm-plot-wrap">
-                {apiData && selectedNode && Array.isArray(apiData.points) && apiData.points.length > 0 ? (
+                {apiData && selectedNode && hasPlotPoints(apiData) ? (
                   <SensorLineChart
                     title={`${selectedSensorDef.label} (${selectedNode.serial})`}
-                    sensorKey={apiData.sensor ?? sensor}
-                    unit={apiData.unit ?? ""}
-                    points={apiData.points.map((p) => ({
-                      ts: p.t,
-                      value: p.v,
-                    }))}
+                    data={apiData}
                     height={420}
                   />
                 ) : (
