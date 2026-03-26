@@ -7,7 +7,7 @@ import paho.mqtt.client as mqtt
 import queue
 import threading
 
-import zstandard as zstd
+import gzip
 
 # Fault logging helper moved out of this file.
 from fault_event_ts import log_faults_from_packet
@@ -26,27 +26,79 @@ PORT = 1883
 TOPIC = "wind_turbine/+/data"
 STATUS_TOPIC = "wind_turbine/+/status"  # MQTT status topic for ACK/state updates
 
-DATA_DIR = "/mnt/ssd/data"
-SSD_AVAILABLE = os.path.isdir("/mnt/ssd") and os.path.ismount("/mnt/ssd")
+DATA_DIR  = "/mnt/ssd/data"
+SSD_MOUNT = "/mnt/ssd"
+
+# SSD state tracking — re-evaluated on every write so mid-run unmounts
+# and re-mounts are detected automatically.
+_ssd_ok        = False   # True when SSD is mounted and writable
+_ssd_last_warn = 0.0     # monotonic time of last SSD-unavailable warning
+_SSD_WARN_INTERVAL = 30.0  # seconds between repeated SSD warnings
+
+
+def _check_ssd() -> bool:
+    """Return True if the SSD is mounted and the data directory is writable.
+    Updates the module-level _ssd_ok flag and emits rate-limited warnings.
+    """
+    global _ssd_ok, _ssd_last_warn
+    mounted   = os.path.isdir(SSD_MOUNT) and os.path.ismount(SSD_MOUNT)
+    if mounted:
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            # Quick write-test: check free space >= 10 MB
+            stat = os.statvfs(SSD_MOUNT)
+            free_mb = stat.f_bavail * stat.f_frsize / (1024 * 1024)
+            if free_mb < 10:
+                _warn_ssd(f"SSD critically low on space: {free_mb:.1f} MB free")
+                _ssd_ok = False
+                return False
+            if not _ssd_ok:
+                print("[SSD] Storage available — resuming writes.")
+            _ssd_ok = True
+            return True
+        except OSError as e:
+            _warn_ssd(f"SSD mounted but not writable: {e}")
+            _ssd_ok = False
+            return False
+    else:
+        _warn_ssd("SSD not mounted at /mnt/ssd — sensor data will not be saved.")
+        _ssd_ok = False
+        return False
+
+
+def _ssd_ok_reset():
+    """Force the next _check_ssd() call to re-evaluate (called after write error)."""
+    global _ssd_ok
+    _ssd_ok = False
+
+
+def _warn_ssd(msg: str):
+    """Emit an SSD warning at most once per _SSD_WARN_INTERVAL seconds."""
+    global _ssd_last_warn
+    now = time.monotonic()
+    if now - _ssd_last_warn >= _SSD_WARN_INTERVAL:
+        _ssd_last_warn = now
+        print(f"[SSD] WARNING: {msg}")
 
 # Queue/backoff settings used by the MQTT consumer path.
 QUEUE_MAX_SIZE = 1000
 KEEPALIVE_S = 60
 MAX_RECONNECT_DELAY_S = 30
 
-if SSD_AVAILABLE:
-    os.makedirs(DATA_DIR, exist_ok=True)
-else:
-    print("[delta_encoder] SSD not mounted. Sensor data will not be saved.")
+# Perform initial SSD check at startup.
+_check_ssd()
 
 # -------------------------------------------------------------------
-# Zstandard compression settings
+# Gzip compression settings
 #
 # Each hourly .bin file is written as plain binary while the hour is
-# active. When the hour rolls over the file is compressed to .zst and
-# the original .bin is deleted.
+# active. When the hour rolls over the file is compressed to .bin.gz
+# (gzip level 4) and the original .bin is deleted.
+#
+# GZIP_LEVEL : 1 (fastest) … 9 (smallest). Level 4 is a good balance
+#             between speed and size for binary sensor data.
 # -------------------------------------------------------------------
-ZSTD_LEVEL = 3
+GZIP_LEVEL = 4
 
 # -------------------------------------------------------------------
 # Packet format (JSON input):
@@ -398,22 +450,30 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
 # -------------------------------------------------------------------
 
 def compress_and_replace(node_id: str, bin_path: str):
-    """Compress a closed .bin file to .zst and delete the original."""
-    zst_path = bin_path[:-4] + ".zst"
+    """Compress a closed .bin file to .bin.gz (gzip level 4) and delete
+    the original.  Skips silently if the SSD is unavailable.
+    """
+    if not _check_ssd():
+        print(f"[{node_id}] Skipping compression of {os.path.basename(bin_path)} — SSD unavailable")
+        return
+    gz_path = bin_path + ".gz"   # data_N01_20260322_14.bin → data_N01_20260322_14.bin.gz
     try:
-        file_size = os.path.getsize(bin_path)
-        cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL, write_content_size=True)
-        with open(bin_path, "rb") as f_in, open(zst_path, "wb") as f_out:
-            cctx.copy_stream(f_in, f_out, size=file_size)
-
         original_size = os.path.getsize(bin_path)
-        compressed_size = os.path.getsize(zst_path)
+        with open(bin_path, "rb") as f_in, \
+             gzip.open(gz_path, "wb", compresslevel=GZIP_LEVEL) as f_out:
+            while True:
+                chunk = f_in.read(65536)
+                if not chunk:
+                    break
+                f_out.write(chunk)
+
+        compressed_size = os.path.getsize(gz_path)
         ratio = compressed_size / original_size * 100 if original_size else 0
         os.remove(bin_path)
 
         print(
             f"[{node_id}] Compressed {os.path.basename(bin_path)} → "
-            f"{os.path.basename(zst_path)} "
+            f"{os.path.basename(gz_path)} "
             f"({original_size:,} → {compressed_size:,} bytes, {ratio:.1f}%)"
         )
     except Exception as e:
@@ -421,7 +481,14 @@ def compress_and_replace(node_id: str, bin_path: str):
 
 
 def write_record(node_id: str, data: dict):
-    """Write one normalized packet into the active hourly binary file."""
+    """Write one normalized packet into the active hourly binary file.
+    Skips the write silently (with rate-limited warning) if the SSD is
+    unavailable. Re-checks SSD availability on every call so recovery
+    after a remount is automatic.
+    """
+    if not _check_ssd():
+        return   # SSD unavailable — packet dropped, warning already emitted
+
     hour_str, filepath = get_hourly_filepath(node_id)
 
     if node_id not in node_state:
@@ -451,11 +518,20 @@ def write_record(node_id: str, data: dict):
     else:
         record = encode_delta_record(data, state)
 
-    with open(filepath, "ab") as f:
-        if not state["header_written"]:
-            f.write(struct.pack("<B", FILE_FORMAT_VERSION))
-            state["header_written"] = True
-        f.write(record)
+    try:
+        with open(filepath, "ab") as f:
+            if not state["header_written"]:
+                f.write(struct.pack("<B", FILE_FORMAT_VERSION))
+                state["header_written"] = True
+            f.write(record)
+    except OSError as e:
+        # Disk full, I/O error, or SSD unmounted mid-write.
+        # Mark the file as needing a fresh header on the next successful write
+        # so the file is not left in a partially-written state.
+        state["header_written"] = False
+        state["is_first"]       = True   # force ABSOLUTE on recovery
+        _ssd_ok_reset()
+        _warn_ssd(f"write failed for {node_id}: {e}")
 
 
 # -------------------------------------------------------------------
@@ -463,15 +539,34 @@ def write_record(node_id: str, data: dict):
 # -------------------------------------------------------------------
 
 def consumer_worker():
-    """Background worker that writes queued sensor packets to disk."""
+    """Background worker that writes queued sensor packets to disk.
+    Also runs a periodic SSD health check every 60 s so unmounts are
+    detected even during quiet periods.
+    """
+    _SSD_CHECK_INTERVAL = 60.0
+    last_ssd_check = time.monotonic()
+
     while True:
-        node_id, data = data_buffer.get()
+        try:
+            node_id, data = data_buffer.get(timeout=_SSD_CHECK_INTERVAL)
+        except queue.Empty:
+            # No packets — just run the periodic health check and loop.
+            _check_ssd()
+            last_ssd_check = time.monotonic()
+            continue
+
         try:
             write_record(node_id, data)
         except Exception as e:
             print(f"Error writing record for {node_id}: {e}")
         finally:
             data_buffer.task_done()
+
+        # Periodic health check during active writes.
+        now = time.monotonic()
+        if now - last_ssd_check >= _SSD_CHECK_INTERVAL:
+            _check_ssd()
+            last_ssd_check = now
 
 
 consumer_thread = threading.Thread(target=consumer_worker, daemon=True)

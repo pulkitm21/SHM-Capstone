@@ -16,14 +16,14 @@ Binary format recap:
   Fields with bit=0 are omitted; decoder keeps previous value.
 
 Usage:
-    python decode_binary.py <file.zst>
-    python decode_binary.py <file.zst> --csv out.csv
-    python decode_binary.py <file.zst> --verbose
-    python decode_binary.py <file.zst> --head 10
+    python decode_binary.py <file.bin.gz>
+    python decode_binary.py <file.bin.gz> --csv out.csv
+    python decode_binary.py <file.bin.gz> --verbose
+    python decode_binary.py <file.bin.gz> --head 10
 """
 
 import struct, sys, os, argparse, csv, io
-import zstandard as zstd
+import gzip
 from datetime import datetime, timezone
 
 TEMP_SCALE    = 100
@@ -42,35 +42,20 @@ FORMAT_V2 = 2   # current: changed byte + simple delta_ts
 
 
 
-# ── Zstd decompression helper ─────────────────────────────────────
+# ── Decompression helper ──────────────────────────────────────────
 
 def open_decompressed(filepath: str) -> io.BytesIO:
     """
     Return a BytesIO of the file contents ready for the record decoders.
 
-    .zst  — decompressed from a standard single-frame Zstd file
-            (written by compress_and_replace() at hour boundary).
-    .bin  — returned as-is (current hour file, still being written).
-
-    Uses stream_reader() instead of decompress() so that files compressed
-    without a content-size header (the default for copy_stream) are handled
-    correctly.
+    .bin.gz — decompressed from a gzip file (written by compress_and_replace).
+    .bin    — returned as-is (current hour file, still being written).
     """
+    if filepath.endswith(".bin.gz"):
+        with gzip.open(filepath, "rb") as f:
+            return io.BytesIO(f.read())
     with open(filepath, "rb") as f:
-        raw = f.read()
-    if not filepath.endswith(".zst"):
-        return io.BytesIO(raw)
-    dctx = zstd.ZstdDecompressor()
-    buf  = bytearray()
-    with dctx.stream_reader(io.BytesIO(raw)) as reader:
-        while True:
-            chunk = reader.read(65536)
-            if not chunk:
-                break
-            buf += chunk
-    return io.BytesIO(bytes(buf))
-    dctx = zstd.ZstdDecompressor()
-    return io.BytesIO(dctx.decompress(raw))
+        return io.BytesIO(f.read())
 
 # ── Low-level helpers ─────────────────────────────────────────────
 
@@ -420,7 +405,7 @@ def main():
         print(f"[ERROR] Not found: {args.file}", file=sys.stderr); sys.exit(1)
 
     compressed_size = os.path.getsize(args.file)
-    if args.file.endswith(".zst"):
+    if args.file.endswith(".bin.gz"):
         # Decompress once to get uncompressed size for display
         import io as _io
         _buf = open_decompressed(args.file)
