@@ -19,7 +19,6 @@ type FaultExportFilters = {
   fault_type: string;
   severity: string;
   fault_status: string;
-  description: string;
 };
 
 const EMPTY_OPTIONS: FaultFilterOptions = {
@@ -64,7 +63,6 @@ export default function ExportPage() {
     fault_type: "",
     severity: "",
     fault_status: "",
-    description: "",
   });
 
   const [options, setOptions] = useState<FaultFilterOptions>(EMPTY_OPTIONS);
@@ -161,7 +159,6 @@ export default function ExportPage() {
       fault_type: "",
       severity: "",
       fault_status: "",
-      description: "",
     });
     setMode("range");
   }
@@ -204,7 +201,6 @@ export default function ExportPage() {
         fault_type: faultFilters.fault_type || undefined,
         severity: faultFilters.severity ? Number(faultFilters.severity) : undefined,
         fault_status: faultFilters.fault_status || undefined,
-        description: faultFilters.description || undefined,
       });
 
       setMessage("Fault log CSV download started.");
@@ -370,17 +366,6 @@ export default function ExportPage() {
                 </option>
               ))}
             </select>
-          </div>
-
-          <div className="export-field export-field-wide">
-            <label htmlFor="fault-export-description">Description</label>
-            <input
-              id="fault-export-description"
-              type="text"
-              value={faultFilters.description}
-              onChange={(e) => updateFaultFilter("description", e.target.value)}
-              placeholder="Search description"
-            />
           </div>
         </div>
 
