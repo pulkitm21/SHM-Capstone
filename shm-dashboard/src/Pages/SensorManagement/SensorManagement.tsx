@@ -16,9 +16,11 @@ import {
   getSensorData,
   getNodes,
   getFaults,
+  getNodeSensorStatus,
   type ApiResponse,
   type FaultRow,
   type NodeRecord,
+  type NodeSensorStatusResponse,
 } from "../../services/api";
 
 import {
@@ -42,6 +44,18 @@ type PlotCacheRecord = {
   data: ApiResponse;
 };
 
+type SensorStatusValue = "online" | "offline" | "warning";
+
+type SensorStatusMap = Record<
+  SensorValue,
+  {
+    status: SensorStatusValue;
+    count: number;
+    hasData: boolean;
+    lastDataTs: string | null;
+  }
+>;
+
 const SENSOR_DEFINITIONS: {
   label: string;
   value: SensorValue;
@@ -57,21 +71,6 @@ const TIMEFRAME_OPTIONS = [
   { label: "12 hours", minutes: 720 },
   { label: "1 day", minutes: 1440 },
 ] as const;
-
-const CHANNELS_BY_SENSOR: Record<SensorValue, { label: string; value: string }[]> = {
-  accelerometer: [
-    { label: "All", value: "all" },
-    { label: "X", value: "x" },
-    { label: "Y", value: "y" },
-    { label: "Z", value: "z" },
-  ],
-  inclinometer: [
-    { label: "All", value: "all" },
-    { label: "Pitch", value: "pitch" },
-    { label: "Roll", value: "roll" },
-  ],
-  temperature: [{ label: "All", value: "all" }],
-};
 
 const ENDPOINT_BY_SENSOR: Record<SensorValue, string> = {
   accelerometer: "/api/accel",
@@ -90,7 +89,7 @@ const FALLBACK_META: Record<SensorValue, SensorMeta> = {
     model: "SCL3300",
     serial: "—",
     installationDate: "—",
-    orientation: "Pitch / Roll",
+    orientation: "Pitch / Roll / Yaw",
   },
   temperature: {
     model: "ADT7420",
@@ -111,8 +110,6 @@ const EMPTY_SENSOR_CONFIG: SensorConfig = {
   applied_range: null,
   applied_hpf_corner: null,
   current_state: "unknown",
-
-  // ACK/SEQ fields intentionally not used by the page anymore.
   pending_seq: null,
   applied_seq: null,
   last_ack_at: null,
@@ -131,6 +128,7 @@ const FALLBACK_CONFIG: Record<SensorValue, SensorConfig> = {
   temperature: { ...EMPTY_SENSOR_CONFIG },
 };
 
+// Load cached settings so the page can still render metadata/config offline.
 function loadCachedSettings():
   | {
       savedAt: string;
@@ -147,6 +145,7 @@ function loadCachedSettings():
   }
 }
 
+// Save settings cache after successful backend sync.
 function saveCachedSettings(
   metaByNode: Record<number, Record<SensorValue, SensorMeta>>,
   configByNode: Record<number, Record<SensorValue, SensorConfig>>
@@ -165,15 +164,16 @@ function saveCachedSettings(
   }
 }
 
+// Build a stable cache key for one node/sensor/window plot request.
 function plotCacheKey(params: {
   nodeKey: string;
   sensor: SensorValue;
   minutes: number;
-  channel: string;
 }) {
-  return `${params.nodeKey}|${params.sensor}|${params.minutes}|${params.channel}`;
+  return `${params.nodeKey}|${params.sensor}|${params.minutes}`;
 }
 
+// Load cached plots from local storage.
 function loadPlotCache(): Record<string, PlotCacheRecord> {
   try {
     const raw = localStorage.getItem(PLOT_CACHE_KEY);
@@ -186,6 +186,12 @@ function loadPlotCache(): Record<string, PlotCacheRecord> {
   }
 }
 
+// Check whether an API plot response contains usable data points.
+function hasPlotPoints(data: ApiResponse | null): boolean {
+  return !!data && Array.isArray(data.points) && data.points.length > 0;
+}
+
+// Save one plot response into local cache.
 function savePlotCacheEntry(key: string, data: ApiResponse) {
   try {
     const all = loadPlotCache();
@@ -196,6 +202,7 @@ function savePlotCacheEntry(key: string, data: ApiResponse) {
   }
 }
 
+// Convert numeric-keyed JSON objects into number-indexed records.
 function normalizeNodeKeyedObject<T>(obj: unknown): Record<number, T> {
   const out: Record<number, T> = {};
   if (!obj || typeof obj !== "object") return out;
@@ -208,25 +215,19 @@ function normalizeNodeKeyedObject<T>(obj: unknown): Record<number, T> {
   return out;
 }
 
+// Normalize one backend sensor config object into the frontend shape.
 function normalizeSensorConfig(raw: any): SensorConfig {
   return {
     odr_index: raw?.odr_index ?? 2,
     range: raw?.range ?? 1,
     hpf_corner: raw?.hpf_corner ?? 0,
-
-    // Use desired config as the UI source of truth.
     desired_odr_index: raw?.desired_odr_index ?? raw?.odr_index ?? 2,
     desired_range: raw?.desired_range ?? raw?.range ?? 1,
     desired_hpf_corner: raw?.desired_hpf_corner ?? raw?.hpf_corner ?? 0,
-
-    // ACK-driven applied values are not used
     applied_odr_index: null,
     applied_range: null,
     applied_hpf_corner: null,
-
     current_state: raw?.current_state ?? "unknown",
-
-    // Kept as inert compatibility fields.
     pending_seq: null,
     applied_seq: null,
     last_ack_at: null,
@@ -240,6 +241,7 @@ function normalizeSensorConfig(raw: any): SensorConfig {
   };
 }
 
+// Normalize the per-node sensor config map.
 function normalizeSensorConfigMap(raw: any): Record<SensorValue, SensorConfig> {
   return {
     accelerometer: normalizeSensorConfig(raw?.accelerometer),
@@ -248,22 +250,47 @@ function normalizeSensorConfigMap(raw: any): Record<SensorValue, SensorConfig> {
   };
 }
 
-function getSimpleSensorStatus(
-  faults: FaultRow[],
-  sensor: SensorValue,
-  online: boolean
-): { status: "online" | "offline" | "warning"; count: number } {
-  const relevant = faults.filter((f) => String(f.sensor_type || "").toLowerCase() === sensor);
+// Fallback sensor health used when the backend sensor-status endpoint is unavailable.
+function buildFallbackSensorStatus(
+  nodeOnline: boolean,
+  faults: FaultRow[]
+): SensorStatusMap {
+  const buildOne = (sensor: SensorValue) => {
+    const relevant = faults.filter(
+      (f) => String(f.sensor_type || "").toLowerCase() === sensor
+    );
 
-  if (!online) {
-    return { status: "offline", count: relevant.length };
-  }
+    if (!nodeOnline) {
+      return {
+        status: "offline" as const,
+        count: relevant.length,
+        hasData: false,
+        lastDataTs: null,
+      };
+    }
 
-  if (relevant.length > 0) {
-    return { status: "warning", count: relevant.length };
-  }
+    if (relevant.length > 0) {
+      return {
+        status: "warning" as const,
+        count: relevant.length,
+        hasData: true,
+        lastDataTs: null,
+      };
+    }
 
-  return { status: "online", count: 0 };
+    return {
+      status: "online" as const,
+      count: 0,
+      hasData: true,
+      lastDataTs: null,
+    };
+  };
+
+  return {
+    accelerometer: buildOne("accelerometer"),
+    inclinometer: buildOne("inclinometer"),
+    temperature: buildOne("temperature"),
+  };
 }
 
 export default function SensorManagement() {
@@ -272,18 +299,21 @@ export default function SensorManagement() {
 
   const [sensor, setSensor] = useState<SensorValue>("accelerometer");
   const [timeframeMin, setTimeframeMin] = useState<number>(60);
-  const [channel, setChannel] = useState<string>("all");
 
   const [nodes, setNodes] = useState<NodeRecord[]>([]);
   const [nodesStatus, setNodesStatus] = useState<string>("");
   const [selectedNodeLabel, setSelectedNodeLabel] = useState<string>("");
 
-  const [metaByNode, setMetaByNode] = useState<Record<number, Record<SensorValue, SensorMeta>>>(() => {
+  const [metaByNode, setMetaByNode] = useState<
+    Record<number, Record<SensorValue, SensorMeta>>
+  >(() => {
     const cached = loadCachedSettings();
     return cached?.meta ?? {};
   });
 
-  const [configByNode, setConfigByNode] = useState<Record<number, Record<SensorValue, SensorConfig>>>(() => {
+  const [configByNode, setConfigByNode] = useState<
+    Record<number, Record<SensorValue, SensorConfig>>
+  >(() => {
     const cached = loadCachedSettings();
     return cached?.config ?? {};
   });
@@ -291,23 +321,45 @@ export default function SensorManagement() {
   const [settingsStatus, setSettingsStatus] = useState<string>("");
   const [faultStatus, setFaultStatus] = useState<string>("");
   const [nodeFaults, setNodeFaults] = useState<FaultRow[]>([]);
-  const [allFaultsBySerial, setAllFaultsBySerial] = useState<Record<string, FaultRow[]>>({});
+  const [allFaultsBySerial, setAllFaultsBySerial] = useState<
+    Record<string, FaultRow[]>
+  >({});
+
+  const [sensorStatusMap, setSensorStatusMap] = useState<SensorStatusMap>({
+    accelerometer: {
+      status: "offline",
+      count: 0,
+      hasData: false,
+      lastDataTs: null,
+    },
+    inclinometer: {
+      status: "offline",
+      count: 0,
+      hasData: false,
+      lastDataTs: null,
+    },
+    temperature: {
+      status: "offline",
+      count: 0,
+      hasData: false,
+      lastDataTs: null,
+    },
+  });
 
   const [apiData, setApiData] = useState<ApiResponse | null>(null);
   const [plotStatus, setPlotStatus] = useState("Loading…");
 
-  useEffect(() => {
-    setChannel("all");
-  }, [sensor]);
-
+  // Refresh settings from backend and merge them with fallback defaults.
   const refreshSettingsFromBackend = useCallback(async () => {
     const json = await getSettings();
 
-    const rawMetaByNode = normalizeNodeKeyedObject<Record<SensorValue, SensorMeta>>(json.meta);
+    const rawMetaByNode =
+      normalizeNodeKeyedObject<Record<SensorValue, SensorMeta>>(json.meta);
     const rawConfigByNode = normalizeNodeKeyedObject<any>(json.config);
 
     const nextMetaByNode: Record<number, Record<SensorValue, SensorMeta>> = {};
-    const nextConfigByNode: Record<number, Record<SensorValue, SensorConfig>> = {};
+    const nextConfigByNode: Record<number, Record<SensorValue, SensorConfig>> =
+      {};
 
     const nodeIds = new Set<number>([
       ...Object.keys(rawMetaByNode).map(Number),
@@ -324,10 +376,13 @@ export default function SensorManagement() {
     saveCachedSettings(nextMetaByNode, nextConfigByNode);
   }, []);
 
+  // Load the live node list.
   useEffect(() => {
     if (UI_PREVIEW_MODE) {
       setNodes(PREVIEW_NODES);
-      setNodesStatus("UI preview mode: showing mock nodes while backend loading is disabled.");
+      setNodesStatus(
+        "UI preview mode: showing mock nodes while backend loading is disabled."
+      );
       return;
     }
 
@@ -344,7 +399,9 @@ export default function SensorManagement() {
         if (!mounted) return;
 
         setNodes([]);
-        setNodesStatus(`Node list load failed: ${e?.message ?? "Unknown error"}`);
+        setNodesStatus(
+          `Node list load failed: ${e?.message ?? "Unknown error"}`
+        );
       }
     }
 
@@ -355,6 +412,7 @@ export default function SensorManagement() {
     };
   }, []);
 
+  // Select the requested serial if present, otherwise keep current or default to the first node.
   useEffect(() => {
     if (!nodes.length) {
       setSelectedNodeLabel("");
@@ -382,13 +440,15 @@ export default function SensorManagement() {
 
   const nodeId = selectedNode?.node_id ?? 0;
   const nodeKey = selectedNode?.serial ?? "none";
-  const isOnline = selectedNode?.online ?? false;
 
+  // Load sensor metadata and saved configuration.
   useEffect(() => {
     if (UI_PREVIEW_MODE) {
       setMetaByNode(PREVIEW_META_BY_NODE);
       setConfigByNode(PREVIEW_CONFIG_BY_NODE);
-      setSettingsStatus("UI preview mode: showing mock sensor metadata and configuration.");
+      setSettingsStatus(
+        "UI preview mode: showing mock sensor metadata and configuration."
+      );
       return;
     }
 
@@ -411,7 +471,9 @@ export default function SensorManagement() {
             ).toLocaleString()})`
           );
         } else {
-          setSettingsStatus(`Settings load failed: ${e?.message ?? "Unknown error"}`);
+          setSettingsStatus(
+            `Settings load failed: ${e?.message ?? "Unknown error"}`
+          );
         }
       }
     }
@@ -423,17 +485,23 @@ export default function SensorManagement() {
     };
   }, [refreshSettingsFromBackend]);
 
+  // Ensure the selected node always has fallback meta/config entries.
   function ensureNodeDefaults(n: number) {
     if (!n) return;
 
-    setMetaByNode((prev) => (prev[n] ? prev : { ...prev, [n]: { ...FALLBACK_META } }));
-    setConfigByNode((prev) => (prev[n] ? prev : { ...prev, [n]: { ...FALLBACK_CONFIG } }));
+    setMetaByNode((prev) =>
+      prev[n] ? prev : { ...prev, [n]: { ...FALLBACK_META } }
+    );
+    setConfigByNode((prev) =>
+      prev[n] ? prev : { ...prev, [n]: { ...FALLBACK_CONFIG } }
+    );
   }
 
   useEffect(() => {
     if (nodeId) ensureNodeDefaults(nodeId);
   }, [nodeId]);
 
+  // Apply accelerometer configuration optimistically, then publish to backend.
   async function handleApplyAccelerometerConfig(updated: {
     odr_index: 0 | 1 | 2;
     range: 1 | 2 | 3;
@@ -453,32 +521,40 @@ export default function SensorManagement() {
       desired_hpf_corner: updated.hpf_corner,
     };
 
-    const nextConfigByNode: Record<number, Record<SensorValue, SensorConfig>> = {
-      ...configByNode,
-      [nodeId]: {
-        ...currentNodeConfig,
-        accelerometer: optimisticAccelConfig,
-      },
-    };
+    const nextConfigByNode: Record<number, Record<SensorValue, SensorConfig>> =
+      {
+        ...configByNode,
+        [nodeId]: {
+          ...currentNodeConfig,
+          accelerometer: optimisticAccelConfig,
+        },
+      };
 
     if (UI_PREVIEW_MODE) {
       setConfigByNode(nextConfigByNode);
-      setSettingsStatus("UI preview mode: accelerometer config updated locally only.");
+      setSettingsStatus(
+        "UI preview mode: accelerometer config updated locally only."
+      );
       return;
     }
 
     try {
       setConfigByNode(nextConfigByNode);
-      setSettingsStatus(selectedNode.online ? "Sending accelerometer config…" : "Saving desired config…");
-
+      setSettingsStatus(
+        selectedNode.online
+          ? "Sending accelerometer config…"
+          : "Saving desired config…"
+      );
       await applyAccelerometerConfig(nodeId, updated);
-
       setSettingsStatus("Accelerometer config sent.");
     } catch (e: any) {
-      setSettingsStatus(`Accelerometer config apply failed: ${e?.message ?? "Unknown error"}`);
+      setSettingsStatus(
+        `Accelerometer config apply failed: ${e?.message ?? "Unknown error"}`
+      );
     }
   }
 
+  // Send node start/stop control and update UI state optimistically.
   async function handleNodeControl(cmd: "start" | "stop") {
     if (!nodeId || !selectedNode) return;
 
@@ -500,11 +576,8 @@ export default function SensorManagement() {
 
     try {
       setSettingsStatus(`${cmd === "start" ? "Starting" : "Stopping"} node…`);
-
       await sendNodeControl(nodeId, { cmd });
 
-
-      //  No pending / ack fields.
       setConfigByNode((prev) => ({
         ...prev,
         [nodeId]: {
@@ -522,12 +595,7 @@ export default function SensorManagement() {
     }
   }
 
-  const selectedAccelConfig = nodeId
-    ? configByNode[nodeId]?.accelerometer ?? EMPTY_SENSOR_CONFIG
-    : EMPTY_SENSOR_CONFIG;
-
-  // Polling for pending config/control ACK is intentionally removed.
-
+  // Load recent node-specific faults for the selected node.
   useEffect(() => {
     if (UI_PREVIEW_MODE) {
       if (!selectedNode?.serial) {
@@ -537,7 +605,9 @@ export default function SensorManagement() {
       }
 
       setNodeFaults(PREVIEW_FAULTS_BY_SERIAL[selectedNode.serial] ?? []);
-      setFaultStatus("UI preview mode: showing mock faults while backend fault loading is disabled.");
+      setFaultStatus(
+        "UI preview mode: showing mock faults while backend fault loading is disabled."
+      );
       return;
     }
 
@@ -565,7 +635,9 @@ export default function SensorManagement() {
         setFaultStatus("");
       } catch (e: any) {
         setNodeFaults([]);
-        setFaultStatus(`Fault summary unavailable: ${e?.message ?? "Unknown error"}`);
+        setFaultStatus(
+          `Fault summary unavailable: ${e?.message ?? "Unknown error"}`
+        );
       }
     }
 
@@ -574,6 +646,7 @@ export default function SensorManagement() {
     return () => controller.abort();
   }, [selectedNode?.serial]);
 
+  // Load lightweight fault summaries for the node table.
   useEffect(() => {
     if (!nodes.length) {
       setAllFaultsBySerial({});
@@ -622,6 +695,65 @@ export default function SensorManagement() {
     };
   }, [nodes]);
 
+  // Load backend-driven per-sensor status so each sensor can be independent of node status.
+  useEffect(() => {
+    if (!selectedNode) {
+      setSensorStatusMap(buildFallbackSensorStatus(false, []));
+      return;
+    }
+
+    if (UI_PREVIEW_MODE) {
+      setSensorStatusMap(
+        buildFallbackSensorStatus(selectedNode.online, nodeFaults)
+      );
+      return;
+    }
+
+    const controller = new AbortController();
+    const currentNode = selectedNode;
+
+    async function loadSensorStatuses() {
+      try {
+        const res: NodeSensorStatusResponse = await getNodeSensorStatus(
+          currentNode.node_id,
+          120,
+          controller.signal
+        );
+
+        setSensorStatusMap({
+          accelerometer: {
+            status: res.sensors.accelerometer.status,
+            count: res.sensors.accelerometer.active_fault_count,
+            hasData: res.sensors.accelerometer.has_data,
+            lastDataTs: res.sensors.accelerometer.last_data_ts ?? null,
+          },
+          inclinometer: {
+            status: res.sensors.inclinometer.status,
+            count: res.sensors.inclinometer.active_fault_count,
+            hasData: res.sensors.inclinometer.has_data,
+            lastDataTs: res.sensors.inclinometer.last_data_ts ?? null,
+          },
+          temperature: {
+            status: res.sensors.temperature.status,
+            count: res.sensors.temperature.active_fault_count,
+            hasData: res.sensors.temperature.has_data,
+            lastDataTs: res.sensors.temperature.last_data_ts ?? null,
+          },
+        });
+      } catch {
+        // Fall back to fault-based summary if the backend endpoint is unavailable.
+        setSensorStatusMap(
+          buildFallbackSensorStatus(currentNode.online, nodeFaults)
+        );
+      }
+    }
+
+    void loadSensorStatuses();
+
+    return () => controller.abort();
+  }, [selectedNode, nodeFaults]);
+
+  // Load plot data for the currently selected sensor and time window.
   useEffect(() => {
     if (UI_PREVIEW_MODE) {
       if (!nodeId) {
@@ -631,7 +763,9 @@ export default function SensorManagement() {
       }
 
       setApiData(buildPreviewPlotData(sensor));
-      setPlotStatus("UI preview mode: showing mock trend data while backend plot loading is disabled.");
+      setPlotStatus(
+        "UI preview mode: showing mock trend data while backend plot loading is disabled."
+      );
       return;
     }
 
@@ -646,16 +780,17 @@ export default function SensorManagement() {
         nodeKey,
         sensor,
         minutes: timeframeMin,
-        channel,
       });
 
       const cache = loadPlotCache();
       const cachedEntry = cache[cacheKey];
 
-      if (cachedEntry?.data?.points?.length) {
-        setApiData(cachedEntry.data);
+      if (hasPlotPoints(cachedEntry?.data ?? null)) {
+        setApiData(cachedEntry!.data);
         setPlotStatus(
-          `Using cached plot (last synced: ${new Date(cachedEntry.savedAt).toLocaleString()})`
+          `Using cached plot (last synced: ${new Date(
+            cachedEntry!.savedAt
+          ).toLocaleString()})`
         );
       } else {
         setPlotStatus("Loading…");
@@ -667,17 +802,16 @@ export default function SensorManagement() {
         const json = await getSensorData(endpoint, {
           node: nodeId,
           minutes: timeframeMin,
-          channel,
         });
 
         setApiData(json);
         setPlotStatus("Loaded");
         savePlotCacheEntry(cacheKey, json);
       } catch (err: any) {
-        if (cachedEntry?.data?.points?.length) {
+        if (hasPlotPoints(cachedEntry?.data ?? null)) {
           setPlotStatus(
             `Backend unreachable — showing cached plot (last synced: ${new Date(
-              cachedEntry.savedAt
+              cachedEntry!.savedAt
             ).toLocaleString()})`
           );
           return;
@@ -689,17 +823,22 @@ export default function SensorManagement() {
     }
 
     void loadPlot();
-  }, [nodeId, nodeKey, sensor, channel, timeframeMin]);
+  }, [nodeId, nodeKey, sensor, timeframeMin]);
 
-  const metaForNode = nodeId ? (metaByNode[nodeId] ?? FALLBACK_META) : FALLBACK_META;
-  const configForNode = nodeId ? (configByNode[nodeId] ?? FALLBACK_CONFIG) : FALLBACK_CONFIG;
-
+  const metaForNode = nodeId
+    ? metaByNode[nodeId] ?? FALLBACK_META
+    : FALLBACK_META;
+  const configForNode = nodeId
+    ? configByNode[nodeId] ?? FALLBACK_CONFIG
+    : FALLBACK_CONFIG;
   const config = configForNode[sensor];
 
+  // Build sensor cards from backend-provided per-sensor status.
   const sensorCards = useMemo(() => {
     return SENSOR_DEFINITIONS.map((sensorDef) => {
-      const sensorMeta = metaForNode[sensorDef.value] ?? FALLBACK_META[sensorDef.value];
-      const summary = getSimpleSensorStatus(nodeFaults, sensorDef.value, isOnline);
+      const sensorMeta =
+        metaForNode[sensorDef.value] ?? FALLBACK_META[sensorDef.value];
+      const summary = sensorStatusMap[sensorDef.value];
 
       return {
         label: sensorDef.label,
@@ -708,10 +847,11 @@ export default function SensorManagement() {
         status: summary.status,
       };
     });
-  }, [metaForNode, nodeFaults, isOnline]);
+  }, [metaForNode, sensorStatusMap]);
 
   const selectedSensorDef =
-    SENSOR_DEFINITIONS.find((entry) => entry.value === sensor) ?? SENSOR_DEFINITIONS[0];
+    SENSOR_DEFINITIONS.find((entry) => entry.value === sensor) ??
+    SENSOR_DEFINITIONS[0];
 
   return (
     <div className="sm-page">
@@ -719,7 +859,9 @@ export default function SensorManagement() {
         <div>
           <h1 className="sm-page-title">Sensor Management</h1>
           {nodesStatus && <p className="sm-inline-status">{nodesStatus}</p>}
-          {settingsStatus && <p className="sm-inline-status">{settingsStatus}</p>}
+          {settingsStatus && (
+            <p className="sm-inline-status">{settingsStatus}</p>
+          )}
           {faultStatus && <p className="sm-inline-status">{faultStatus}</p>}
         </div>
       </div>
@@ -727,7 +869,10 @@ export default function SensorManagement() {
       {!selectedNode ? (
         <div className="sm-empty-state">
           <h2>No node selected</h2>
-          <p>Select a node from the table to inspect sensors, plots, and configuration.</p>
+          <p>
+            Select a node from the table to inspect sensors, plots, and
+            configuration.
+          </p>
         </div>
       ) : (
         <div className="sm-layout">
@@ -757,7 +902,9 @@ export default function SensorManagement() {
             <div className="sm-panel sm-full-width-panel">
               <div className="sm-plot-toolbar">
                 <div>
-                  <h2 className="sm-panel-title">{selectedSensorDef.label} Trend</h2>
+                  <h2 className="sm-panel-title">
+                    {selectedSensorDef.label} Trend
+                  </h2>
                   <p className="sm-panel-subtitle">
                     Recent data for {selectedNode.serial}
                   </p>
@@ -778,50 +925,32 @@ export default function SensorManagement() {
                       ))}
                     </select>
                   </div>
-
-                  <div className="sm-filter-group">
-                    <label htmlFor="sm-channel">Channel</label>
-                    <select
-                      id="sm-channel"
-                      value={channel}
-                      onChange={(e) => setChannel(e.target.value)}
-                    >
-                      {CHANNELS_BY_SENSOR[sensor].map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
                 </div>
               </div>
 
               <div className="sm-plot-status">{plotStatus}</div>
 
               <div className="sm-plot-wrap">
-                {apiData && selectedNode && Array.isArray(apiData.points) && apiData.points.length > 0 ? (
+                {apiData && selectedNode && hasPlotPoints(apiData) ? (
                   <SensorLineChart
                     title={`${selectedSensorDef.label} (${selectedNode.serial})`}
-                    sensorKey={apiData.sensor ?? sensor}
-                    unit={apiData.unit ?? ""}
-                    points={apiData.points.map((p) => ({
-                      ts: p.t,
-                      value: p.v,
-                    }))}
+                    data={apiData}
                     height={420}
                   />
                 ) : (
-                  <div className="sm-plot-empty">No plot data available for the selected view.</div>
+                  <div className="sm-plot-empty">
+                    No plot data available for the selected view.
+                  </div>
                 )}
               </div>
             </div>
 
             <FaultLog
               variant="node"
-              serial_number={selectedNode.serial}
+              serial_number={selectedNode?.serial ?? ""}
               limit={5}
               previewMode={UI_PREVIEW_MODE}
-              previewFaults={PREVIEW_FAULTS_BY_SERIAL[selectedNode.serial] ?? []}
+              previewFaults={PREVIEW_FAULTS_BY_SERIAL[selectedNode?.serial ?? ""] ?? []}
             />
           </section>
         </div>

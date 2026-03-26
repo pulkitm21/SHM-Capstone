@@ -1,4 +1,3 @@
-import type { SensorMeta } from "../SensorInfo/SensorInfo";
 import type { SensorValue } from "../../Pages/SensorManagement/SensorManagement.preview";
 import "./SensorCardGrid.css";
 

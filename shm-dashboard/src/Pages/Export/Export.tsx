@@ -1,8 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   downloadFaultExport,
+  downloadSensorExport,
   getFaults,
+  getNodes,
   type FaultFilterOptions,
+  type NodeRecord,
 } from "../../services/api";
 import "./Export.css";
 
@@ -53,7 +56,7 @@ export default function ExportPage() {
   const defaultRange = useMemo(() => getDefaultDateRange(), []);
 
   const [mode, setMode] = useState<ExportMode>("range");
-  const [filters, setFilters] = useState<FaultExportFilters>({
+  const [faultFilters, setFaultFilters] = useState<FaultExportFilters>({
     start_day: defaultRange.start_day,
     end_day: defaultRange.end_day,
     serial_number: "",
@@ -66,7 +69,16 @@ export default function ExportPage() {
 
   const [options, setOptions] = useState<FaultFilterOptions>(EMPTY_OPTIONS);
   const [loadingOptions, setLoadingOptions] = useState(true);
-  const [exporting, setExporting] = useState(false);
+
+  const [nodes, setNodes] = useState<NodeRecord[]>([]);
+  const [loadingNodes, setLoadingNodes] = useState(true);
+  const [selectedNodeIds, setSelectedNodeIds] = useState<number[]>([]);
+  const [sensorStartDay, setSensorStartDay] = useState(defaultRange.start_day);
+  const [sensorEndDay, setSensorEndDay] = useState(defaultRange.end_day);
+
+  const [faultExporting, setFaultExporting] = useState(false);
+  const [sensorExporting, setSensorExporting] = useState(false);
+
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
 
@@ -80,7 +92,7 @@ export default function ExportPage() {
 
         const response = await getFaults(
           {
-            serial_number: filters.serial_number || undefined,
+            serial_number: faultFilters.serial_number || undefined,
             page: 1,
             page_size: 1,
           },
@@ -96,26 +108,52 @@ export default function ExportPage() {
 
         setOptions(EMPTY_OPTIONS);
         setLoadingOptions(false);
-        setError(err?.message ?? "Failed to load export filters.");
+        setError(err?.message ?? "Failed to load fault export filters.");
       }
     }
 
     void loadFilterOptions();
     return () => controller.abort();
-  }, [filters.serial_number]);
+  }, [faultFilters.serial_number]);
 
-  function updateFilter<K extends keyof FaultExportFilters>(
+  useEffect(() => {
+    const controller = new AbortController();
+
+    async function loadNodes() {
+      try {
+        setLoadingNodes(true);
+
+        const response = await getNodes(controller.signal);
+        if (controller.signal.aborted) return;
+
+        const nodeRows = response.nodes ?? [];
+        setNodes(nodeRows);
+        setLoadingNodes(false);
+      } catch (err: any) {
+        if (controller.signal.aborted) return;
+
+        setNodes([]);
+        setLoadingNodes(false);
+        setError(err?.message ?? "Failed to load nodes for sensor export.");
+      }
+    }
+
+    void loadNodes();
+    return () => controller.abort();
+  }, []);
+
+  function updateFaultFilter<K extends keyof FaultExportFilters>(
     key: K,
     value: FaultExportFilters[K]
   ) {
-    setFilters((current) => ({
+    setFaultFilters((current) => ({
       ...current,
       [key]: value,
     }));
   }
 
-  function resetFilters() {
-    setFilters({
+  function resetFaultFilters() {
+    setFaultFilters({
       start_day: defaultRange.start_day,
       end_day: defaultRange.end_day,
       serial_number: "",
@@ -126,37 +164,74 @@ export default function ExportPage() {
       description: "",
     });
     setMode("range");
-    setError("");
-    setMessage("");
   }
 
-  const rangeIsValid =
-    !filters.start_day ||
-    !filters.end_day ||
-    filters.start_day <= filters.end_day;
+  function toggleNodeSelection(nodeId: number) {
+    setSelectedNodeIds((current) =>
+      current.includes(nodeId)
+        ? current.filter((id) => id !== nodeId)
+        : [...current, nodeId].sort((a, b) => a - b)
+    );
+  }
 
-  async function handleExport() {
-    setExporting(true);
+  function selectAllNodes() {
+    setSelectedNodeIds(nodes.map((node) => node.node_id));
+  }
+
+  function clearNodeSelection() {
+    setSelectedNodeIds([]);
+  }
+
+  const faultRangeIsValid =
+    !faultFilters.start_day ||
+    !faultFilters.end_day ||
+    faultFilters.start_day <= faultFilters.end_day;
+
+  const sensorRangeIsValid =
+    !!sensorStartDay && !!sensorEndDay && sensorStartDay <= sensorEndDay;
+
+  async function handleFaultExport() {
+    setFaultExporting(true);
     setError("");
     setMessage("");
 
     try {
       await downloadFaultExport({
-        start_day: mode === "range" ? filters.start_day : undefined,
-        end_day: mode === "range" ? filters.end_day : undefined,
-        serial_number: filters.serial_number || undefined,
-        sensor_type: filters.sensor_type || undefined,
-        fault_type: filters.fault_type || undefined,
-        severity: filters.severity ? Number(filters.severity) : undefined,
-        fault_status: filters.fault_status || undefined,
-        description: filters.description || undefined,
+        start_day: mode === "range" ? faultFilters.start_day : undefined,
+        end_day: mode === "range" ? faultFilters.end_day : undefined,
+        serial_number: faultFilters.serial_number || undefined,
+        sensor_type: faultFilters.sensor_type || undefined,
+        fault_type: faultFilters.fault_type || undefined,
+        severity: faultFilters.severity ? Number(faultFilters.severity) : undefined,
+        fault_status: faultFilters.fault_status || undefined,
+        description: faultFilters.description || undefined,
       });
 
-      setMessage("Fault log export started successfully.");
+      setMessage("Fault log CSV download started.");
     } catch (err: any) {
       setError(err?.message ?? "Fault export failed.");
     } finally {
-      setExporting(false);
+      setFaultExporting(false);
+    }
+  }
+
+  async function handleSensorExport() {
+    setSensorExporting(true);
+    setError("");
+    setMessage("");
+
+    try {
+      await downloadSensorExport({
+        node_ids: selectedNodeIds,
+        start_day: sensorStartDay,
+        end_day: sensorEndDay,
+      });
+
+      setMessage("Sensor data ZIP download started.");
+    } catch (err: any) {
+      setError(err?.message ?? "Sensor export failed.");
+    } finally {
+      setSensorExporting(false);
     }
   }
 
@@ -170,7 +245,9 @@ export default function ExportPage() {
 
       <section className="export-card">
         <div className="export-card-header">
-
+          <div>
+            <h2>Fault Log Export</h2>
+          </div>
 
           <div className="export-card-badge">CSV</div>
         </div>
@@ -199,8 +276,8 @@ export default function ExportPage() {
             <input
               id="fault-export-start-day"
               type="date"
-              value={filters.start_day}
-              onChange={(e) => updateFilter("start_day", e.target.value)}
+              value={faultFilters.start_day}
+              onChange={(e) => updateFaultFilter("start_day", e.target.value)}
               disabled={mode === "full"}
             />
           </div>
@@ -210,8 +287,8 @@ export default function ExportPage() {
             <input
               id="fault-export-end-day"
               type="date"
-              value={filters.end_day}
-              onChange={(e) => updateFilter("end_day", e.target.value)}
+              value={faultFilters.end_day}
+              onChange={(e) => updateFaultFilter("end_day", e.target.value)}
               disabled={mode === "full"}
             />
           </div>
@@ -221,8 +298,8 @@ export default function ExportPage() {
             <input
               id="fault-export-serial"
               type="text"
-              value={filters.serial_number}
-              onChange={(e) => updateFilter("serial_number", e.target.value)}
+              value={faultFilters.serial_number}
+              onChange={(e) => updateFaultFilter("serial_number", e.target.value)}
               placeholder="Search serial number"
             />
           </div>
@@ -231,8 +308,8 @@ export default function ExportPage() {
             <label htmlFor="fault-export-sensor">Sensor</label>
             <select
               id="fault-export-sensor"
-              value={filters.sensor_type}
-              onChange={(e) => updateFilter("sensor_type", e.target.value)}
+              value={faultFilters.sensor_type}
+              onChange={(e) => updateFaultFilter("sensor_type", e.target.value)}
               disabled={loadingOptions}
             >
               <option value="">All sensors</option>
@@ -248,8 +325,8 @@ export default function ExportPage() {
             <label htmlFor="fault-export-type">Fault Type</label>
             <select
               id="fault-export-type"
-              value={filters.fault_type}
-              onChange={(e) => updateFilter("fault_type", e.target.value)}
+              value={faultFilters.fault_type}
+              onChange={(e) => updateFaultFilter("fault_type", e.target.value)}
               disabled={loadingOptions}
             >
               <option value="">All fault types</option>
@@ -265,8 +342,8 @@ export default function ExportPage() {
             <label htmlFor="fault-export-severity">Severity</label>
             <select
               id="fault-export-severity"
-              value={filters.severity}
-              onChange={(e) => updateFilter("severity", e.target.value)}
+              value={faultFilters.severity}
+              onChange={(e) => updateFaultFilter("severity", e.target.value)}
               disabled={loadingOptions}
             >
               <option value="">All severities</option>
@@ -282,8 +359,8 @@ export default function ExportPage() {
             <label htmlFor="fault-export-status">Status</label>
             <select
               id="fault-export-status"
-              value={filters.fault_status}
-              onChange={(e) => updateFilter("fault_status", e.target.value)}
+              value={faultFilters.fault_status}
+              onChange={(e) => updateFaultFilter("fault_status", e.target.value)}
               disabled={loadingOptions}
             >
               <option value="">All statuses</option>
@@ -300,14 +377,132 @@ export default function ExportPage() {
             <input
               id="fault-export-description"
               type="text"
-              value={filters.description}
-              onChange={(e) => updateFilter("description", e.target.value)}
+              value={faultFilters.description}
+              onChange={(e) => updateFaultFilter("description", e.target.value)}
               placeholder="Search description"
             />
           </div>
         </div>
 
-        {!rangeIsValid && mode === "range" && (
+        {!faultRangeIsValid && mode === "range" && (
+          <div className="export-alert error">
+            End day cannot be earlier than start day.
+          </div>
+        )}
+
+        <div className="export-actions">
+          <button
+            type="button"
+            className="export-secondary-btn"
+            onClick={resetFaultFilters}
+            disabled={faultExporting}
+          >
+            Reset
+          </button>
+
+          <button
+            type="button"
+            className="export-primary-btn"
+            onClick={handleFaultExport}
+            disabled={faultExporting || (mode === "range" && !faultRangeIsValid)}
+          >
+            {faultExporting ? "Exporting..." : "Export CSV"}
+          </button>
+        </div>
+      </section>
+
+      <section className="export-card">
+        <div className="export-card-header">
+          <div>
+            <h2>Sensor Data Export</h2>
+          </div>
+
+          <div className="export-card-badge">ZIP</div>
+        </div>
+
+        <div className="export-grid export-grid-sensor">
+          <div className="export-field">
+            <label htmlFor="sensor-export-start-day">Start Day</label>
+            <input
+              id="sensor-export-start-day"
+              type="date"
+              value={sensorStartDay}
+              onChange={(e) => setSensorStartDay(e.target.value)}
+            />
+          </div>
+
+          <div className="export-field">
+            <label htmlFor="sensor-export-end-day">End Day</label>
+            <input
+              id="sensor-export-end-day"
+              type="date"
+              value={sensorEndDay}
+              onChange={(e) => setSensorEndDay(e.target.value)}
+            />
+          </div>
+
+          <div className="export-field export-field-wide export-node-field">
+            <label>Nodes</label>
+
+            <div className="export-node-toolbar">
+              <button
+                type="button"
+                className="export-secondary-btn export-inline-btn"
+                onClick={selectAllNodes}
+                disabled={loadingNodes || nodes.length === 0}
+              >
+                Select All
+              </button>
+
+              <button
+                type="button"
+                className="export-secondary-btn export-inline-btn"
+                onClick={clearNodeSelection}
+                disabled={selectedNodeIds.length === 0}
+              >
+                Clear
+              </button>
+
+              <span className="export-node-count">
+                {selectedNodeIds.length} selected
+              </span>
+            </div>
+
+            <div className="export-node-list">
+              {loadingNodes ? (
+                <div className="export-node-empty">Loading nodes…</div>
+              ) : nodes.length === 0 ? (
+                <div className="export-node-empty">No nodes available.</div>
+              ) : (
+                nodes.map((node) => {
+                  const checked = selectedNodeIds.includes(node.node_id);
+                  return (
+                    <label
+                      key={node.node_id}
+                      className={`export-node-option ${checked ? "selected" : ""}`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => toggleNodeSelection(node.node_id)}
+                      />
+                      <span className="export-node-option-main">
+                        <span className="export-node-option-title">
+                          {node.label || `Node ${node.node_id}`}
+                        </span>
+                        <span className="export-node-option-meta">
+                          {node.serial}
+                        </span>
+                      </span>
+                    </label>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        </div>
+
+        {!sensorRangeIsValid && (
           <div className="export-alert error">
             End day cannot be earlier than start day.
           </div>
@@ -319,20 +514,15 @@ export default function ExportPage() {
         <div className="export-actions">
           <button
             type="button"
-            className="export-secondary-btn"
-            onClick={resetFilters}
-            disabled={exporting}
-          >
-            Reset
-          </button>
-
-          <button
-            type="button"
             className="export-primary-btn"
-            onClick={handleExport}
-            disabled={exporting || (mode === "range" && !rangeIsValid)}
+            onClick={handleSensorExport}
+            disabled={
+              sensorExporting ||
+              !sensorRangeIsValid ||
+              selectedNodeIds.length === 0
+            }
           >
-            {exporting ? "Exporting..." : "Export CSV"}
+            {sensorExporting ? "Exporting..." : "Export ZIP"}
           </button>
         </div>
       </section>

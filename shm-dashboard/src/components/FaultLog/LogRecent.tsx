@@ -15,10 +15,6 @@ type Props = {
 export default function LogRecent({ faults, loading, error }: Props) {
   return (
     <div className="faultlog-panel">
-      <div className="faultlog-header">
-        <span className="faultlog-count">{faults.length}</span>
-      </div>
-
       {loading ? (
         <div className="faultlog-empty">Loading faults…</div>
       ) : error ? (

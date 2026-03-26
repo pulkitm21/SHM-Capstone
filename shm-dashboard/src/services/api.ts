@@ -20,17 +20,50 @@ async function request<T>(
   return (await res.json()) as T;
 }
 
-export type SensorPoint = {
-  t: string;
-  v: number;
+export type AccelerometerPlotPoint = {
+  ts: string;
+  x: number;
+  y: number;
+  z: number;
 };
 
-export type ApiResponse = {
-  points: SensorPoint[];
-  sensor?: string;
-  unit?: string;
-  [key: string]: unknown;
+export type InclinometerPlotPoint = {
+  ts: string;
+  roll: number;
+  pitch: number;
+  yaw: number;
 };
+
+export type TemperaturePlotPoint = {
+  ts: string;
+  value: number;
+};
+
+export type AccelerometerPlotResponse = {
+  sensor: "accelerometer";
+  unit: "g";
+  node: number;
+  points: AccelerometerPlotPoint[];
+};
+
+export type InclinometerPlotResponse = {
+  sensor: "inclinometer";
+  unit: "deg";
+  node: number;
+  points: InclinometerPlotPoint[];
+};
+
+export type TemperaturePlotResponse = {
+  sensor: "temperature";
+  unit: "C";
+  node: number;
+  points: TemperaturePlotPoint[];
+};
+
+export type ApiResponse =
+  | AccelerometerPlotResponse
+  | InclinometerPlotResponse
+  | TemperaturePlotResponse;
 
 export type SettingsResponse = {
   site_name?: string;
@@ -132,7 +165,9 @@ export type SystemActionResponse = {
   ok: boolean;
   action: string;
   status: string;
-  time: string;
+  time?: string;
+  message?: string;
+  detail?: string;
 };
 
 export function getHealth(signal?: AbortSignal) {
@@ -211,13 +246,12 @@ export function putSiteName(
 
 export function getSensorData(
   endpoint: string,
-  params: { node: number; minutes: number; channel?: string },
+  params: { node: number; minutes: number },
   signal?: AbortSignal
 ) {
   const qs = new URLSearchParams();
   qs.set("node", String(params.node));
   qs.set("minutes", String(params.minutes));
-  if (params.channel) qs.set("channel", params.channel);
 
   return request<ApiResponse>(`${endpoint}?${qs.toString()}`, { signal });
 }
@@ -310,8 +344,6 @@ export type ApplyAccelerometerConfigResponse = {
     hpf_corner: number;
   };
   status: string;
-
-  // ACK / SEQ fields intentionally removed from the frontend contract.
 };
 
 export type NodeControlBody = {
@@ -431,4 +463,180 @@ export async function downloadFaultExport(
   } finally {
     window.URL.revokeObjectURL(objectUrl);
   }
+}
+
+export type SensorExportParams = {
+  node_ids: number[];
+  start_day: string;
+  end_day: string;
+};
+
+async function downloadFromEndpoint(
+  path: string,
+  signal?: AbortSignal
+): Promise<void> {
+  const res = await fetch(`${API_BASE}${path}`, { signal });
+
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try {
+      const text = await res.text();
+      if (text) msg += ` - ${text}`;
+    } catch {
+      // ignore
+    }
+    throw new Error(msg);
+  }
+
+  const blob = await res.blob();
+  const filename =
+    parseFilenameFromDisposition(res.headers.get("Content-Disposition")) ??
+    "download.bin";
+
+  const objectUrl = window.URL.createObjectURL(blob);
+
+  try {
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  } finally {
+    window.URL.revokeObjectURL(objectUrl);
+  }
+}
+
+export async function downloadSensorExport(
+  params: SensorExportParams,
+  signal?: AbortSignal
+) {
+  if (!params.node_ids.length) {
+    throw new Error("At least one node must be selected.");
+  }
+
+  const qs = new URLSearchParams();
+  qs.set("node_ids", params.node_ids.join(","));
+  qs.set("start_day", params.start_day);
+  qs.set("end_day", params.end_day);
+
+  await downloadFromEndpoint(`/api/exports/sensor-data?${qs.toString()}`, signal);
+}
+
+export type ServerStatusResponse = {
+  backend_status?: "OK" | "DEGRADED" | "OFFLINE";
+  mqtt_connected?: boolean;
+  fault_db_available?: boolean;
+  ssd_available?: boolean;
+  uptime_seconds?: number;
+  last_boot?: string;
+  time?: string;
+  [key: string]: unknown;
+};
+
+export type ServerNetworkResponse = {
+  vpn_connected?: boolean;
+  vpn_cert_expires_at?: string;
+  internet_reachable?: boolean;
+  [key: string]: unknown;
+};
+
+export type ServerActionResponse = {
+  ok: boolean;
+  action: string;
+  status: string;
+  time?: string;
+  message?: string;
+  detail?: string;
+  [key: string]: unknown;
+};
+
+export type PruneStoredDataBody = {
+  older_than_days: number;
+};
+
+export type SensorHealthStatus = "online" | "offline" | "warning";
+
+export type SensorHealthDetail = {
+  status: SensorHealthStatus;
+  has_data: boolean;
+  last_data_ts?: string | null;
+  active_fault_count: number;
+  active_faults: FaultRow[];
+};
+
+export type NodeSensorStatusResponse = {
+  node_id: number;
+  serial: string;
+  node_online: boolean;
+  window_seconds: number;
+  time: string;
+  sensors: {
+    accelerometer: SensorHealthDetail;
+    inclinometer: SensorHealthDetail;
+    temperature: SensorHealthDetail;
+  };
+};
+
+export function getServerStatus(signal?: AbortSignal) {
+  return request<ServerStatusResponse>("/api/server/status", { signal });
+}
+
+export function getServerNetwork(signal?: AbortSignal) {
+  return request<ServerNetworkResponse>("/api/server/network", { signal });
+}
+
+export function rebootServer(signal?: AbortSignal) {
+  return request<ServerActionResponse>("/api/server/reboot", {
+    method: "POST",
+    signal,
+  });
+}
+
+export function restartBackendService(signal?: AbortSignal) {
+  return request<ServerActionResponse>("/api/server/restart-backend", {
+    method: "POST",
+    signal,
+  });
+}
+
+export function restartMqttService(signal?: AbortSignal) {
+  return request<ServerActionResponse>("/api/server/restart-mqtt", {
+    method: "POST",
+    signal,
+  });
+}
+
+export function renewVpnCertificate(signal?: AbortSignal) {
+  return request<ServerActionResponse>("/api/server/renew-vpn-certificate", {
+    method: "POST",
+    signal,
+  });
+}
+
+export function pruneStoredData(
+  body: PruneStoredDataBody,
+  signal?: AbortSignal
+) {
+  return request<ServerActionResponse>("/api/server/prune-data", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+}
+
+// Fetch per-sensor health for the selected node.
+export function getNodeSensorStatus(
+  nodeId: number,
+  windowSeconds = 120,
+  signal?: AbortSignal
+) {
+  const qs = new URLSearchParams();
+  qs.set("window_seconds", String(windowSeconds));
+
+  return request<NodeSensorStatusResponse>(
+    `/api/nodes/${nodeId}/sensor-status?${qs.toString()}`,
+    { signal }
+  );
 }
