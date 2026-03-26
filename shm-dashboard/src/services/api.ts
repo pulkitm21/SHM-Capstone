@@ -20,17 +20,50 @@ async function request<T>(
   return (await res.json()) as T;
 }
 
-export type SensorPoint = {
-  t: string;
-  v: number;
+export type AccelerometerPlotPoint = {
+  ts: string;
+  x: number;
+  y: number;
+  z: number;
 };
 
-export type ApiResponse = {
-  points: SensorPoint[];
-  sensor?: string;
-  unit?: string;
-  [key: string]: unknown;
+export type InclinometerPlotPoint = {
+  ts: string;
+  roll: number;
+  pitch: number;
+  yaw: number;
 };
+
+export type TemperaturePlotPoint = {
+  ts: string;
+  value: number;
+};
+
+export type AccelerometerPlotResponse = {
+  sensor: "accelerometer";
+  unit: "g";
+  node: number;
+  points: AccelerometerPlotPoint[];
+};
+
+export type InclinometerPlotResponse = {
+  sensor: "inclinometer";
+  unit: "deg";
+  node: number;
+  points: InclinometerPlotPoint[];
+};
+
+export type TemperaturePlotResponse = {
+  sensor: "temperature";
+  unit: "C";
+  node: number;
+  points: TemperaturePlotPoint[];
+};
+
+export type ApiResponse =
+  | AccelerometerPlotResponse
+  | InclinometerPlotResponse
+  | TemperaturePlotResponse;
 
 export type SettingsResponse = {
   site_name?: string;
@@ -211,13 +244,12 @@ export function putSiteName(
 
 export function getSensorData(
   endpoint: string,
-  params: { node: number; minutes: number; channel?: string },
+  params: { node: number; minutes: number },
   signal?: AbortSignal
 ) {
   const qs = new URLSearchParams();
   qs.set("node", String(params.node));
   qs.set("minutes", String(params.minutes));
-  if (params.channel) qs.set("channel", params.channel);
 
   return request<ApiResponse>(`${endpoint}?${qs.toString()}`, { signal });
 }
@@ -310,8 +342,6 @@ export type ApplyAccelerometerConfigResponse = {
     hpf_corner: number;
   };
   status: string;
-
-  // ACK / SEQ fields intentionally removed from the frontend contract.
 };
 
 export type NodeControlBody = {
@@ -431,4 +461,62 @@ export async function downloadFaultExport(
   } finally {
     window.URL.revokeObjectURL(objectUrl);
   }
+}
+
+export type SensorExportParams = {
+  node_ids: number[];
+  start_day: string;
+  end_day: string;
+};
+
+async function downloadFromEndpoint(
+  path: string,
+  signal?: AbortSignal
+): Promise<void> {
+  const res = await fetch(`${API_BASE}${path}`, { signal });
+
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try {
+      const text = await res.text();
+      if (text) msg += ` - ${text}`;
+    } catch {
+      // ignore
+    }
+    throw new Error(msg);
+  }
+
+  const blob = await res.blob();
+  const filename =
+    parseFilenameFromDisposition(res.headers.get("Content-Disposition")) ??
+    "download.bin";
+
+  const objectUrl = window.URL.createObjectURL(blob);
+
+  try {
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  } finally {
+    window.URL.revokeObjectURL(objectUrl);
+  }
+}
+
+export async function downloadSensorExport(
+  params: SensorExportParams,
+  signal?: AbortSignal
+) {
+  if (!params.node_ids.length) {
+    throw new Error("At least one node must be selected.");
+  }
+
+  const qs = new URLSearchParams();
+  qs.set("node_ids", params.node_ids.join(","));
+  qs.set("start_day", params.start_day);
+  qs.set("end_day", params.end_day);
+
+  await downloadFromEndpoint(`/api/exports/sensor-data?${qs.toString()}`, signal);
 }
