@@ -9,7 +9,7 @@ import type {
 
 export type SensorValue = "accelerometer" | "inclinometer" | "temperature";
 
-export const UI_PREVIEW_MODE = true;
+export const UI_PREVIEW_MODE = false;
 
 const NOW = Date.now();
 
