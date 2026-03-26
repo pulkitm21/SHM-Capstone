@@ -9,7 +9,6 @@ import {
   getStorage,
   getStorageStatus,
   type HealthResponse,
-  unmountStorage,
   type FaultRow,
   type NodeRecord,
   type StorageResponse,
@@ -74,38 +73,6 @@ export default function Home() {
   const [ssdMountPath, setSsdMountPath] = useState<string>("/mnt/ssd");
 
   const [warningSerials, setWarningSerials] = useState<string[]>([]);
-
-  const [unmounting, setUnmounting] = useState<boolean>(false);
-
-  async function handleUnmount() {
-    const confirmed = window.confirm(
-      "This will unmount the SSD and stop data storage. Continue?"
-    );
-    if (!confirmed) return;
-
-    try {
-      setUnmounting(true);
-      await unmountStorage();
-
-      const [storageRes, storageStatusRes] = await Promise.all([
-        getStorage(),
-        getStorageStatus(),
-      ]);
-
-      setStorageUsed(Number(storageRes.used_gb ?? 0));
-      setStorageFree(Number(storageRes.free_gb ?? 0));
-      setStorageTotal(Number(storageRes.total_gb ?? 0));
-      setStoragePercent(Number(storageRes.usage_percent ?? 0));
-
-      setSsdMounted(Boolean(storageStatusRes.mounted));
-      setSsdAvailable(Boolean(storageStatusRes.available));
-      setSsdMountPath(String(storageStatusRes.mount_path ?? "/mnt/ssd"));
-    } catch (err: any) {
-      alert(`Unmount failed: ${err?.message ?? "Unknown error"}`);
-    } finally {
-      setUnmounting(false);
-    }
-  }
 
   useEffect(() => {
     let mounted = true;
@@ -327,15 +294,6 @@ export default function Home() {
             </div>
 
             <div className="home-card-actions">
-              <button
-                className="home-action-btn"
-                onClick={handleUnmount}
-                disabled={unmounting || !ssdMounted}
-                type="button"
-              >
-                {unmounting ? "Unmounting..." : "Unmount"}
-              </button>
-
               <span className={`status-pill ${ssdAvailable ? "info" : "high"}`}>
                 {ssdAvailable ? "Available" : "Unavailable"}
               </span>
@@ -422,16 +380,6 @@ export default function Home() {
 
           <div className="sc-card-body home-card-body">
             <FaultLog variant="recent" limit={5} />
-          </div>
-
-          <div className="home-faults-footer">
-            <button
-              className="home-link-btn"
-              onClick={() => navigate("/fault-log")}
-              type="button"
-            >
-              View all faults
-            </button>
           </div>
         </section>
       </div>
