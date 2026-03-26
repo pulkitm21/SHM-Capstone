@@ -118,6 +118,11 @@ FILE_FORMAT_VERSION = 2
 MAX_DELTA_S = 60.0
 INT16_MAX = 32767
 
+# Deadband threshold for value deltas. If |Δ| <= threshold, the value delta is
+# omitted from the delta record (stored as null / unchanged). Units are the
+# encoder's scaled integer counts, not engineering units.
+DELTA_NULL_THRESHOLD = 1
+
 TS_MIN = 1_577_836_800.0   # 2020-01-01
 TS_MAX = 4_102_444_800.0   # 2100-01-01
 _clock_warn_interval = 10.0
@@ -282,6 +287,11 @@ def _pack_delta(value: int) -> bytes:
     return struct.pack("<h", max(-32768, min(32767, value)))
 
 
+def _apply_null_threshold(delta: int, threshold: int = DELTA_NULL_THRESHOLD) -> int:
+    """Return 0 when |delta| is within the configured deadband threshold."""
+    return 0 if abs(delta) <= threshold else delta
+
+
 # -------------------------------------------------------------------
 # ABSOLUTE record encoder
 # -------------------------------------------------------------------
@@ -349,7 +359,9 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
             xi = int(float(s[1]) * ACCEL_SCALE)
             yi = int(float(s[2]) * ACCEL_SCALE)
             zi = int(float(s[3]) * ACCEL_SCALE)
-            dx, dy, dz = xi - prev[0], yi - prev[1], zi - prev[2]
+            dx = _apply_null_threshold(xi - prev[0])
+            dy = _apply_null_threshold(yi - prev[1])
+            dz = _apply_null_threshold(zi - prev[2])
 
             ts_us_new = int(float(s[0]) * TS_SCALE)
             delta_us = ts_us_new - ss["ts_us"]
@@ -375,7 +387,7 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
                 body += _pack_delta(dz)
 
             ss["ts_us"] = ts_us_new
-            prev = [xi, yi, zi]
+            prev = [prev[0] + dx, prev[1] + dy, prev[2] + dz]
 
         state["accel"]["xyz_prev"] = prev
 
@@ -387,7 +399,9 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
         pi = int(float(iv[2]) * INCLIN_SCALE)
         yi = int(float(iv[3]) * INCLIN_SCALE)
         prev = ss["xyz_prev"]
-        dr, dp, dy = ri - prev[0], pi - prev[1], yi - prev[2]
+        dr = _apply_null_threshold(ri - prev[0])
+        dp = _apply_null_threshold(pi - prev[1])
+        dy = _apply_null_threshold(yi - prev[2])
 
         ts_us_new = int(float(iv[0]) * TS_SCALE)
         delta_us = ts_us_new - ss["ts_us"]
@@ -413,7 +427,7 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
             body += _pack_delta(dy)
 
         ss["ts_us"] = ts_us_new
-        ss["xyz_prev"] = [ri, pi, yi]
+        ss["xyz_prev"] = [prev[0] + dr, prev[1] + dp, prev[2] + dy]
 
     if "T" in data:
         tv = data["T"]
@@ -421,9 +435,9 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
         vi = int(float(tv[1]) * TEMP_SCALE)
         ts_us_new = int(float(tv[0]) * TS_SCALE)
         delta_us = ts_us_new - ss["ts_us"]
-        dt = vi - ss["val_prev"]
+        dt = _apply_null_threshold(vi - ss["val_prev"])
 
-        is_frozen = (ts_us_new == ss["ts_us"] and vi == ss["val_prev"])
+        is_frozen = (ts_us_new == ss["ts_us"] and dt == 0)
         ss["ts_us"] = ts_us_new
 
         if not is_frozen:
@@ -440,7 +454,7 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
             if changed & 0x02:
                 body += _pack_delta(dt)
 
-            ss["val_prev"] = vi
+            ss["val_prev"] = ss["val_prev"] + dt
 
     return struct.pack("<B", header) + bytes(body)
 

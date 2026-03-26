@@ -177,7 +177,7 @@ def _decode_accel_delta(f, state):
             ss["ts_us"] = ts_us
         else:
             ts_us = ss["ts_us"]
-        # Values — keep prev if bit not set (null delta)
+        # Values — keep prev if bit not set (null delta / |Δ| <= deadband threshold)
         (dx,) = read_fmt(f, "<h", "accel dx") if changed & 0x02 else ((0,),)[0]
         (dy,) = read_fmt(f, "<h", "accel dy") if changed & 0x04 else ((0,),)[0]
         (dz,) = read_fmt(f, "<h", "accel dz") if changed & 0x08 else ((0,),)[0]

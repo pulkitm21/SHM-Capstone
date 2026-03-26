@@ -380,9 +380,9 @@ def pass2_delta_trace(filepath, focus_record=None):
                             dz = read_fmt(f, "<h", f"accel[{i}] dz")[0] if changed & 0x08 else 0
                             cur = [prev[0]+dx, prev[1]+dy, prev[2]+dz]
                             if show:
-                                dx_s = str(dx) if changed & 0x02 else "null"
-                                dy_s = str(dy) if changed & 0x04 else "null"
-                                dz_s = str(dz) if changed & 0x08 else "null"
+                                dx_s = str(dx) if changed & 0x02 else "null(|Δ|<=1 or unchanged)"
+                                dy_s = str(dy) if changed & 0x04 else "null(|Δ|<=1 or unchanged)"
+                                dz_s = str(dz) if changed & 0x08 else "null(|Δ|<=1 or unchanged)"
                                 print(f"    accel[{i}] changed=0x{changed:02X}  Δ=({dx_s},{dy_s},{dz_s})  "
                                       f"prev={[fmt_a(v) for v in prev]}  "
                                       f"→ now={[fmt_a(v) for v in cur]} g")
@@ -430,7 +430,7 @@ def pass2_delta_trace(filepath, focus_record=None):
                             dt  = None
                             cur = prev
                         if show:
-                            dt_s = f"{dt} ({dt/TEMP_SCALE:+.2f} °C)" if dt is not None else "null"
+                            dt_s = f"{dt} ({dt/TEMP_SCALE:+.2f} °C)" if dt is not None else "null(|Δ|<=1 or unchanged)"
                             print(f"    temp changed=0x{changed:02X}  Δ={dt_s}  "
                                   f"prev={fmt_t(prev)}  → now={fmt_t(cur)} °C")
 
