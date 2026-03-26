@@ -15,6 +15,7 @@ const navItems: NavItem[] = [
   { id: "sensor-management", label: "Sensor Management", icon: "🛠️", to: "/sensor-management" },
   { id: "fault-log", label: "Fault Log", icon: "⚠️", to: "/fault-log" },
   { id: "export", label: "Export", icon: "💾", to: "/export" },
+  { id: "decoder", label: "Decoder", icon: "D", to: "/decoder" },
 ];
 
 const DEFAULT_DASHBOARD_TITLE = "Cape Scott, BC";
