@@ -76,6 +76,17 @@
   font-weight: 700;
 }
 
+
+.decoder-format-note {
+  border: 1px solid #d9e1e8;
+  border-radius: 14px;
+  padding: 12px 14px;
+  background: #f8fbfd;
+  color: #435767;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
 .decoder-upload-panel {
   display: flex;
   flex-direction: column;

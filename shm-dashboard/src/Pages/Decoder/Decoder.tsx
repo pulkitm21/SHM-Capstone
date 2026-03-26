@@ -130,11 +130,6 @@ export default function DecoderPage() {
       <section className="decoder-hero">
         <div>
           <h1 className="decoder-title">Decoder</h1>
-          <p className="decoder-subtitle">
-            Decode raw sensor exports on the user device. This page accepts individual .bin files,
-            .bin.gz files, or a raw export ZIP and converts supported inputs into per-sensor CSV
-            outputs without using the Pi backend.
-          </p>
         </div>
       </section>
 
@@ -142,12 +137,13 @@ export default function DecoderPage() {
         <div className="decoder-card-header">
           <div>
             <h2>Input Files</h2>
-            <p>
-              Add raw files individually or load an exported ZIP archive. The page expands ZIP
-              contents locally in the browser and queues supported raw file members for decoding.
-            </p>
           </div>
           <div className="decoder-card-badge">Local</div>
+        </div>
+
+        <div className="decoder-format-note">
+          Expected format: version byte + absolute/delta records using the same sensor layout as
+          the Python decoder.
         </div>
 
         <div className="decoder-upload-panel">
@@ -244,10 +240,6 @@ export default function DecoderPage() {
         <div className="decoder-card-header">
           <div>
             <h2>Progress</h2>
-            <p>
-              Files are processed one at a time in the browser to keep memory usage more stable on
-              the user device during large batches.
-            </p>
           </div>
         </div>
 
