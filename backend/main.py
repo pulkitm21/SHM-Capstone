@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Query, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 import asyncio
@@ -11,6 +11,8 @@ import sqlite3
 import shutil
 import os
 from pathlib import Path
+from collections import deque
+import subprocess
 
 import mqtt_listener
 from mqtt_listener import start_listener
@@ -33,11 +35,18 @@ from node_registry import list_nodes, get_node_by_id, update_node_position
 from mqtt_commands import publish_accelerometer_config, publish_node_control
 
 from export_routes import router as export_router
-
-import subprocess
-
 from export_utils import find_sensor_files_for_serial
 from sensor_export_decoder import iter_decoded_records_for_export
+
+from server_management import (
+    get_server_network_payload,
+    get_server_status_payload,
+    prune_sensor_data,
+    reboot_server as reboot_server_action,
+    renew_vpn_certificate as renew_vpn_certificate_action,
+    restart_backend_service as restart_backend_service_action,
+    restart_mqtt_service as restart_mqtt_service_action,
+)
 
 app = FastAPI()
 
@@ -71,6 +80,10 @@ INCL_SIZE = struct.calcsize(INCL_FORMAT)
 TEMP_FORMAT = "<df"
 TEMP_SIZE = struct.calcsize(TEMP_FORMAT)
 
+# Sensor status values returned to the frontend.
+SENSOR_STATUS_WINDOW_SECONDS = 120
+SENSOR_KEYS = ("accelerometer", "inclinometer", "temperature")
+
 
 class NodePositionUpdate(BaseModel):
     x: float = Field(..., ge=0.0, le=1.0)
@@ -89,6 +102,10 @@ class NodeControlRequest(BaseModel):
 
 class SiteNameUpdate(BaseModel):
     site_name: str = Field(..., min_length=1, max_length=60)
+
+
+class PruneStoredDataRequest(BaseModel):
+    older_than_days: int = Field(..., ge=1)
 
 
 def _iso_from_epoch_seconds(ts: float) -> str:
@@ -302,6 +319,187 @@ def read_temperature_points(
     return points[-limit:]
 
 
+def _active_sensor_faults_for_serial(serial: str) -> dict[str, list[dict[str, Any]]]:
+    """
+    Return active unresolved sensor faults grouped by sensor type for one node serial.
+    Only accelerometer / inclinometer / temperature faults are included.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {
+        "accelerometer": [],
+        "inclinometer": [],
+        "temperature": [],
+    }
+
+    if not is_ssd_available() or not FAULTS_DB.exists():
+        return grouped
+
+    con: Optional[sqlite3.Connection] = None
+
+    try:
+        con = sqlite3.connect(str(FAULTS_DB))
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+
+        cur.execute(
+            """
+            SELECT id, serial_number, sensor_type, fault_type, severity, fault_status, description, ts
+            FROM faults
+            WHERE serial_number = ?
+              AND LOWER(fault_status) != 'resolved'
+              AND LOWER(sensor_type) IN ('accelerometer', 'inclinometer', 'temperature')
+            ORDER BY ts DESC
+            """,
+            [serial],
+        )
+
+        for row in cur.fetchall():
+            item = dict(row)
+            sensor_type = str(item.get("sensor_type", "")).lower().strip()
+            if sensor_type in grouped:
+                grouped[sensor_type].append(item)
+
+        return grouped
+
+    except sqlite3.Error:
+        return grouped
+
+    finally:
+        if con is not None:
+            con.close()
+
+
+def _recent_sensor_data_presence(
+    serial: str,
+    window_seconds: int = SENSOR_STATUS_WINDOW_SECONDS,
+) -> dict[str, dict[str, Any]]:
+    """
+    Inspect recent decoded files and determine whether each sensor has fresh data.
+    This is used only for sensor status and is intentionally lightweight.
+    """
+    now_dt = datetime.now(timezone.utc)
+    start_dt = now_dt - timedelta(seconds=window_seconds)
+
+    start_ts = start_dt.timestamp()
+    end_ts = now_dt.timestamp()
+
+    status = {
+        "accelerometer": {"has_data": False, "last_ts": None},
+        "inclinometer": {"has_data": False, "last_ts": None},
+        "temperature": {"has_data": False, "last_ts": None},
+    }
+
+    if not is_ssd_available():
+        return status
+
+    files = find_sensor_files_for_serial(
+        serial=serial,
+        start_iso=start_dt.isoformat(),
+        end_exclusive_iso=now_dt.isoformat(),
+    )
+
+    for sensor_file in files:
+        for rec in iter_decoded_records_for_export(str(sensor_file)):
+            accel_samples = rec.get("accel_samples")
+            if accel_samples:
+                for ts, *_rest in accel_samples:
+                    if start_ts <= ts < end_ts:
+                        status["accelerometer"]["has_data"] = True
+                        status["accelerometer"]["last_ts"] = _iso_from_epoch_seconds(ts)
+
+            inclin = rec.get("inclin")
+            if inclin:
+                ts = inclin[0]
+                if start_ts <= ts < end_ts:
+                    status["inclinometer"]["has_data"] = True
+                    status["inclinometer"]["last_ts"] = _iso_from_epoch_seconds(ts)
+
+            temp = rec.get("temp")
+            if temp:
+                ts = temp[0]
+                if start_ts <= ts < end_ts:
+                    status["temperature"]["has_data"] = True
+                    status["temperature"]["last_ts"] = _iso_from_epoch_seconds(ts)
+
+            # Stop early once all three sensors have been seen recently.
+            if all(status[key]["has_data"] for key in SENSOR_KEYS):
+                return status
+
+    return status
+
+
+def _sensor_health_state(
+    *,
+    node_online: bool,
+    has_data: bool,
+    active_faults: list[dict[str, Any]],
+) -> str:
+    """
+    Sensor health priority:
+    1. node offline -> offline
+    2. active fault -> warning
+    3. no recent data -> offline
+    4. otherwise -> online
+    """
+    if not node_online:
+        return "offline"
+
+    if active_faults:
+        return "warning"
+
+    if not has_data:
+        return "offline"
+
+    return "online"
+
+
+def build_node_sensor_status(
+    node_id: int,
+    window_seconds: int = SENSOR_STATUS_WINDOW_SECONDS,
+) -> Dict[str, Any]:
+    """
+    Build per-sensor health for one node.
+    """
+    node = get_node_by_id(node_id, timeout_seconds=60)
+    if node is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    serial = str(node.get("serial") or "").strip()
+    if not serial:
+        raise HTTPException(status_code=400, detail="Node has no serial number")
+
+    node_online = bool(node.get("online"))
+    fault_groups = _active_sensor_faults_for_serial(serial)
+    data_presence = _recent_sensor_data_presence(serial, window_seconds=window_seconds)
+
+    sensors: dict[str, Any] = {}
+
+    for sensor_name in SENSOR_KEYS:
+        active_faults = fault_groups.get(sensor_name, [])
+        has_data = bool(data_presence.get(sensor_name, {}).get("has_data"))
+        last_ts = data_presence.get(sensor_name, {}).get("last_ts")
+
+        sensors[sensor_name] = {
+            "status": _sensor_health_state(
+                node_online=node_online,
+                has_data=has_data,
+                active_faults=active_faults,
+            ),
+            "has_data": has_data,
+            "last_data_ts": last_ts,
+            "active_fault_count": len(active_faults),
+            "active_faults": active_faults[:5],
+        }
+
+    return {
+        "node_id": node["node_id"],
+        "serial": serial,
+        "node_online": node_online,
+        "window_seconds": window_seconds,
+        "sensors": sensors,
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @app.get("/")
 def root():
     return {"message": "backend working"}
@@ -418,6 +616,102 @@ def unmount_storage():
     }
 
 
+@app.get("/api/server/status")
+def get_server_status():
+    """
+    Detailed Pi/server status for the Server Management page.
+    """
+    return get_server_status_payload(get_system_health())
+
+
+@app.get("/api/server/network")
+def get_server_network():
+    """
+    Connectivity details for VPN reachability and certificate health.
+    """
+    return get_server_network_payload()
+
+
+@app.post("/api/server/restart-backend")
+def restart_backend_service():
+    """
+    Restart the backend service running on the Raspberry Pi.
+    """
+    try:
+        return restart_backend_service_action()
+    except subprocess.CalledProcessError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to restart backend service: {exc.stderr or exc.stdout or exc}",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/server/restart-mqtt")
+def restart_mqtt_service():
+    """
+    Restart the MQTT broker service on the Raspberry Pi.
+    """
+    try:
+        return restart_mqtt_service_action()
+    except subprocess.CalledProcessError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to restart MQTT service: {exc.stderr or exc.stdout or exc}",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/server/reboot")
+def reboot_server():
+    """
+    Reboot the Raspberry Pi.
+    """
+    try:
+        return reboot_server_action()
+    except subprocess.CalledProcessError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to reboot server: {exc.stderr or exc.stdout or exc}",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/server/renew-vpn-certificate")
+def renew_vpn_certificate():
+    """
+    Run the configured VPN certificate renewal command.
+    """
+    try:
+        return renew_vpn_certificate_action()
+    except subprocess.CalledProcessError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to renew VPN certificate: {exc.stderr or exc.stdout or exc}",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/server/prune-data")
+def prune_data(payload: PruneStoredDataRequest):
+    """
+    Delete raw sensor data files older than the requested retention window.
+    """
+    try:
+        return prune_sensor_data(payload.older_than_days)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to prune stored data: {exc}",
+        ) from exc
+
+
 @app.get("/api/nodes")
 def get_nodes():
     return {"nodes": list_nodes(timeout_seconds=60)}
@@ -429,6 +723,17 @@ def get_node(node_id: int):
     if node is None:
         raise HTTPException(status_code=404, detail="Node not found")
     return {"node": node}
+
+
+@app.get("/api/nodes/{node_id}/sensor-status")
+def get_node_sensor_status(
+    node_id: int,
+    window_seconds: int = Query(default=SENSOR_STATUS_WINDOW_SECONDS, ge=30, le=3600),
+):
+    """
+    Return per-sensor health for one node using recent data presence + active faults.
+    """
+    return build_node_sensor_status(node_id=node_id, window_seconds=window_seconds)
 
 
 @app.put("/api/nodes/{node_id}/position")
@@ -564,28 +869,14 @@ def apply_accelerometer_config(node_id: int, payload: AccelerometerConfigApplyRe
 
     ensure_node_defaults(node_id)
 
-    # Old ACK/SEQ flow disabled:
-    # seq = int(datetime.now(timezone.utc).timestamp() * 1000)
-    #
-    # updated = update_accelerometer_config_request(
-    #     node_id=node_id,
-    #     odr_index=payload.odr_index,
-    #     range_value=payload.range,
-    #     hpf_corner=payload.hpf_corner,
-    #     seq=seq,
-    # )
-
     try:
         publish_accelerometer_config(
             serial=node["serial"],
             odr_index=payload.odr_index,
             range_value=payload.range,
             hpf_corner=payload.hpf_corner,
-            # seq=seq,
         )
     except Exception as exc:
-        # Old ACK/SEQ failure tracking disabled
-        # mark_accelerometer_config_failed(node_id)
         raise HTTPException(
             status_code=503,
             detail=f"Failed to publish configure command: {exc}",
@@ -601,7 +892,6 @@ def apply_accelerometer_config(node_id: int, payload: AccelerometerConfigApplyRe
             "range": payload.range,
             "hpf_corner": payload.hpf_corner,
         },
-        # no ACK-based applied/pending state yet.
         "status": "accepted",
     }
 
@@ -615,37 +905,12 @@ def control_node(node_id: int, payload: NodeControlRequest):
 
     ensure_node_defaults(node_id)
 
-    # Old ACK/SEQ flow disabled for:
-    # seq = int(datetime.now(timezone.utc).timestamp() * 1000)
-    #
-    # try:
-    #     control_cfg = update_node_control_request(
-    #         node_id=node_id,
-    #         cmd=payload.cmd,
-    #         seq=seq,
-    #     )
-    # except Exception as exc:
-    #     raise HTTPException(
-    #         status_code=500,
-    #         detail=f"Failed to store pending control request: {exc}",
-    #     )
-
     try:
         publish_node_control(
             serial=node["serial"],
             cmd=payload.cmd,
-            # seq=seq,
         )
     except Exception as exc:
-        # Old ACK/SEQ failure tracking disabled
-        # try:
-        #     mark_node_control_failed(
-        #         node_id=node_id,
-        #         error_msg=f"MQTT publish failed: {exc}",
-        #     )
-        # except Exception:
-        #     pass
-
         raise HTTPException(
             status_code=503,
             detail=f"Failed to publish control command: {exc}",
@@ -971,12 +1236,6 @@ def api_temperature(
         "points": pts,
     }
 
-from collections import deque
-from datetime import datetime, timezone, timedelta
-
-def _iso_from_epoch_seconds(ts: float) -> str:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
 
 def _get_plot_node_serial(node_id: int) -> str:
     node = get_node_by_id(node_id, timeout_seconds=300)
@@ -1000,14 +1259,6 @@ def _plot_time_window(minutes: int) -> tuple[float, float, str, str]:
         start_dt.isoformat(),
         end_dt.isoformat(),
     )
-
-
-def _target_plot_points(sensor_name: str) -> int:
-    if sensor_name == "accelerometer":
-        return 1200
-    if sensor_name == "inclinometer":
-        return 1200
-    return 2000
 
 
 def _min_spacing_seconds(minutes: int, target_points: int) -> float:
@@ -1085,6 +1336,7 @@ def read_inclinometer_points(node_id: int, minutes: int, limit: int = 1200):
             if ts < start_ts or ts >= end_ts:
                 continue
 
+            # Keep plotting density bounded for long time windows.
             if last_kept_ts is not None and (ts - last_kept_ts) < min_spacing:
                 continue
 

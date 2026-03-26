@@ -165,7 +165,9 @@ export type SystemActionResponse = {
   ok: boolean;
   action: string;
   status: string;
-  time: string;
+  time?: string;
+  message?: string;
+  detail?: string;
 };
 
 export function getHealth(signal?: AbortSignal) {
@@ -519,4 +521,122 @@ export async function downloadSensorExport(
   qs.set("end_day", params.end_day);
 
   await downloadFromEndpoint(`/api/exports/sensor-data?${qs.toString()}`, signal);
+}
+
+export type ServerStatusResponse = {
+  backend_status?: "OK" | "DEGRADED" | "OFFLINE";
+  mqtt_connected?: boolean;
+  fault_db_available?: boolean;
+  ssd_available?: boolean;
+  uptime_seconds?: number;
+  last_boot?: string;
+  time?: string;
+  [key: string]: unknown;
+};
+
+export type ServerNetworkResponse = {
+  vpn_connected?: boolean;
+  vpn_cert_expires_at?: string;
+  internet_reachable?: boolean;
+  [key: string]: unknown;
+};
+
+export type ServerActionResponse = {
+  ok: boolean;
+  action: string;
+  status: string;
+  time?: string;
+  message?: string;
+  detail?: string;
+  [key: string]: unknown;
+};
+
+export type PruneStoredDataBody = {
+  older_than_days: number;
+};
+
+export type SensorHealthStatus = "online" | "offline" | "warning";
+
+export type SensorHealthDetail = {
+  status: SensorHealthStatus;
+  has_data: boolean;
+  last_data_ts?: string | null;
+  active_fault_count: number;
+  active_faults: FaultRow[];
+};
+
+export type NodeSensorStatusResponse = {
+  node_id: number;
+  serial: string;
+  node_online: boolean;
+  window_seconds: number;
+  time: string;
+  sensors: {
+    accelerometer: SensorHealthDetail;
+    inclinometer: SensorHealthDetail;
+    temperature: SensorHealthDetail;
+  };
+};
+
+export function getServerStatus(signal?: AbortSignal) {
+  return request<ServerStatusResponse>("/api/server/status", { signal });
+}
+
+export function getServerNetwork(signal?: AbortSignal) {
+  return request<ServerNetworkResponse>("/api/server/network", { signal });
+}
+
+export function rebootServer(signal?: AbortSignal) {
+  return request<ServerActionResponse>("/api/server/reboot", {
+    method: "POST",
+    signal,
+  });
+}
+
+export function restartBackendService(signal?: AbortSignal) {
+  return request<ServerActionResponse>("/api/server/restart-backend", {
+    method: "POST",
+    signal,
+  });
+}
+
+export function restartMqttService(signal?: AbortSignal) {
+  return request<ServerActionResponse>("/api/server/restart-mqtt", {
+    method: "POST",
+    signal,
+  });
+}
+
+export function renewVpnCertificate(signal?: AbortSignal) {
+  return request<ServerActionResponse>("/api/server/renew-vpn-certificate", {
+    method: "POST",
+    signal,
+  });
+}
+
+export function pruneStoredData(
+  body: PruneStoredDataBody,
+  signal?: AbortSignal
+) {
+  return request<ServerActionResponse>("/api/server/prune-data", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+}
+
+// Fetch per-sensor health for the selected node.
+export function getNodeSensorStatus(
+  nodeId: number,
+  windowSeconds = 120,
+  signal?: AbortSignal
+) {
+  const qs = new URLSearchParams();
+  qs.set("window_seconds", String(windowSeconds));
+
+  return request<NodeSensorStatusResponse>(
+    `/api/nodes/${nodeId}/sensor-status?${qs.toString()}`,
+    { signal }
+  );
 }
