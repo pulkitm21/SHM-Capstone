@@ -13,9 +13,6 @@ if not NODES_JSON.exists():
 
 TOPIC_PREFIX = "wind_turbine"
 
-# TESTCODE: Temporary node used for frontend and backend testing.
-TEST_SERIAL = "TEST123"
-
 # Node map X/Y boundaries used by the frontend node map.
 MIN_X = 0.06
 MAX_X = 0.94
@@ -174,34 +171,6 @@ def _build_node_response(item: dict, timeout_seconds: int) -> dict:
     }
 
 
-# TESTCODE: Ensure a test node exists for development previews.
-def _ensure_test_node():
-    raw = _load_registry_raw()
-    nodes = raw["nodes"]
-
-    for item in nodes:
-        if item["serial"] == TEST_SERIAL:
-            ensure_node_defaults(item["node_id"])
-            return
-
-    now_iso = _now_iso()
-    next_node_id = max((item["node_id"] for item in nodes), default=0) + 1
-    default_x, default_y = _default_position(next_node_id)
-
-    new_item = {
-        "node_id": next_node_id,
-        "serial": TEST_SERIAL,
-        "first_seen": now_iso,
-        "last_seen": now_iso,
-        "x": default_x,
-        "y": default_y,
-    }
-
-    nodes.append(new_item)
-    _save_registry_raw({"nodes": sorted(nodes, key=lambda item: item["node_id"])})
-    ensure_node_defaults(next_node_id)
-
-
 # Return all nodes in a frontend-ready format.
 def list_nodes(timeout_seconds: int = 60):
     raw = _load_registry_raw()
@@ -297,7 +266,3 @@ def serial_from_topic(topic: str) -> str:
         raise ValueError(f"Missing serial in topic: {topic}")
 
     return serial
-
-
-# TESTCODE: Add the temporary test node during development.
-_ensure_test_node()
