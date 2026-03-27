@@ -13,9 +13,10 @@ import os
 from pathlib import Path
 from collections import deque
 import subprocess
+import math
 
-import mqtt_listener
-from mqtt_listener import start_listener
+import backend.mqtt_listener_control as mqtt_listener_control
+from backend.mqtt_listener_control import start_listener
 
 from settings_schema import SettingsModel, to_dict, copy_deep
 
@@ -152,7 +153,7 @@ def is_ssd_available() -> bool:
 # Build one lightweight backend health snapshot for REST and SSE.
 def get_system_health() -> Dict[str, Any]:
     ssd_status = get_ssd_mount_status()
-    mqtt_ok = bool(mqtt_listener.MQTT_CONNECTED)
+    mqtt_ok = bool(mqtt_listener_control.MQTT_CONNECTED)
     ssd_ok = bool(ssd_status["available"])
     fault_db_ok = bool(ssd_ok and FAULTS_DB.exists())
 
@@ -373,8 +374,13 @@ def _recent_sensor_data_presence(
     window_seconds: int = SENSOR_STATUS_WINDOW_SECONDS,
 ) -> dict[str, dict[str, Any]]:
     """
-    Inspect recent decoded files and determine whether each sensor has fresh data.
-    This is used only for sensor status and is intentionally lightweight.
+    Inspect recent decoded files and determine whether each sensor has fresh data,
+    whether that data is valid, and whether NaN values were observed.
+
+    Status meaning:
+    - no recent samples -> idle (if node online)
+    - recent NaN samples -> offline
+    - recent valid samples -> online
     """
     now_dt = datetime.now(timezone.utc)
     start_dt = now_dt - timedelta(seconds=window_seconds)
@@ -383,9 +389,24 @@ def _recent_sensor_data_presence(
     end_ts = now_dt.timestamp()
 
     status = {
-        "accelerometer": {"has_data": False, "last_ts": None},
-        "inclinometer": {"has_data": False, "last_ts": None},
-        "temperature": {"has_data": False, "last_ts": None},
+        "accelerometer": {
+            "has_data": False,
+            "has_valid_data": False,
+            "has_nan_data": False,
+            "last_ts": None,
+        },
+        "inclinometer": {
+            "has_data": False,
+            "has_valid_data": False,
+            "has_nan_data": False,
+            "last_ts": None,
+        },
+        "temperature": {
+            "has_data": False,
+            "has_valid_data": False,
+            "has_nan_data": False,
+            "last_ts": None,
+        },
     }
 
     if not is_ssd_available():
@@ -397,14 +418,24 @@ def _recent_sensor_data_presence(
         end_exclusive_iso=now_dt.isoformat(),
     )
 
+    def _is_valid_number(value: Any) -> bool:
+        if not isinstance(value, (int, float)):
+            return False
+        return not math.isnan(float(value))
+
     for sensor_file in files:
         for rec in iter_decoded_records_for_export(str(sensor_file)):
             accel_samples = rec.get("accel_samples")
             if accel_samples:
-                for ts, *_rest in accel_samples:
+                for ts, x, y, z in accel_samples:
                     if start_ts <= ts < end_ts:
                         status["accelerometer"]["has_data"] = True
                         status["accelerometer"]["last_ts"] = _iso_from_epoch_seconds(ts)
+
+                        if all(_is_valid_number(v) for v in (x, y, z)):
+                            status["accelerometer"]["has_valid_data"] = True
+                        else:
+                            status["accelerometer"]["has_nan_data"] = True
 
             inclin = rec.get("inclin")
             if inclin:
@@ -413,6 +444,12 @@ def _recent_sensor_data_presence(
                     status["inclinometer"]["has_data"] = True
                     status["inclinometer"]["last_ts"] = _iso_from_epoch_seconds(ts)
 
+                    values = inclin[1:]
+                    if values and all(_is_valid_number(v) for v in values):
+                        status["inclinometer"]["has_valid_data"] = True
+                    else:
+                        status["inclinometer"]["has_nan_data"] = True
+
             temp = rec.get("temp")
             if temp:
                 ts = temp[0]
@@ -420,8 +457,16 @@ def _recent_sensor_data_presence(
                     status["temperature"]["has_data"] = True
                     status["temperature"]["last_ts"] = _iso_from_epoch_seconds(ts)
 
-            # Stop early once all three sensors have been seen recently.
-            if all(status[key]["has_data"] for key in SENSOR_KEYS):
+                    value = temp[1] if len(temp) > 1 else None
+                    if _is_valid_number(value):
+                        status["temperature"]["has_valid_data"] = True
+                    else:
+                        status["temperature"]["has_nan_data"] = True
+
+            if all(
+                status[key]["has_valid_data"] or status[key]["has_nan_data"]
+                for key in SENSOR_KEYS
+            ):
                 return status
 
     return status
@@ -431,25 +476,35 @@ def _sensor_health_state(
     *,
     node_online: bool,
     has_data: bool,
+    has_valid_data: bool,
+    has_nan_data: bool,
     active_faults: list[dict[str, Any]],
 ) -> str:
     """
     Sensor health priority:
     1. node offline -> offline
-    2. active fault -> warning
-    3. no recent data -> offline
-    4. otherwise -> online
+    2. recent NaN data -> offline
+    3. active fault -> warning
+    4. node online but no recent data -> idle
+    5. recent valid data -> online
+    6. fallback -> offline
     """
     if not node_online:
+        return "offline"
+
+    if has_nan_data:
         return "offline"
 
     if active_faults:
         return "warning"
 
     if not has_data:
-        return "offline"
+        return "idle"
 
-    return "online"
+    if has_valid_data:
+        return "online"
+
+    return "offline"
 
 
 def build_node_sensor_status(
@@ -475,16 +530,23 @@ def build_node_sensor_status(
 
     for sensor_name in SENSOR_KEYS:
         active_faults = fault_groups.get(sensor_name, [])
-        has_data = bool(data_presence.get(sensor_name, {}).get("has_data"))
-        last_ts = data_presence.get(sensor_name, {}).get("last_ts")
+        sensor_presence = data_presence.get(sensor_name, {})
+        has_data = bool(sensor_presence.get("has_data"))
+        has_valid_data = bool(sensor_presence.get("has_valid_data"))
+        has_nan_data = bool(sensor_presence.get("has_nan_data"))
+        last_ts = sensor_presence.get("last_ts")
 
         sensors[sensor_name] = {
             "status": _sensor_health_state(
                 node_online=node_online,
                 has_data=has_data,
+                has_valid_data=has_valid_data,
+                has_nan_data=has_nan_data,
                 active_faults=active_faults,
             ),
             "has_data": has_data,
+            "has_valid_data": has_valid_data,
+            "has_nan_data": has_nan_data,
             "last_data_ts": last_ts,
             "active_fault_count": len(active_faults),
             "active_faults": active_faults[:5],
@@ -1109,8 +1171,6 @@ def read_fault_rows(
         )
         rows = [dict(r) for r in cur.fetchall()]
 
-        # Filter dropdowns are read from SQLite so the frontend does not need
-        # to scan a large in-memory dataset just to build filter choices.
         filter_options = _get_fault_filter_options(con=con, serial_number=serial_number)
 
         return {
@@ -1182,7 +1242,6 @@ async def fault_events(
                 await asyncio.sleep(5)
 
         except asyncio.CancelledError:
-            # Expected when the client disconnects or the backend shuts down.
             return
 
     return StreamingResponse(
@@ -1336,7 +1395,6 @@ def read_inclinometer_points(node_id: int, minutes: int, limit: int = 1200):
             if ts < start_ts or ts >= end_ts:
                 continue
 
-            # Keep plotting density bounded for long time windows.
             if last_kept_ts is not None and (ts - last_kept_ts) < min_spacing:
                 continue
 
