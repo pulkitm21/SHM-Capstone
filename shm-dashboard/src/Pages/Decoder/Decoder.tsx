@@ -141,10 +141,6 @@ export default function DecoderPage() {
           <div className="decoder-card-badge">Local</div>
         </div>
 
-        <div className="decoder-format-note">
-          Expected format: versioned binary records matching the updated Python decoder, including v1, v2, and v3 files with per-sensor timestamps, bursts, and NaN handling.
-        </div>
-
         <div className="decoder-upload-panel">
           <input
             ref={fileInputRef}
