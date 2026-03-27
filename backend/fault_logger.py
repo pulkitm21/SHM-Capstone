@@ -23,35 +23,39 @@ def log_fault_events(
         print("[fault_logger] SSD not mounted. Skipping fault log.")
         return
 
+    conn = None
     try:
-        with sqlite3.connect(FAULT_DB_PATH) as conn:
-            for code, ts in unique_events:
-                f = get_fault_definition(code)
+        conn = sqlite3.connect(FAULT_DB_PATH)
+        for code, ts in unique_events:
+            f = get_fault_definition(code)
 
-                conn.execute(
-                    """
-                    INSERT INTO faults (
-                        serial_number,
-                        sensor_type,
-                        fault_type,
-                        severity,
-                        fault_status,
-                        description,
-                        ts
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        serial_number,
-                        f.sensor_type,
-                        f.fault_type,
-                        f.severity,
-                        f.fault_status,
-                        f.description,
-                        ts,
-                    ),
+            conn.execute(
+                """
+                INSERT INTO faults (
+                    serial_number,
+                    sensor_type,
+                    fault_type,
+                    severity,
+                    fault_status,
+                    description,
+                    ts
                 )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    serial_number,
+                    f.sensor_type,
+                    f.fault_type,
+                    f.severity,
+                    f.fault_status,
+                    f.description,
+                    ts,
+                ),
+            )
 
-            conn.commit()
+        conn.commit()
     except Exception as e:
         print(f"[fault_logger] Failed to write fault log: {e}")
+    finally:
+        if conn is not None:
+            conn.close()
