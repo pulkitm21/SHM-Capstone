@@ -142,8 +142,7 @@ export default function DecoderPage() {
         </div>
 
         <div className="decoder-format-note">
-          Expected format: version byte + absolute/delta records using the same sensor layout as
-          the Python decoder.
+          Expected format: versioned binary records matching the updated Python decoder, including v1, v2, and v3 files with per-sensor timestamps, bursts, and NaN handling.
         </div>
 
         <div className="decoder-upload-panel">

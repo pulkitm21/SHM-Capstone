@@ -61,7 +61,7 @@ function formatUptime(totalSeconds: unknown) {
   return parts.join(" ");
 }
 
-type BackendHealthBadgeState = "OK" | "DEGRADED" | "OFFLINE";
+type BackendHealthBadgeState = "OK" | "OFFLINE";
 
 function getBackendStateFromSources(
   serverStatus: ServerStatusResponse | null,
@@ -72,19 +72,16 @@ function getBackendStateFromSources(
   ).toUpperCase();
 
   if (statusValue === "OK") return "OK";
-  if (statusValue === "DEGRADED") return "DEGRADED";
   return "OFFLINE";
 }
 
 function getPillClass(state: BackendHealthBadgeState) {
   if (state === "OK") return "server-pill ok";
-  if (state === "DEGRADED") return "server-pill warning";
   return "server-pill danger";
 }
 
 function getPillLabel(state: BackendHealthBadgeState) {
   if (state === "OK") return "Online";
-  if (state === "DEGRADED") return "Degraded";
   return "Offline";
 }
 

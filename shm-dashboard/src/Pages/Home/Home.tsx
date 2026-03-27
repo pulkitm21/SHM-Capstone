@@ -21,18 +21,14 @@ function isActiveFault(fault: FaultRow) {
   return String(fault.fault_status ?? "").toLowerCase() !== "resolved";
 }
 
-type BackendHealthBadgeState = "OK" | "DEGRADED" | "OFFLINE";
+type BackendHealthBadgeState = "ONLINE" | "OFFLINE";
 
 function getBackendPillClass(state: BackendHealthBadgeState) {
-  if (state === "OK") return "info";
-  if (state === "DEGRADED") return "warning";
-  return "high";
+  return state === "ONLINE" ? "info" : "high";
 }
 
 function getBackendBadgeLabel(state: BackendHealthBadgeState) {
-  if (state === "OK") return "Online";
-  if (state === "DEGRADED") return "Degraded";
-  return "Offline";
+  return state === "ONLINE" ? "Online" : "Offline";
 }
 
 function formatSubsystemHealth(value: boolean) {
@@ -42,10 +38,6 @@ function formatSubsystemHealth(value: boolean) {
 function getBackendWarningMessage(state: BackendHealthBadgeState) {
   if (state === "OFFLINE") {
     return "Backend unavailable. Live status, node updates, and storage data may be stale.";
-  }
-
-  if (state === "DEGRADED") {
-    return "Backend degraded. Some live services may be unavailable.";
   }
 
   return "";
@@ -78,8 +70,38 @@ export default function Home() {
     let mounted = true;
     let eventSource: EventSource | null = null;
     let reconnectTimeoutId: number | null = null;
+    let heartbeatTimeoutId: number | null = null;
+
+    function clearReconnectTimeout() {
+      if (reconnectTimeoutId !== null) {
+        window.clearTimeout(reconnectTimeoutId);
+        reconnectTimeoutId = null;
+      }
+    }
+
+    function clearHeartbeatTimeout() {
+      if (heartbeatTimeoutId !== null) {
+        window.clearTimeout(heartbeatTimeoutId);
+        heartbeatTimeoutId = null;
+      }
+    }
+
+    function resetHeartbeatTimeout() {
+      clearHeartbeatTimeout();
+
+      heartbeatTimeoutId = window.setTimeout(() => {
+        if (!mounted) return;
+
+        setBackendHealthState("OFFLINE");
+        setMqttHealthy(false);
+        setFaultDbHealthy(false);
+      }, 12000);
+    }
 
     function connectBackendStatusSSE() {
+      clearReconnectTimeout();
+      eventSource?.close();
+
       eventSource = new EventSource(
         `${import.meta.env.VITE_API_BASE_URL}/api/events/health`
       );
@@ -91,17 +113,19 @@ export default function Home() {
           const data: HealthResponse = JSON.parse(event.data);
           const receivedAt = new Date().toLocaleString();
 
-          setBackendHealthState(data.status === "OK" ? "OK" : "DEGRADED");
+          setBackendHealthState("ONLINE");
           setMqttHealthy(Boolean(data.mqtt));
           setFaultDbHealthy(Boolean(data.fault_db));
           setLastUpdate(receivedAt);
+          resetHeartbeatTimeout();
         } catch {
           const receivedAt = new Date().toLocaleString();
 
-          setBackendHealthState("DEGRADED");
+          setBackendHealthState("ONLINE");
           setMqttHealthy(false);
           setFaultDbHealthy(false);
           setLastUpdate(receivedAt);
+          resetHeartbeatTimeout();
         }
       };
 
@@ -112,6 +136,7 @@ export default function Home() {
         setMqttHealthy(false);
         setFaultDbHealthy(false);
 
+        clearHeartbeatTimeout();
         eventSource?.close();
 
         reconnectTimeoutId = window.setTimeout(() => {
@@ -208,11 +233,8 @@ export default function Home() {
     return () => {
       mounted = false;
       eventSource?.close();
-
-      if (reconnectTimeoutId !== null) {
-        window.clearTimeout(reconnectTimeoutId);
-      }
-
+      clearReconnectTimeout();
+      clearHeartbeatTimeout();
       window.clearInterval(id);
     };
   }, []);
@@ -223,7 +245,7 @@ export default function Home() {
   );
 
   const backendWarningMessage = getBackendWarningMessage(backendHealthState);
-  const showBackendWarning = backendHealthState !== "OK";
+  const showBackendWarning = backendHealthState === "OFFLINE";
 
   return (
     <div className="home-page">

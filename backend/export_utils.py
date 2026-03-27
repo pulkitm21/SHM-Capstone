@@ -60,6 +60,21 @@ def parse_day_string(value: str) -> date:
         raise ValueError(f"Invalid day value '{value}'. Expected YYYY-MM-DD.") from exc
 
 
+def parse_optional_hour_string(value: Optional[str], *, field_name: str) -> Optional[int]:
+    if value is None or str(value).strip() == "":
+        return None
+
+    try:
+        parsed = int(str(value).strip())
+    except ValueError as exc:
+        raise ValueError(f"Invalid {field_name} value '{value}'. Expected 00-23.") from exc
+
+    if parsed < 0 or parsed > 23:
+        raise ValueError(f"Invalid {field_name} value '{value}'. Expected 00-23.")
+
+    return parsed
+
+
 def day_start_iso(value: str) -> str:
     day = parse_day_string(value)
     dt = datetime.combine(day, time.min, tzinfo=timezone.utc)
@@ -99,6 +114,53 @@ def validate_required_day_range(
     if not start_iso or not end_exclusive_iso:
         raise ValueError("start_day and end_day are required.")
     return start_iso, end_exclusive_iso
+
+
+def validate_required_day_hour_range(
+    *,
+    start_day: Optional[str],
+    end_day: Optional[str],
+    start_hour: Optional[str],
+    end_hour: Optional[str],
+) -> tuple[str, str, Optional[int], Optional[int]]:
+    if bool(start_day) != bool(end_day):
+        raise ValueError("start_day and end_day must both be provided together.")
+
+    if not start_day or not end_day:
+        raise ValueError("start_day and end_day are required.")
+
+    start_date = parse_day_string(start_day)
+    end_date = parse_day_string(end_day)
+
+    if end_date < start_date:
+        raise ValueError("end_day cannot be earlier than start_day.")
+
+    parsed_start_hour = parse_optional_hour_string(start_hour, field_name="start_hour")
+    parsed_end_hour = parse_optional_hour_string(end_hour, field_name="end_hour")
+
+    if (parsed_start_hour is None) != (parsed_end_hour is None):
+        raise ValueError("start_hour and end_hour must both be provided together.")
+
+    if parsed_start_hour is None and parsed_end_hour is None:
+        start_dt = datetime.combine(start_date, time.min, tzinfo=timezone.utc)
+        end_dt = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=timezone.utc)
+        return start_dt.isoformat(), end_dt.isoformat(), None, None
+
+    start_dt = datetime.combine(
+        start_date,
+        time(hour=parsed_start_hour),
+        tzinfo=timezone.utc,
+    )
+    end_dt = datetime.combine(
+        end_date,
+        time(hour=parsed_end_hour),
+        tzinfo=timezone.utc,
+    ) + timedelta(hours=1)
+
+    if end_dt <= start_dt:
+        raise ValueError("End hour cannot be earlier than start hour for the selected range.")
+
+    return start_dt.isoformat(), end_dt.isoformat(), parsed_start_hour, parsed_end_hour
 
 
 def build_fault_export_where(
@@ -310,14 +372,31 @@ def find_sensor_files_for_serial(
     return matched
 
 
+def build_sensor_scope_filename_part(node_ids: list[int]) -> str:
+    if len(node_ids) == 1:
+        return f"node_{node_ids[0]}"
+    joined_ids = "-".join(str(node_id) for node_id in node_ids)
+    return f"nodes_{joined_ids}"
+
+
+def build_sensor_range_filename_part(day_value: str, hour_value: Optional[int]) -> str:
+    if hour_value is None:
+        return day_value
+    return f"{day_value}_{hour_value:02d}"
+
+
 def build_sensor_export_zip_filename(
     *,
     start_day: str,
     end_day: str,
-    node_count: int,
+    node_ids: list[int],
+    start_hour: Optional[int] = None,
+    end_hour: Optional[int] = None,
 ) -> str:
-    scope = "single_node" if node_count == 1 else f"{node_count}_nodes"
-    return f"sensor_export_raw_{scope}_{start_day}_to_{end_day}.zip"
+    scope = build_sensor_scope_filename_part(node_ids)
+    start_part = build_sensor_range_filename_part(start_day, start_hour)
+    end_part = build_sensor_range_filename_part(end_day, end_hour)
+    return f"{scope}_{start_part}_{end_part}.zip"
 
 
 def build_raw_sensor_export_metadata_text(
@@ -325,6 +404,8 @@ def build_raw_sensor_export_metadata_text(
     generated_at: str,
     start_day: str,
     end_day: str,
+    start_hour: Optional[int],
+    end_hour: Optional[int],
     nodes: list[dict[str, Any]],
     node_file_counts: dict[str, int],
     exported_files: dict[str, list[str]],
@@ -336,6 +417,8 @@ def build_raw_sensor_export_metadata_text(
     lines.append(f"generated_at_utc: {generated_at}")
     lines.append(f"start_day: {start_day}")
     lines.append(f"end_day: {end_day}")
+    lines.append(f"start_hour_utc: {'' if start_hour is None else f'{start_hour:02d}'}")
+    lines.append(f"end_hour_utc: {'' if end_hour is None else f'{end_hour:02d}'}")
     lines.append(f"node_count: {len(nodes)}")
     lines.append("")
 
@@ -361,7 +444,7 @@ def build_raw_sensor_export_metadata_text(
     lines.append("Notes")
     lines.append("-" * 5)
     lines.append("This export contains raw hourly backend storage files.")
-    lines.append("Files are copied as-is into this ZIP archive.")
+    lines.append("Files are copied into this ZIP archive with user-facing export names.")
     lines.append("Current hour files may appear as .bin.")
     lines.append("Finalized historical files may appear as .bin.gz.")
     lines.append("No decode or CSV conversion was performed by the backend.")
@@ -369,9 +452,34 @@ def build_raw_sensor_export_metadata_text(
     return "\n".join(lines) + "\n"
 
 
+def build_export_member_name(
+    *,
+    node_id: int,
+    bucket_day: str,
+    bucket_hour: str,
+    source_name: str,
+) -> str:
+    if source_name.endswith(".bin.gz"):
+        suffix = ".bin.gz"
+    else:
+        suffix = ".bin"
+    return f"node_{node_id}_{bucket_day}_{bucket_hour}{suffix}"
+
+
+def extract_sensor_bucket_from_filename(source_name: str) -> tuple[str, str]:
+    match = re.match(r"^data_.+_(\d{8})_(\d{2})\.bin(?:\.gz)?$", source_name)
+    if not match:
+        raise ValueError(f"Unrecognized sensor export source filename: {source_name}")
+
+    day_token = match.group(1)
+    hour_token = match.group(2)
+    bucket_day = f"{day_token[0:4]}-{day_token[4:6]}-{day_token[6:8]}"
+    return bucket_day, hour_token
+
+
 def stage_files_for_zip(
     export_dir: Path,
-    members: list[Path],
+    members: list[tuple[Path, str]],
 ) -> list[Path]:
     """
     Copy matching storage files into the temporary export directory before zipping.
@@ -379,8 +487,8 @@ def stage_files_for_zip(
     """
     staged_paths: list[Path] = []
 
-    for source_path in members:
-        destination = export_dir / source_path.name
+    for source_path, destination_name in members:
+        destination = export_dir / destination_name
         shutil.copy2(source_path, destination)
         staged_paths.append(destination)
 
