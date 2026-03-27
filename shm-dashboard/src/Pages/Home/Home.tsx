@@ -4,22 +4,17 @@ import { useNavigate } from "react-router-dom";
 import FaultLog from "../../components/FaultLog/Log";
 import NodeMap from "../../components/NodeMap/NodeMap";
 import {
-  getFaults,
+  getFaultSummary,
   getNodes,
   getStorage,
   getStorageStatus,
   type HealthResponse,
-  type FaultRow,
   type NodeRecord,
   type StorageResponse,
   type StorageStatusResponse,
 } from "../../services/api";
 
 import "./Home.css";
-
-function isActiveFault(fault: FaultRow) {
-  return String(fault.fault_status ?? "").toLowerCase() !== "resolved";
-}
 
 type BackendHealthBadgeState = "ONLINE" | "OFFLINE";
 
@@ -198,19 +193,10 @@ export default function Home() {
 
     async function pollFaultWarnings() {
       try {
-        const res = await getFaults({ limit: 5000 });
+        const res = await getFaultSummary();
         if (!mounted) return;
 
-        const activeWarningSerials = Array.from(
-          new Set(
-            (res.faults ?? [])
-              .filter(isActiveFault)
-              .map((fault) => String(fault.serial_number))
-              .filter(Boolean)
-          )
-        );
-
-        setWarningSerials(activeWarningSerials);
+        setWarningSerials(res.warning_serials ?? []);
       } catch {
         if (!mounted) return;
         setWarningSerials([]);
@@ -401,7 +387,7 @@ export default function Home() {
           </div>
 
           <div className="sc-card-body home-card-body">
-            <FaultLog variant="recent" limit={5} />
+            <FaultLog variant="recent" limit={3} />
           </div>
         </section>
       </div>

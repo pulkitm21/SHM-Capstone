@@ -16,10 +16,12 @@ import {
   getSensorData,
   getNodes,
   getFaults,
+  getFaultSummary,
   getNodeSensorStatus,
   type ApiResponse,
   type FaultRow,
   type NodeRecord,
+  type FaultSummaryResponse,
   type NodeSensorStatusResponse,
 } from "../../services/api";
 
@@ -65,12 +67,27 @@ const SENSOR_DEFINITIONS: {
   { label: "Temperature", value: "temperature" },
 ];
 
-const TIMEFRAME_OPTIONS = [
-  { label: "1 hour", minutes: 60 },
-  { label: "6 hours", minutes: 360 },
-  { label: "12 hours", minutes: 720 },
-  { label: "1 day", minutes: 1440 },
-] as const;
+const TIMEFRAME_OPTIONS_BY_SENSOR: Record<
+  SensorValue,
+  ReadonlyArray<{ label: string; minutes: number }>
+> = {
+  accelerometer: [
+    { label: "1 min", minutes: 1 },
+    { label: "2 min", minutes: 2 },
+    { label: "5 min", minutes: 5 },
+  ],
+  inclinometer: [
+    { label: "10 min", minutes: 10 },
+    { label: "30 min", minutes: 30 },
+    { label: "1 hour", minutes: 60 },
+  ],
+  temperature: [
+    { label: "1 hour", minutes: 60 },
+    { label: "6 hours", minutes: 360 },
+    { label: "12 hours", minutes: 720 },
+    { label: "1 day", minutes: 1440 },
+  ],
+};
 
 const ENDPOINT_BY_SENSOR: Record<SensorValue, string> = {
   accelerometer: "/api/accel",
@@ -321,8 +338,8 @@ export default function SensorManagement() {
   const [settingsStatus, setSettingsStatus] = useState<string>("");
   const [faultStatus, setFaultStatus] = useState<string>("");
   const [nodeFaults, setNodeFaults] = useState<FaultRow[]>([]);
-  const [allFaultsBySerial, setAllFaultsBySerial] = useState<
-    Record<string, FaultRow[]>
+  const [allFaultCountsBySerial, setAllFaultCountsBySerial] = useState<
+    Record<string, number>
   >({});
 
   const [sensorStatusMap, setSensorStatusMap] = useState<SensorStatusMap>({
@@ -649,16 +666,18 @@ export default function SensorManagement() {
   // Load lightweight fault summaries for the node table.
   useEffect(() => {
     if (!nodes.length) {
-      setAllFaultsBySerial({});
+      setAllFaultCountsBySerial({});
       return;
     }
 
     if (UI_PREVIEW_MODE) {
-      const previewMap: Record<string, FaultRow[]> = {};
+      const previewMap: Record<string, number> = {};
       nodes.forEach((node) => {
-        previewMap[node.serial] = PREVIEW_FAULTS_BY_SERIAL[node.serial] ?? [];
+        previewMap[node.serial] = (PREVIEW_FAULTS_BY_SERIAL[node.serial] ?? []).filter(
+          (fault) => String(fault.fault_status ?? "").toLowerCase() === "active"
+        ).length;
       });
-      setAllFaultsBySerial(previewMap);
+      setAllFaultCountsBySerial(previewMap);
       return;
     }
 
@@ -666,25 +685,19 @@ export default function SensorManagement() {
 
     async function loadFaultCountsForTable() {
       try {
-        const entries = await Promise.all(
-          nodes.map(async (node) => {
-            try {
-              const res = await getFaults({
-                serial_number: node.serial,
-                limit: 50,
-              });
-              return [node.serial, res.faults ?? []] as const;
-            } catch {
-              return [node.serial, []] as const;
-            }
-          })
-        );
+        const res: FaultSummaryResponse = await getFaultSummary();
 
         if (cancelled) return;
-        setAllFaultsBySerial(Object.fromEntries(entries));
+
+        const counts: Record<string, number> = {};
+        nodes.forEach((node) => {
+          counts[node.serial] = res.by_serial[node.serial]?.active_count ?? 0;
+        });
+
+        setAllFaultCountsBySerial(counts);
       } catch {
         if (cancelled) return;
-        setAllFaultsBySerial({});
+        setAllFaultCountsBySerial({});
       }
     }
 
@@ -694,6 +707,14 @@ export default function SensorManagement() {
       cancelled = true;
     };
   }, [nodes]);
+
+  useEffect(() => {
+    const validOptions = TIMEFRAME_OPTIONS_BY_SENSOR[sensor];
+
+    if (!validOptions.some((option) => option.minutes === timeframeMin)) {
+      setTimeframeMin(validOptions[0].minutes);
+    }
+  }, [sensor, timeframeMin]);
 
   // Load backend-driven per-sensor status so each sensor can be independent of node status.
   useEffect(() => {
@@ -853,6 +874,8 @@ export default function SensorManagement() {
     SENSOR_DEFINITIONS.find((entry) => entry.value === sensor) ??
     SENSOR_DEFINITIONS[0];
 
+  const timeframeOptions = TIMEFRAME_OPTIONS_BY_SENSOR[sensor];
+
   return (
     <div className="sm-page">
       <div className="sm-toolbar">
@@ -880,7 +903,7 @@ export default function SensorManagement() {
             nodes={nodes}
             selectedNodeLabel={selectedNodeLabel}
             onSelectNode={setSelectedNodeLabel}
-            faultsBySerial={allFaultsBySerial}
+            faultCountsBySerial={allFaultCountsBySerial}
           />
 
           <section className="sm-main">
@@ -918,7 +941,7 @@ export default function SensorManagement() {
                       value={timeframeMin}
                       onChange={(e) => setTimeframeMin(Number(e.target.value))}
                     >
-                      {TIMEFRAME_OPTIONS.map((option) => (
+                      {timeframeOptions.map((option) => (
                         <option key={option.minutes} value={option.minutes}>
                           {option.label}
                         </option>
