@@ -1,11 +1,11 @@
-import type { FaultRow, NodeRecord } from "../../services/api";
+import type { NodeRecord } from "../../services/api";
 import "./NodeTable.css";
 
 type Props = {
   nodes: NodeRecord[];
   selectedNodeLabel: string;
   onSelectNode: (label: string) => void;
-  faultsBySerial: Record<string, FaultRow[]>;
+  faultCountsBySerial: Record<string, number>;
 };
 
 function formatTimestamp(ts?: string) {
@@ -13,14 +13,6 @@ function formatTimestamp(ts?: string) {
   const date = new Date(ts);
   if (Number.isNaN(date.getTime())) return ts;
   return date.toLocaleString();
-}
-
-function countUnresolvedFaultsForSerial(faults: FaultRow[], serial: string) {
-  return faults.filter(
-    (f) =>
-      f.serial_number === serial &&
-      String(f.fault_status || "").toLowerCase() === "active"
-  ).length;
 }
 
 // Determine the simple node health state for the table.
@@ -38,7 +30,7 @@ export default function NodeTable({
   nodes,
   selectedNodeLabel,
   onSelectNode,
-  faultsBySerial,
+  faultCountsBySerial,
 }: Props) {
   return (
     <div className="sm-node-table-panel">
@@ -71,10 +63,7 @@ export default function NodeTable({
             {nodes.map((node) => {
               const selected = node.label === selectedNodeLabel;
 
-              const unresolvedFaults = countUnresolvedFaultsForSerial(
-                faultsBySerial[node.serial] ?? [],
-                node.serial
-              );
+              const unresolvedFaults = faultCountsBySerial[node.serial] ?? 0;
 
               const healthState = getNodeHealthState(node, unresolvedFaults);
               const statusLabel =

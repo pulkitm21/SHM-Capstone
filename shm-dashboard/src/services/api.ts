@@ -275,6 +275,18 @@ export type FaultFilterOptions = {
   statuses: string[];
 };
 
+export type FaultSummaryItem = {
+  active_count: number;
+  latest_active_ts?: string | null;
+};
+
+export type FaultSummaryResponse = {
+  by_serial: Record<string, FaultSummaryItem>;
+  warning_serials: string[];
+  total_active_faults: number;
+  time: string;
+};
+
 export type FaultsResponse = {
   faults: FaultRow[];
   page: number;
@@ -312,6 +324,11 @@ export function getFaults(params?: FaultsQueryParams, signal?: AbortSignal) {
 
   const suffix = qs.toString() ? `?${qs.toString()}` : "";
   return request<FaultsResponse>(`/api/faults${suffix}`, { signal });
+}
+
+
+export function getFaultSummary(signal?: AbortSignal) {
+  return request<FaultSummaryResponse>("/api/faults/summary", { signal });
 }
 
 export type AccelerometerOdrIndex = 0 | 1 | 2;

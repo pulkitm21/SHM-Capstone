@@ -11,6 +11,7 @@ import gzip
 import math
 
 from fault_logger import log_fault_events
+from sensor_health_cache import update_sensor_health_from_packet
 
 ## Addition for ACK
 from node_registry import register_serial, serial_from_topic, get_node_by_serial
@@ -757,7 +758,7 @@ def handle_fault_message(topic: str, payload_bytes: bytes) -> None:
     try:
         serial = serial_from_topic(topic)
 
-        # keep node registry activity fresh for fault-only traffic too
+        # Keep registry activity fresh for fault traffic.
         register_serial(serial)
 
         data = json.loads(payload_bytes.decode())
@@ -769,17 +770,14 @@ def handle_fault_message(topic: str, payload_bytes: bytes) -> None:
             print(f"[faults] Invalid payload from {serial}: {data}")
             return
 
-        # normalize to list
         if isinstance(faults, int):
             faults = [faults]
         elif not isinstance(faults, list):
             print(f"[faults] Invalid fault format from {serial}: {faults}")
             return
 
-        # build events [(code, ts), ...]
         fault_events = [(int(code), ts) for code in faults]
 
-        # log directly
         log_fault_events(
             serial_number=serial,
             fault_events=fault_events,
@@ -834,7 +832,7 @@ def on_message(client, userdata, msg):
         topic_parts = msg.topic.split("/")
         node_id = topic_parts[1]
 
-        # keep node registry activity fresh for data traffic
+        # Keep registry activity fresh for data traffic.
         register_serial(node_id)
 
         # Raw backup is written first so the original packet is preserved.
@@ -842,6 +840,9 @@ def on_message(client, userdata, msg):
 
         # Parse the JSON payload.
         data = json.loads(msg.payload.decode())
+
+        # Update live sensor health from MQTT packet contents.
+        update_sensor_health_from_packet(node_id, data)
 
         # Normalize sensor timestamps only for binary storage.
         if not normalise_sensor_timestamps(data, node_id):

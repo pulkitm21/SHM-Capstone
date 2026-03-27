@@ -1,5 +1,5 @@
 // Log.tsx
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { getFaults, type FaultRow } from "../../services/api";
 import LogRecent from "./LogRecent";
 import LogNode from "./LogNode";
@@ -19,6 +19,8 @@ type FaultLogProps = {
 
 type FaultEventsResponse = {
   faults?: FaultRow[];
+  mode?: "snapshot" | "delta";
+  last_id?: number;
 };
 
 // Sort faults newest-first so all UI variants display a consistent order.
@@ -30,6 +32,21 @@ function normalizeFaultRows(rows: FaultRow[] | undefined): FaultRow[] {
     const bTime = new Date(b.ts ?? 0).getTime();
     return bTime - aTime;
   });
+}
+
+
+function mergeFaultRows(existing: FaultRow[], incoming: FaultRow[] | undefined): FaultRow[] {
+  const byId = new Map<number | string, FaultRow>();
+
+  existing.forEach((fault) => {
+    byId.set(fault.id ?? `${fault.serial_number}-${fault.ts}-${fault.fault_type}`, fault);
+  });
+
+  (incoming ?? []).forEach((fault) => {
+    byId.set(fault.id ?? `${fault.serial_number}-${fault.ts}-${fault.fault_type}`, fault);
+  });
+
+  return normalizeFaultRows(Array.from(byId.values()));
 }
 
 // Keep only active faults for summary-style variants.
@@ -53,6 +70,7 @@ export default function FaultLog({
   const [faults, setFaults] = useState<FaultRow[]>([]);
   const [loading, setLoading] = useState(variant !== "full");
   const [error, setError] = useState("");
+  const lastFaultIdRef = useRef<number>(0);
 
   useEffect(() => {
     // The full table manages its own fetching and state internally.
@@ -62,7 +80,12 @@ export default function FaultLog({
 
     // In preview mode, skip API calls and use the provided mock data.
     if (previewMode) {
-      setFaults(normalizeFaultRows(safePreviewFaults.slice(0, limit)));
+      const previewRows = normalizeFaultRows(safePreviewFaults.slice(0, limit));
+      setFaults(previewRows);
+      lastFaultIdRef.current = previewRows.reduce(
+        (maxId, fault) => Math.max(maxId, Number(fault.id ?? 0)),
+        0
+      );
       setLoading(false);
       setError("");
       return;
@@ -85,7 +108,12 @@ export default function FaultLog({
 
         if (!mounted) return;
 
-        setFaults(normalizeFaultRows(response.faults));
+        const nextRows = normalizeFaultRows(response.faults);
+        setFaults(nextRows);
+        lastFaultIdRef.current = nextRows.reduce(
+          (maxId, fault) => Math.max(maxId, Number(fault.id ?? 0)),
+          0
+        );
         setLoading(false);
         setError("");
       } catch (err: any) {
@@ -125,7 +153,21 @@ export default function FaultLog({
 
         try {
           const data: FaultEventsResponse = JSON.parse(event.data);
-          setFaults(normalizeFaultRows(data.faults));
+
+          setFaults((current) => {
+            const nextRows =
+              data.mode === "delta"
+                ? mergeFaultRows(current, data.faults)
+                : normalizeFaultRows(data.faults);
+
+            lastFaultIdRef.current = nextRows.reduce(
+              (maxId, fault) => Math.max(maxId, Number(fault.id ?? 0)),
+              0
+            );
+
+            return nextRows.slice(0, limit);
+          });
+
           setLoading(false);
           setError("");
         } catch (err) {
