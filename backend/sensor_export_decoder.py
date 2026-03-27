@@ -6,45 +6,263 @@ import struct
 from contextlib import ExitStack, contextmanager
 from typing import Dict, Generator, Any
 
-from decode_binary import (
-    read_fmt,
-    _fresh_decode_state,
-    _decode_accel_abs,
-    _decode_accel_delta,
-    _decode_accel_delta_v1,
-    _decode_inclin_abs,
-    _decode_inclin_delta,
-    _decode_inclin_delta_v1,
-    _decode_temp_abs,
-    _decode_temp_delta,
-    _decode_temp_delta_v1,
-    FORMAT_V1,
-    FORMAT_V2,
-    FLAG_ACCEL,
-    FLAG_INCLIN,
-    FLAG_TEMP,
-    SENTINEL,
-)
+TEMP_SCALE = 100
+ACCEL_SCALE = 10000
+INCLIN_SCALE = 10000
+TS_SCALE = 1_000_000
+
+FLAG_ACCEL = 0x01
+FLAG_INCLIN = 0x02
+FLAG_TEMP = 0x04
+SENTINEL = 0xFF
+
+FORMAT_V1 = 1
+FORMAT_V2 = 2
+
+
+def read_bytes(f, n, label=""):
+    d = f.read(n)
+    if len(d) < n:
+        raise EOFError(f"EOF reading {label!r}: got {len(d)}/{n} bytes")
+    return d
+
+
+def read_fmt(f, fmt, label=""):
+    raw = read_bytes(f, struct.calcsize(fmt), label)
+    return struct.unpack(fmt, raw)
+
+
+def _fresh_sensor_state():
+    return {
+        "ts_us": 0,
+        "ts_delta_prev": 0,
+        "xyz_prev": [0, 0, 0],
+        "val_prev": 0,
+    }
+
+
+def _fresh_decode_state():
+    return {
+        "accel": _fresh_sensor_state(),
+        "inclin": _fresh_sensor_state(),
+        "temp": _fresh_sensor_state(),
+    }
+
+
+def _reconstruct_abs_ts(f, ss: dict) -> int:
+    (ts_us,) = read_fmt(f, "<q", "abs timestamp")
+    ss["ts_us"] = ts_us
+    return ts_us
+
+
+def _v1_reconstruct_ts(f, ss: dict) -> int:
+    (dod,) = read_fmt(f, "<i", "v1 dod_ts")
+    delta_us = ss.get("ts_delta_prev", 0) + dod
+    ts_us = ss["ts_us"] + delta_us
+    ss["ts_us"] = ts_us
+    ss["ts_delta_prev"] = delta_us
+    return ts_us
+
+
+def _decode_accel_abs(f, state):
+    (n,) = read_fmt(f, "<B", "accel n")
+    out = []
+
+    for _ in range(n):
+        ts_us = _reconstruct_abs_ts(f, state["accel"])
+        x, y, z = read_fmt(f, "<iii", "accel abs xyz")
+        state["accel"]["xyz_prev"] = [x, y, z]
+
+        out.append(
+            (
+                ts_us / TS_SCALE,
+                x / ACCEL_SCALE,
+                y / ACCEL_SCALE,
+                z / ACCEL_SCALE,
+            )
+        )
+
+    return out or None
+
+
+def _decode_accel_delta_v1(f, state):
+    (n,) = read_fmt(f, "<B", "accel n")
+    out = []
+    ss = state["accel"]
+    prev = ss["xyz_prev"]
+
+    for _ in range(n):
+        ts_us = _v1_reconstruct_ts(f, ss)
+        dx, dy, dz = read_fmt(f, "<hhh", "accel delta xyz")
+        cur = [prev[0] + dx, prev[1] + dy, prev[2] + dz]
+
+        out.append(
+            (
+                ts_us / TS_SCALE,
+                cur[0] / ACCEL_SCALE,
+                cur[1] / ACCEL_SCALE,
+                cur[2] / ACCEL_SCALE,
+            )
+        )
+
+        prev = cur
+
+    ss["xyz_prev"] = prev
+    return out or None
+
+
+def _decode_accel_delta(f, state):
+    (n,) = read_fmt(f, "<B", "accel n")
+    out = []
+    ss = state["accel"]
+    prev = ss["xyz_prev"]
+
+    for _ in range(n):
+        (changed,) = read_fmt(f, "<B", "accel changed")
+
+        if changed & 0x01:
+            (delta_us,) = read_fmt(f, "<i", "accel delta_ts")
+            ts_us = ss["ts_us"] + delta_us
+            ss["ts_us"] = ts_us
+        else:
+            ts_us = ss["ts_us"]
+
+        dx = read_fmt(f, "<h", "accel dx")[0] if changed & 0x02 else 0
+        dy = read_fmt(f, "<h", "accel dy")[0] if changed & 0x04 else 0
+        dz = read_fmt(f, "<h", "accel dz")[0] if changed & 0x08 else 0
+
+        cur = [prev[0] + dx, prev[1] + dy, prev[2] + dz]
+
+        out.append(
+            (
+                ts_us / TS_SCALE,
+                cur[0] / ACCEL_SCALE,
+                cur[1] / ACCEL_SCALE,
+                cur[2] / ACCEL_SCALE,
+            )
+        )
+
+        prev = cur
+
+    ss["xyz_prev"] = prev
+    return out or None
+
+
+def _decode_inclin_abs(f, state):
+    ts_us = _reconstruct_abs_ts(f, state["inclin"])
+    roll, pitch, yaw = read_fmt(f, "<iii", "inclin abs")
+    state["inclin"]["xyz_prev"] = [roll, pitch, yaw]
+
+    return (
+        ts_us / TS_SCALE,
+        roll / INCLIN_SCALE,
+        pitch / INCLIN_SCALE,
+        yaw / INCLIN_SCALE,
+    )
+
+
+def _decode_inclin_delta_v1(f, state):
+    ss = state["inclin"]
+    ts_us = _v1_reconstruct_ts(f, ss)
+    dr, dp, dy = read_fmt(f, "<hhh", "inclin delta")
+    prev = ss["xyz_prev"]
+    cur = [prev[0] + dr, prev[1] + dp, prev[2] + dy]
+    ss["xyz_prev"] = cur
+
+    return (
+        ts_us / TS_SCALE,
+        cur[0] / INCLIN_SCALE,
+        cur[1] / INCLIN_SCALE,
+        cur[2] / INCLIN_SCALE,
+    )
+
+
+def _decode_inclin_delta(f, state):
+    ss = state["inclin"]
+    (changed,) = read_fmt(f, "<B", "inclin changed")
+
+    if changed & 0x01:
+        (delta_us,) = read_fmt(f, "<i", "inclin delta_ts")
+        ts_us = ss["ts_us"] + delta_us
+        ss["ts_us"] = ts_us
+    else:
+        ts_us = ss["ts_us"]
+
+    prev = ss["xyz_prev"]
+    dr = read_fmt(f, "<h", "inclin dr")[0] if changed & 0x02 else 0
+    dp = read_fmt(f, "<h", "inclin dp")[0] if changed & 0x04 else 0
+    dy = read_fmt(f, "<h", "inclin dy")[0] if changed & 0x08 else 0
+
+    cur = [prev[0] + dr, prev[1] + dp, prev[2] + dy]
+    ss["xyz_prev"] = cur
+
+    return (
+        ts_us / TS_SCALE,
+        cur[0] / INCLIN_SCALE,
+        cur[1] / INCLIN_SCALE,
+        cur[2] / INCLIN_SCALE,
+    )
+
+
+def _decode_temp_abs(f, state):
+    ts_us = _reconstruct_abs_ts(f, state["temp"])
+    (val,) = read_fmt(f, "<i", "temp abs")
+    state["temp"]["val_prev"] = val
+
+    return (
+        ts_us / TS_SCALE,
+        val / TEMP_SCALE,
+    )
+
+
+def _decode_temp_delta_v1(f, state):
+    ss = state["temp"]
+    ts_us = _v1_reconstruct_ts(f, ss)
+    (dt,) = read_fmt(f, "<h", "temp delta")
+    val = ss["val_prev"] + dt
+    ss["val_prev"] = val
+
+    return (
+        ts_us / TS_SCALE,
+        val / TEMP_SCALE,
+    )
+
+
+def _decode_temp_delta(f, state):
+    ss = state["temp"]
+    (changed,) = read_fmt(f, "<B", "temp changed")
+
+    if changed & 0x01:
+        (delta_us,) = read_fmt(f, "<i", "temp delta_ts")
+        ts_us = ss["ts_us"] + delta_us
+        ss["ts_us"] = ts_us
+    else:
+        ts_us = ss["ts_us"]
+
+    if changed & 0x02:
+        (dt,) = read_fmt(f, "<h", "temp dval")
+        ss["val_prev"] = ss["val_prev"] + dt
+
+    return (
+        ts_us / TS_SCALE,
+        ss["val_prev"] / TEMP_SCALE,
+    )
 
 
 @contextmanager
 def open_record_stream(filepath: str):
     """
-    Plotting decoder file opener that keeps memory usage low.
+    Streaming opener for raw sensor files used by plotting.
 
-    .bin:
-      - use the file directly
+    Supported:
+    - .bin
+    - .bin.gz
 
-    .bin.gz:
-      - stream-decompress using gzip.open(..., "rb")
-      - wrap in BufferedReader so the existing binary decode helpers can
-        continue using read()/struct unpack operations efficiently
-
-    This keeps plotting compatible with both active .bin files and finalized
-    .bin.gz files without loading the full decompressed file into RAM.
+    This matches the frontend decoder's file support while keeping backend
+    RAM usage low by streaming instead of fully decompressing into memory.
     """
     with ExitStack() as stack:
-        if filepath.endswith(".gz"):
+        if filepath.endswith(".gz") or filepath.endswith(".gzip"):
             gzip_file = stack.enter_context(gzip.open(filepath, "rb"))
             buffered = io.BufferedReader(gzip_file)
             yield buffered
@@ -58,14 +276,16 @@ def iter_decoded_records_for_export(
     filepath: str,
 ) -> Generator[Dict[str, Any], None, None]:
     """
-    Streaming decoder used by the sensor plotting endpoints.
+    Streaming decoder used by the backend plot endpoints.
 
-    This function still decodes one record at a time so plotting can work with
-    both .bin and .bin.gz files while keeping memory use low.
+    This now matches the frontend decoder behavior more closely:
+    - supports .bin and .bin.gz
+    - supports FORMAT_V1 and FORMAT_V2
+    - tolerates a truncated tail record by stopping cleanly
+    - yields one decoded record at a time for low-memory processing
 
-    Note:
-    Export no longer uses this decoder path. Raw export now packages backend
-    storage files directly into a ZIP archive.
+    Export no longer uses this path. Raw export packages the storage files
+    directly without decoding.
     """
     state = _fresh_decode_state()
 
@@ -135,7 +355,10 @@ def iter_decoded_records_for_export(
                 idx += 1
 
             except EOFError:
-                # Current-hour .bin can be actively written and end mid-record.
+                # Match the frontend decoder behavior:
+                # keep all earlier decoded records and stop cleanly if the file
+                # ends mid-record, which can happen for active .bin files or
+                # interrupted/incomplete files.
                 break
             except struct.error:
                 break
