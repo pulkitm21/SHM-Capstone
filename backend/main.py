@@ -6,7 +6,6 @@ from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 import asyncio
 import json
-import struct
 import sqlite3
 import shutil
 import os
@@ -15,8 +14,10 @@ from collections import deque
 import subprocess
 import math
 
-import backend.mqtt_listener_control as mqtt_listener_control
-from backend.mqtt_listener_control import start_listener
+import mqtt_listener_control as mqtt_listener_control
+from mqtt_listener_control import start_listener
+
+from sensor_health_cache import get_sensor_health_snapshot
 
 from settings_schema import SettingsModel, to_dict, copy_deep
 
@@ -66,20 +67,8 @@ app.include_router(export_router)
 
 DATA_DIR = Path("/mnt/ssd")
 
-ACCEL_BIN = DATA_DIR / "accel_data_20260219.bin"
-INCL_BIN = DATA_DIR / "incl_data.bin"
-TEMP_BIN = DATA_DIR / "temp_data.bin"
 FAULT_DIR = DATA_DIR / "fault"
 FAULTS_DB = FAULT_DIR / "faults.db"
-
-ACCEL_FORMAT = "<dfff"
-ACCEL_SIZE = struct.calcsize(ACCEL_FORMAT)
-
-INCL_FORMAT = "<dff"
-INCL_SIZE = struct.calcsize(INCL_FORMAT)
-
-TEMP_FORMAT = "<df"
-TEMP_SIZE = struct.calcsize(TEMP_FORMAT)
 
 # Sensor status values returned to the frontend.
 SENSOR_STATUS_WINDOW_SECONDS = 120
@@ -187,139 +176,6 @@ def empty_fault_response(page: int = 1, page_size: int = 15) -> Dict[str, Any]:
     }
 
 
-def _read_tail_bytes(path: Path, record_size: int, max_records: int) -> bytes:
-    """
-    Safely read the trailing bytes of a binary sensor file.
-
-    If the SSD is missing or the file cannot be read, return empty bytes so the
-    caller can degrade gracefully instead of failing the request.
-    """
-    if not is_ssd_available():
-        return b""
-
-    try:
-        if not path.exists():
-            return b""
-
-        size = path.stat().st_size
-        bytes_needed = min(size, max_records * record_size)
-
-        if bytes_needed <= 0:
-            return b""
-
-        with path.open("rb") as f:
-            f.seek(size - bytes_needed)
-            return f.read()
-
-    except (OSError, ValueError):
-        return b""
-
-
-def read_accel_points(
-    minutes: int,
-    channel: str,
-    max_records_to_scan: int = 50000,
-    limit: int = 500,
-):
-    if not is_ssd_available():
-        return []
-
-    now_s = datetime.now(timezone.utc).timestamp()
-    cutoff_s = now_s - (minutes * 60)
-
-    if channel not in ["x", "y", "z"]:
-        return []
-
-    data = _read_tail_bytes(ACCEL_BIN, ACCEL_SIZE, max_records_to_scan)
-    if not data:
-        return []
-
-    usable_len = (len(data) // ACCEL_SIZE) * ACCEL_SIZE
-    data = data[:usable_len]
-
-    idx = {"x": 1, "y": 2, "z": 3}[channel]
-    points: List[Dict[str, Any]] = []
-
-    try:
-        for (ts, ax, ay, az) in struct.iter_unpack(ACCEL_FORMAT, data):
-            if ts < cutoff_s:
-                continue
-            val = (ts, ax, ay, az)[idx]
-            points.append({"ts": _iso_from_epoch_seconds(ts), "value": float(val)})
-    except struct.error:
-        return []
-
-    return points[-limit:]
-
-
-def read_inclinometer_points(
-    minutes: int,
-    channel: str,
-    max_records_to_scan: int = 50000,
-    limit: int = 500,
-):
-    if not is_ssd_available():
-        return []
-
-    now_s = datetime.now(timezone.utc).timestamp()
-    cutoff_s = now_s - (minutes * 60)
-
-    if channel not in ["pitch", "roll"]:
-        return []
-
-    data = _read_tail_bytes(INCL_BIN, INCL_SIZE, max_records_to_scan)
-    if not data:
-        return []
-
-    usable_len = (len(data) // INCL_SIZE) * INCL_SIZE
-    data = data[:usable_len]
-
-    idx = 1 if channel == "pitch" else 2
-    points: List[Dict[str, Any]] = []
-
-    try:
-        for (ts, pitch, roll) in struct.iter_unpack(INCL_FORMAT, data):
-            if ts < cutoff_s:
-                continue
-            val = (ts, pitch, roll)[idx]
-            points.append({"ts": _iso_from_epoch_seconds(ts), "value": float(val)})
-    except struct.error:
-        return []
-
-    return points[-limit:]
-
-
-def read_temperature_points(
-    minutes: int,
-    max_records_to_scan: int = 50000,
-    limit: int = 500,
-):
-    if not is_ssd_available():
-        return []
-
-    now_s = datetime.now(timezone.utc).timestamp()
-    cutoff_s = now_s - (minutes * 60)
-
-    data = _read_tail_bytes(TEMP_BIN, TEMP_SIZE, max_records_to_scan)
-    if not data:
-        return []
-
-    usable_len = (len(data) // TEMP_SIZE) * TEMP_SIZE
-    data = data[:usable_len]
-
-    points: List[Dict[str, Any]] = []
-
-    try:
-        for (ts, temp) in struct.iter_unpack(TEMP_FORMAT, data):
-            if ts < cutoff_s:
-                continue
-            points.append({"ts": _iso_from_epoch_seconds(ts), "value": float(temp)})
-    except struct.error:
-        return []
-
-    return points[-limit:]
-
-
 def _active_sensor_faults_for_serial(serial: str) -> dict[str, list[dict[str, Any]]]:
     """
     Return active unresolved sensor faults grouped by sensor type for one node serial.
@@ -374,19 +230,12 @@ def _recent_sensor_data_presence(
     window_seconds: int = SENSOR_STATUS_WINDOW_SECONDS,
 ) -> dict[str, dict[str, Any]]:
     """
-    Inspect recent decoded files and determine whether each sensor has fresh data,
-    whether that data is valid, and whether NaN values were observed.
+    Read recent per-sensor health from the live MQTT packet cache.
 
-    Status meaning:
-    - no recent samples -> idle (if node online)
-    - recent NaN samples -> offline
-    - recent valid samples -> online
+    A sensor counts as having recent data only when its cached timestamps
+    are within the requested window.
     """
     now_dt = datetime.now(timezone.utc)
-    start_dt = now_dt - timedelta(seconds=window_seconds)
-
-    start_ts = start_dt.timestamp()
-    end_ts = now_dt.timestamp()
 
     status = {
         "accelerometer": {
@@ -409,68 +258,45 @@ def _recent_sensor_data_presence(
         },
     }
 
-    if not is_ssd_available():
-        return status
+    live_health = get_sensor_health_snapshot(serial)
 
-    files = find_sensor_files_for_serial(
-        serial=serial,
-        start_iso=start_dt.isoformat(),
-        end_exclusive_iso=now_dt.isoformat(),
-    )
+    def _parse_iso(ts: Any) -> Optional[datetime]:
+        if not ts:
+            return None
+        try:
+            return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone(timezone.utc)
+        except Exception:
+            return None
 
-    def _is_valid_number(value: Any) -> bool:
-        if not isinstance(value, (int, float)):
+    def _is_recent(ts: Any) -> bool:
+        dt = _parse_iso(ts)
+        if dt is None:
             return False
-        return not math.isnan(float(value))
+        return (now_dt - dt).total_seconds() <= window_seconds
 
-    for sensor_file in files:
-        for rec in iter_decoded_records_for_export(str(sensor_file)):
-            accel_samples = rec.get("accel_samples")
-            if accel_samples:
-                for ts, x, y, z in accel_samples:
-                    if start_ts <= ts < end_ts:
-                        status["accelerometer"]["has_data"] = True
-                        status["accelerometer"]["last_ts"] = _iso_from_epoch_seconds(ts)
+    for sensor_name in SENSOR_KEYS:
+        sensor_health = live_health.get(sensor_name, {})
+        last_packet_ts = sensor_health.get("last_packet_ts")
+        last_valid_ts = sensor_health.get("last_valid_data_ts")
+        last_nan_ts = sensor_health.get("last_nan_ts")
 
-                        if all(_is_valid_number(v) for v in (x, y, z)):
-                            status["accelerometer"]["has_valid_data"] = True
-                        else:
-                            status["accelerometer"]["has_nan_data"] = True
+        has_recent_packet = _is_recent(last_packet_ts)
+        has_recent_valid = _is_recent(last_valid_ts)
+        has_recent_nan = _is_recent(last_nan_ts)
 
-            inclin = rec.get("inclin")
-            if inclin:
-                ts = inclin[0]
-                if start_ts <= ts < end_ts:
-                    status["inclinometer"]["has_data"] = True
-                    status["inclinometer"]["last_ts"] = _iso_from_epoch_seconds(ts)
+        status[sensor_name]["has_data"] = has_recent_packet
+        status[sensor_name]["has_valid_data"] = has_recent_valid
+        status[sensor_name]["has_nan_data"] = has_recent_nan
 
-                    values = inclin[1:]
-                    if values and all(_is_valid_number(v) for v in values):
-                        status["inclinometer"]["has_valid_data"] = True
-                    else:
-                        status["inclinometer"]["has_nan_data"] = True
-
-            temp = rec.get("temp")
-            if temp:
-                ts = temp[0]
-                if start_ts <= ts < end_ts:
-                    status["temperature"]["has_data"] = True
-                    status["temperature"]["last_ts"] = _iso_from_epoch_seconds(ts)
-
-                    value = temp[1] if len(temp) > 1 else None
-                    if _is_valid_number(value):
-                        status["temperature"]["has_valid_data"] = True
-                    else:
-                        status["temperature"]["has_nan_data"] = True
-
-            if all(
-                status[key]["has_valid_data"] or status[key]["has_nan_data"]
-                for key in SENSOR_KEYS
-            ):
-                return status
+        # Prefer the most recent packet timestamp for display.
+        if has_recent_packet:
+            status[sensor_name]["last_ts"] = last_packet_ts
+        elif has_recent_valid:
+            status[sensor_name]["last_ts"] = last_valid_ts
+        elif has_recent_nan:
+            status[sensor_name]["last_ts"] = last_nan_ts
 
     return status
-
 
 def _sensor_health_state(
     *,
@@ -485,8 +311,8 @@ def _sensor_health_state(
     1. node offline -> offline
     2. recent NaN data -> offline
     3. active fault -> warning
-    4. node online but no recent data -> idle
-    5. recent valid data -> online
+    4. recent valid data -> online
+    5. node online but no recent data -> idle
     6. fallback -> offline
     """
     if not node_online:
@@ -498,11 +324,11 @@ def _sensor_health_state(
     if active_faults:
         return "warning"
 
-    if not has_data:
-        return "idle"
-
     if has_valid_data:
         return "online"
+
+    if not has_data:
+        return "idle"
 
     return "offline"
 
@@ -1191,6 +1017,118 @@ def read_fault_rows(
             con.close()
 
 
+
+
+def read_active_fault_summary() -> Dict[str, Any]:
+    if not is_ssd_available() or not FAULTS_DB.exists():
+        return {
+            "by_serial": {},
+            "warning_serials": [],
+            "total_active_faults": 0,
+            "time": datetime.now(timezone.utc).isoformat(),
+        }
+
+    con: Optional[sqlite3.Connection] = None
+
+    try:
+        con = sqlite3.connect(str(FAULTS_DB))
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+
+        cur.execute(
+            """
+            SELECT serial_number, COUNT(*) AS active_count, MAX(ts) AS latest_active_ts
+            FROM faults
+            WHERE LOWER(fault_status) = 'active'
+            GROUP BY serial_number
+            ORDER BY serial_number COLLATE NOCASE ASC
+            """
+        )
+
+        by_serial: Dict[str, Any] = {}
+        total_active_faults = 0
+
+        for row in cur.fetchall():
+            serial = str(row["serial_number"] or "").strip()
+            if not serial:
+                continue
+
+            active_count = int(row["active_count"] or 0)
+            total_active_faults += active_count
+
+            by_serial[serial] = {
+                "active_count": active_count,
+                "latest_active_ts": row["latest_active_ts"],
+            }
+
+        return {
+            "by_serial": by_serial,
+            "warning_serials": list(by_serial.keys()),
+            "total_active_faults": total_active_faults,
+            "time": datetime.now(timezone.utc).isoformat(),
+        }
+
+    except sqlite3.Error as e:
+        print(f"[faults] Failed to build fault summary: {e}")
+        return {
+            "by_serial": {},
+            "warning_serials": [],
+            "total_active_faults": 0,
+            "time": datetime.now(timezone.utc).isoformat(),
+        }
+
+    finally:
+        if con is not None:
+            con.close()
+
+
+def read_fault_rows_since_id(
+    after_id: int,
+    limit: int,
+    serial_number: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if not is_ssd_available() or not FAULTS_DB.exists():
+        return []
+
+    con: Optional[sqlite3.Connection] = None
+
+    try:
+        con = sqlite3.connect(str(FAULTS_DB))
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+
+        where_clauses = ["id > ?"]
+        params: List[Any] = [after_id]
+
+        serial_number_value = _normalize_fault_text(serial_number)
+        if serial_number_value:
+            where_clauses.append("serial_number LIKE ?")
+            params.append(f"%{serial_number_value}%")
+
+        where_sql = "WHERE " + " AND ".join(where_clauses)
+
+        cur.execute(
+            f"""
+            SELECT id, serial_number, sensor_type, fault_type, severity, fault_status, description, ts
+            FROM faults
+            {where_sql}
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            [*params, limit],
+        )
+
+        return [dict(r) for r in cur.fetchall()]
+
+    except sqlite3.Error as e:
+        print(f"[faults] Failed to read fault delta rows: {e}")
+        return []
+
+    finally:
+        if con is not None:
+            con.close()
+
+
 @app.get("/api/faults")
 def get_faults(
     serial_number: Optional[str] = Query(default=None),
@@ -1216,6 +1154,11 @@ def get_faults(
     )
 
 
+@app.get("/api/faults/summary")
+def get_fault_summary():
+    return read_active_fault_summary()
+
+
 @app.get("/api/events/faults")
 async def fault_events(
     request: Request,
@@ -1223,22 +1166,50 @@ async def fault_events(
     limit: int = Query(default=200, ge=1, le=5000),
 ):
     # SSE code for live fault log updates on the frontend dashboard.
-    # This should degrade cleanly when SSD/fault DB is unavailable.
+    # This now sends one initial snapshot, then only newly inserted fault rows.
     async def event_generator():
+        last_seen_id = 0
+
         try:
+            snapshot_rows = read_fault_rows(
+                serial_number=serial_number,
+                limit=limit,
+            )["faults"]
+
+            if snapshot_rows:
+                last_seen_id = max(int(row.get("id") or 0) for row in snapshot_rows)
+
+            snapshot_payload = {
+                "mode": "snapshot",
+                "faults": snapshot_rows,
+                "last_id": last_seen_id,
+                "time": datetime.now(timezone.utc).isoformat(),
+            }
+
+            yield f"data: {json.dumps(snapshot_payload)}\n\n"
+
             while True:
                 if await request.is_disconnected():
                     break
 
-                payload = {
-                    "faults": read_fault_rows(
-                        serial_number=serial_number,
-                        limit=limit,
-                    )["faults"],
-                    "time": datetime.now(timezone.utc).isoformat(),
-                }
+                delta_rows = read_fault_rows_since_id(
+                    after_id=last_seen_id,
+                    limit=limit,
+                    serial_number=serial_number,
+                )
 
-                yield f"data: {json.dumps(payload)}\n\n"
+                if delta_rows:
+                    last_seen_id = max(int(row.get("id") or 0) for row in delta_rows)
+
+                    payload = {
+                        "mode": "delta",
+                        "faults": delta_rows,
+                        "last_id": last_seen_id,
+                        "time": datetime.now(timezone.utc).isoformat(),
+                    }
+
+                    yield f"data: {json.dumps(payload)}\n\n"
+
                 await asyncio.sleep(5)
 
         except asyncio.CancelledError:
@@ -1257,7 +1228,7 @@ async def fault_events(
 @app.get("/api/accel")
 def get_accel_data(
     node: int = Query(1, ge=1),
-    minutes: int = Query(60, ge=1, le=1440),
+    minutes: int = Query(1, ge=1, le=5),
 ):
     pts = read_accel_points(node_id=node, minutes=minutes)
     return {
@@ -1271,7 +1242,7 @@ def get_accel_data(
 @app.get("/api/inclinometer")
 def api_inclinometer(
     node: int = Query(1, ge=1),
-    minutes: int = Query(60, ge=1, le=1440),
+    minutes: int = Query(10, ge=1, le=60),
 ):
     pts = read_inclinometer_points(node_id=node, minutes=minutes)
     return {
