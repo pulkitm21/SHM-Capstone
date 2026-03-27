@@ -1,10 +1,17 @@
 const API_BASE = import.meta.env.VITE_API_BASE_URL;
 
+/*
+  All API requests include credentials so browser-managed auth cookies
+  will be sent automatically once backend session auth is wired in.
+*/
 async function request<T>(
   path: string,
   options?: RequestInit & { signal?: AbortSignal }
 ): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, options);
+  const res = await fetch(`${API_BASE}${path}`, {
+    credentials: "include",
+    ...options,
+  });
 
   if (!res.ok) {
     let msg = `HTTP ${res.status}`;
@@ -18,6 +25,138 @@ async function request<T>(
   }
 
   return (await res.json()) as T;
+}
+
+export type AuthRole = "admin" | "viewer";
+
+export type AuthUser = {
+  id: number;
+  username: string;
+  role: AuthRole;
+  created_at?: string;
+  updated_at?: string;
+  last_login_at?: string | null;
+};
+
+export type LoginRequest = {
+  username: string;
+  password: string;
+};
+
+export type LoginResponse = {
+  ok: boolean;
+  user: AuthUser;
+};
+
+export type CurrentUserResponse = {
+  authenticated: boolean;
+  user: AuthUser | null;
+};
+
+export type LogoutResponse = {
+  ok: boolean;
+};
+
+export type CreateUserRequest = {
+  username: string;
+  password: string;
+  role: AuthRole;
+};
+
+export type CreateUserResponse = {
+  ok: boolean;
+  user: AuthUser;
+};
+
+export type UsersListResponse = {
+  users: AuthUser[];
+};
+
+export type UpdateUserRoleRequest = {
+  role: AuthRole;
+};
+
+export type UpdateUserRoleResponse = {
+  ok: boolean;
+  user: AuthUser;
+};
+
+export type ResetUserPasswordRequest = {
+  password: string;
+};
+
+export type ResetUserPasswordResponse = {
+  ok: boolean;
+};
+
+export type DeleteUserResponse = {
+  ok: boolean;
+};
+
+export function login(body: LoginRequest, signal?: AbortSignal) {
+  return request<LoginResponse>("/api/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+}
+
+export function logout(signal?: AbortSignal) {
+  return request<LogoutResponse>("/api/auth/logout", {
+    method: "POST",
+    signal,
+  });
+}
+
+export function getCurrentUser(signal?: AbortSignal) {
+  return request<CurrentUserResponse>("/api/auth/me", { signal });
+}
+
+export function getUsers(signal?: AbortSignal) {
+  return request<UsersListResponse>("/api/users", { signal });
+}
+
+export function createUser(body: CreateUserRequest, signal?: AbortSignal) {
+  return request<CreateUserResponse>("/api/users", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+}
+
+export function updateUserRole(
+  userId: number,
+  body: UpdateUserRoleRequest,
+  signal?: AbortSignal
+) {
+  return request<UpdateUserRoleResponse>(`/api/users/${userId}/role`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+}
+
+export function resetUserPassword(
+  userId: number,
+  body: ResetUserPasswordRequest,
+  signal?: AbortSignal
+) {
+  return request<ResetUserPasswordResponse>(`/api/users/${userId}/password`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+}
+
+export function deleteUser(userId: number, signal?: AbortSignal) {
+  return request<DeleteUserResponse>(`/api/users/${userId}`, {
+    method: "DELETE",
+    signal,
+  });
 }
 
 export type AccelerometerPlotPoint = {
@@ -326,7 +465,6 @@ export function getFaults(params?: FaultsQueryParams, signal?: AbortSignal) {
   return request<FaultsResponse>(`/api/faults${suffix}`, { signal });
 }
 
-
 export function getFaultSummary(signal?: AbortSignal) {
   return request<FaultSummaryResponse>("/api/faults/summary", { signal });
 }
@@ -450,7 +588,10 @@ export async function downloadFaultExport(
   if (params.description) qs.set("description", params.description);
 
   const suffix = qs.toString() ? `?${qs.toString()}` : "";
-  const res = await fetch(`${API_BASE}/api/exports/faults${suffix}`, { signal });
+  const res = await fetch(`${API_BASE}/api/exports/faults${suffix}`, {
+    credentials: "include",
+    signal,
+  });
 
   if (!res.ok) {
     let msg = `HTTP ${res.status}`;
@@ -494,7 +635,10 @@ async function downloadFromEndpoint(
   path: string,
   signal?: AbortSignal
 ): Promise<void> {
-  const res = await fetch(`${API_BASE}${path}`, { signal });
+  const res = await fetch(`${API_BASE}${path}`, {
+    credentials: "include",
+    signal,
+  });
 
   if (!res.ok) {
     let msg = `HTTP ${res.status}`;
