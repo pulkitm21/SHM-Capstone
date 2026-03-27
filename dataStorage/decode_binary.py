@@ -6,11 +6,11 @@ Decodes binary files written by delta_encoder.py.
 Binary format recap:
   ABSOLUTE:  0xFF | header(B)
       accel:  n(B) + n×[ts(q) x(i) y(i) z(i)]
-      inclin: n(B) + n×[ts(q) r(i) p(i) yaw(i)]
+      inclin: ts(q) r(i) p(i) yaw(i)
       temp:   ts(q) val(i)
   DELTA:  header(B)
       accel:  n(B) + n×[changed(B) delta_ts?(i) dx?(h) dy?(h) dz?(h)]
-      inclin: n(B) + n×[changed(B) delta_ts?(i) dr?(h) dp?(h) dyaw?(h)]
+      inclin: changed(B) delta_ts?(i) dr?(h) dp?(h) dyaw?(h)
       temp:   changed(B) delta_ts?(i) dval?(h)
   changed byte: bit0=ts, bit1=x/r/val, bit2=y/p, bit3=z/yaw
   Fields with bit=0 are omitted; decoder keeps previous value.
@@ -37,7 +37,13 @@ FLAG_TEMP   = 0x04
 SENTINEL    = 0xFF
 
 FORMAT_V1 = 1   # legacy: raw dod_ts, no changed byte
-FORMAT_V2 = 2   # current: changed byte + simple delta_ts
+FORMAT_V2 = 2   # changed byte + simple delta_ts
+FORMAT_V3 = 3   # explicit NaN flags + inclination bursts
+INT32_NAN_SENTINEL = -2147483648
+CHANGED_NAN_X = 0x10
+CHANGED_NAN_Y = 0x20
+CHANGED_NAN_Z = 0x40
+CHANGED_NAN_TEMP = 0x10
 
 
 
@@ -75,7 +81,11 @@ def ts_to_str(ts_s):
     except Exception:
         return f"<invalid {ts_s}>"
 
+def _decode_abs_component(raw: int, scale: int):
+    return None if raw == INT32_NAN_SENTINEL else raw / scale
 
+def _fmt_opt(v, fmt: str) -> str:
+    return "NaN" if v is None else format(v, fmt)
 
 
 # ── v1 legacy delta decoders (no changed byte, raw dod_ts) ───────
@@ -110,7 +120,7 @@ def _decode_inclin_delta_v1(f, state):
     prev     = ss["xyz_prev"]
     cur      = [prev[0]+dr, prev[1]+dp, prev[2]+dy]
     ss["xyz_prev"] = cur
-    return [(ts_us/TS_SCALE, cur[0]/INCLIN_SCALE, cur[1]/INCLIN_SCALE, cur[2]/INCLIN_SCALE)]
+    return (ts_us/TS_SCALE, cur[0]/INCLIN_SCALE, cur[1]/INCLIN_SCALE, cur[2]/INCLIN_SCALE)
 
 def _decode_temp_delta_v1(f, state):
     ss    = state["temp"]
@@ -156,86 +166,136 @@ def _decode_accel_abs(f, state):
     """Returns list of (ts_s, x, y, z) tuples."""
     (n,) = read_fmt(f, "<B", "accel n")
     out  = []
+    prev = list(state["accel"]["xyz_prev"])
     for _ in range(n):
         ts_us = _reconstruct_abs_ts(f, state["accel"])
-        x, y, z = read_fmt(f, "<iii", "accel abs xyz")
-        state["accel"]["xyz_prev"] = [x, y, z]
-        out.append((ts_us / TS_SCALE, x / ACCEL_SCALE, y / ACCEL_SCALE, z / ACCEL_SCALE))
+        x_raw, y_raw, z_raw = read_fmt(f, "<iii", "accel abs xyz")
+        vals = []
+        for idx, raw in enumerate((x_raw, y_raw, z_raw)):
+            if raw != INT32_NAN_SENTINEL:
+                prev[idx] = raw
+                vals.append(raw / ACCEL_SCALE)
+            else:
+                vals.append(None)
+        out.append((ts_us / TS_SCALE, vals[0], vals[1], vals[2]))
+    state["accel"]["xyz_prev"] = prev
     return out or None
 
-def _decode_accel_delta(f, state):
+def _decode_accel_delta(f, state, fv):
     (n,) = read_fmt(f, "<B", "accel n")
     out  = []
     ss   = state["accel"]
-    prev = ss["xyz_prev"]
+    prev = list(ss["xyz_prev"])
     for _ in range(n):
         (changed,) = read_fmt(f, "<B", "accel changed")
-        # Timestamp
-        if changed & 0x01:
+        nan_mask = (changed & 0x70) if fv >= FORMAT_V3 else 0
+        low = changed & 0x0F
+        if low & 0x01:
             (delta_us,) = read_fmt(f, "<i", "accel delta_ts")
             ts_us       = ss["ts_us"] + delta_us
             ss["ts_us"] = ts_us
         else:
             ts_us = ss["ts_us"]
-        # Values — keep prev if bit not set (null delta / |Δ| <= deadband threshold)
-        (dx,) = read_fmt(f, "<h", "accel dx") if changed & 0x02 else ((0,),)[0]
-        (dy,) = read_fmt(f, "<h", "accel dy") if changed & 0x04 else ((0,),)[0]
-        (dz,) = read_fmt(f, "<h", "accel dz") if changed & 0x08 else ((0,),)[0]
-        cur = [prev[0]+dx, prev[1]+dy, prev[2]+dz]
-        out.append((ts_us / TS_SCALE, cur[0]/ACCEL_SCALE, cur[1]/ACCEL_SCALE, cur[2]/ACCEL_SCALE))
-        prev = cur
+        vals = []
+        for idx, (delta_bit, nan_bit) in enumerate(((0x02, CHANGED_NAN_X), (0x04, CHANGED_NAN_Y), (0x08, CHANGED_NAN_Z))):
+            if nan_mask & nan_bit:
+                vals.append(None)
+                continue
+            d = read_fmt(f, "<h", "accel delta")[0] if (low & delta_bit) else 0
+            prev[idx] += d
+            vals.append(prev[idx] / ACCEL_SCALE)
+        out.append((ts_us / TS_SCALE, vals[0], vals[1], vals[2]))
     ss["xyz_prev"] = prev
     return out or None
 
-def _decode_inclin_abs(f, state):
-    """Returns list of (ts_s, r, p, y) tuples."""
-    (n,) = read_fmt(f, "<B", "inclin n")
-    out = []
-    for _ in range(n):
-        ts_us = _reconstruct_abs_ts(f, state["inclin"])
-        r, p, y = read_fmt(f, "<iii", "inclin abs xyz")
-        state["inclin"]["xyz_prev"] = [r, p, y]
-        out.append((ts_us / TS_SCALE, r / INCLIN_SCALE, p / INCLIN_SCALE, y / INCLIN_SCALE))
-    return out or None
+def _decode_inclin_abs(f, state, fv):
+    if fv >= FORMAT_V3:
+        (n,) = read_fmt(f, "<B", "inclin n")
+        out = []
+        prev = list(state["inclin"]["xyz_prev"])
+        for _ in range(n):
+            ts_us = _reconstruct_abs_ts(f, state["inclin"])
+            r_raw, p_raw, y_raw = read_fmt(f, "<iii", "inclin abs xyz")
+            vals = []
+            for idx, raw in enumerate((r_raw, p_raw, y_raw)):
+                if raw != INT32_NAN_SENTINEL:
+                    prev[idx] = raw
+                    vals.append(raw / INCLIN_SCALE)
+                else:
+                    vals.append(None)
+            out.append((ts_us / TS_SCALE, vals[0], vals[1], vals[2]))
+        state["inclin"]["xyz_prev"] = prev
+        return out or None
+    ts_us    = _reconstruct_abs_ts(f, state["inclin"])
+    r, p, y  = read_fmt(f, "<iii", "inclin abs")
+    state["inclin"]["xyz_prev"] = [r, p, y]
+    return [(ts_us / TS_SCALE, r / INCLIN_SCALE, p / INCLIN_SCALE, y / INCLIN_SCALE)]
 
-def _decode_inclin_delta(f, state):
-    (n,) = read_fmt(f, "<B", "inclin n")
-    out = []
+def _decode_inclin_delta(f, state, fv):
     ss = state["inclin"]
-    prev = ss["xyz_prev"]
-    for _ in range(n):
-        (changed,) = read_fmt(f, "<B", "inclin changed")
-        if changed & 0x01:
-            (delta_us,) = read_fmt(f, "<i", "inclin delta_ts")
-            ts_us = ss["ts_us"] + delta_us
-            ss["ts_us"] = ts_us
-        else:
-            ts_us = ss["ts_us"]
-        (dr,) = read_fmt(f, "<h", "inclin dr") if changed & 0x02 else ((0,),)[0]
-        (dp,) = read_fmt(f, "<h", "inclin dp") if changed & 0x04 else ((0,),)[0]
-        (dy,) = read_fmt(f, "<h", "inclin dy") if changed & 0x08 else ((0,),)[0]
-        cur = [prev[0] + dr, prev[1] + dp, prev[2] + dy]
-        out.append((ts_us / TS_SCALE, cur[0] / INCLIN_SCALE, cur[1] / INCLIN_SCALE, cur[2] / INCLIN_SCALE))
-        prev = cur
+    prev = list(ss["xyz_prev"])
+    if fv >= FORMAT_V3:
+        (n,) = read_fmt(f, "<B", "inclin n")
+        out = []
+        for _ in range(n):
+            (changed,) = read_fmt(f, "<B", "inclin changed")
+            nan_mask = changed & 0x70
+            low = changed & 0x0F
+            if low & 0x01:
+                (delta_us,) = read_fmt(f, "<i", "inclin delta_ts")
+                ts_us       = ss["ts_us"] + delta_us
+                ss["ts_us"] = ts_us
+            else:
+                ts_us = ss["ts_us"]
+            vals = []
+            for idx, (delta_bit, nan_bit) in enumerate(((0x02, CHANGED_NAN_X), (0x04, CHANGED_NAN_Y), (0x08, CHANGED_NAN_Z))):
+                if nan_mask & nan_bit:
+                    vals.append(None)
+                    continue
+                d = read_fmt(f, "<h", "inclin delta")[0] if (low & delta_bit) else 0
+                prev[idx] += d
+                vals.append(prev[idx] / INCLIN_SCALE)
+            out.append((ts_us / TS_SCALE, vals[0], vals[1], vals[2]))
+        ss["xyz_prev"] = prev
+        return out or None
+    (changed,) = read_fmt(f, "<B", "inclin changed")
+    if changed & 0x01:
+        (delta_us,) = read_fmt(f, "<i", "inclin delta_ts")
+        ts_us       = ss["ts_us"] + delta_us
+        ss["ts_us"] = ts_us
+    else:
+        ts_us = ss["ts_us"]
+    dr = read_fmt(f, "<h", "inclin dr")[0] if changed & 0x02 else 0
+    dp = read_fmt(f, "<h", "inclin dp")[0] if changed & 0x04 else 0
+    dy = read_fmt(f, "<h", "inclin dy")[0] if changed & 0x08 else 0
+    prev[0] += dr; prev[1] += dp; prev[2] += dy
     ss["xyz_prev"] = prev
-    return out or None
+    return [(ts_us / TS_SCALE, prev[0] / INCLIN_SCALE, prev[1] / INCLIN_SCALE, prev[2] / INCLIN_SCALE)]
 
 def _decode_temp_abs(f, state):
     ts_us   = _reconstruct_abs_ts(f, state["temp"])
     (val,)  = read_fmt(f, "<i", "temp abs")
-    state["temp"]["val_prev"] = val
-    return (ts_us / TS_SCALE, val / TEMP_SCALE)
+    if val != INT32_NAN_SENTINEL:
+        state["temp"]["val_prev"] = val
+        out = val / TEMP_SCALE
+    else:
+        out = None
+    return (ts_us / TS_SCALE, out)
 
-def _decode_temp_delta(f, state):
+def _decode_temp_delta(f, state, fv):
     ss = state["temp"]
     (changed,) = read_fmt(f, "<B", "temp changed")
-    if changed & 0x01:
+    low = changed & 0x0F
+    if low & 0x01:
         (delta_us,) = read_fmt(f, "<i", "temp delta_ts")
         ts_us       = ss["ts_us"] + delta_us
         ss["ts_us"] = ts_us
     else:
         ts_us = ss["ts_us"]
-    if changed & 0x02:
+    is_nan = (fv >= FORMAT_V3) and bool(changed & CHANGED_NAN_TEMP)
+    if is_nan:
+        return (ts_us / TS_SCALE, None)
+    if low & 0x02:
         (dt,) = read_fmt(f, "<h", "temp dval")
         ss["val_prev"] = ss["val_prev"] + dt
     return (ts_us / TS_SCALE, ss["val_prev"] / TEMP_SCALE)
@@ -253,7 +313,7 @@ def decode_file(filepath: str, verbose: bool = False):
         if not ver:
             return records
         fv = ver[0]
-        if fv not in (FORMAT_V1, FORMAT_V2):
+        if fv not in (FORMAT_V1, FORMAT_V2, FORMAT_V3):
             # No version byte — old file starting with sentinel 0xFF or header.
             # Seek back 1 byte and decode as v1 (original format).
             f.seek(-1, 1)
@@ -269,31 +329,31 @@ def decode_file(filepath: str, verbose: bool = False):
                 if sentinel == SENTINEL:
                     (header,) = read_fmt(f, "<B", "abs header")
                     rec = {"record_index": idx, "record_type": "ABSOLUTE",
-                           "accel_samples": None, "inclin_samples": None, "temp": None}
+                           "accel_samples": None, "inclin": None, "temp": None}
                     if header & FLAG_ACCEL:
                         rec["accel_samples"] = _decode_accel_abs(f, state)
                     if header & FLAG_INCLIN:
-                        rec["inclin_samples"] = _decode_inclin_abs(f, state)
+                        rec["inclin"] = _decode_inclin_abs(f, state, fv)
                     if header & FLAG_TEMP:
                         rec["temp"] = _decode_temp_abs(f, state)
                 else:
                     header = sentinel
                     rec = {"record_index": idx, "record_type": "DELTA",
-                           "accel_samples": None, "inclin_samples": None, "temp": None}
+                           "accel_samples": None, "inclin": None, "temp": None}
                     if fv == FORMAT_V1:
                         if header & FLAG_ACCEL:
                             rec["accel_samples"] = _decode_accel_delta_v1(f, state)
                         if header & FLAG_INCLIN:
-                            rec["inclin_samples"] = _decode_inclin_delta_v1(f, state)
+                            rec["inclin"] = _decode_inclin_delta_v1(f, state)
                         if header & FLAG_TEMP:
                             rec["temp"] = _decode_temp_delta_v1(f, state)
                     else:
                         if header & FLAG_ACCEL:
-                            rec["accel_samples"] = _decode_accel_delta(f, state)
+                            rec["accel_samples"] = _decode_accel_delta(f, state, fv)
                         if header & FLAG_INCLIN:
-                            rec["inclin_samples"] = _decode_inclin_delta(f, state)
+                            rec["inclin"] = _decode_inclin_delta(f, state, fv)
                         if header & FLAG_TEMP:
-                            rec["temp"] = _decode_temp_delta(f, state)
+                            rec["temp"] = _decode_temp_delta(f, state, fv)
 
                 records.append(rec)
                 if verbose:
@@ -317,15 +377,14 @@ def _print_record(rec):
     if rec["accel_samples"]:
         for i, (ts, x, y, z) in enumerate(rec["accel_samples"]):
             print(f"  Accel[{i}]  ts={ts:.6f} ({ts_to_str(ts)})  "
-                  f"x={x:+.4f}  y={y:+.4f}  z={z:+.4f} g")
-    if rec["inclin_samples"]:
-        for i, (ts, r, p, y) in enumerate(rec["inclin_samples"]):
+                  f"x={_fmt_opt(x, '+.4f')}  y={_fmt_opt(y, '+.4f')}  z={_fmt_opt(z, '+.4f')} g")
+    if rec["inclin"]:
+        for i, (ts, r, p, y) in enumerate(rec["inclin"]):
             print(f"  Inclin[{i}] ts={ts:.6f} ({ts_to_str(ts)})  "
-                  f"roll={r:+.4f}  pitch={p:+.4f}  yaw={y:+.4f} °")
+                  f"roll={_fmt_opt(r, '+.4f')}  pitch={_fmt_opt(p, '+.4f')}  yaw={_fmt_opt(y, '+.4f')} °")
     if rec["temp"]:
         ts, v = rec["temp"]
-        print(f"  Temp      ts={ts:.6f} ({ts_to_str(ts)})  {v:.2f} °C")
-
+        print(f"  Temp      ts={ts:.6f} ({ts_to_str(ts)})  {_fmt_opt(v, '.2f')} °C")
 
 def print_summary(records, filepath):
     print(f"\n{'='*60}")
@@ -338,66 +397,49 @@ def print_summary(records, filepath):
     print(f"  ABSOLUTE: {abs_cnt}   DELTA: {len(records)-abs_cnt}")
 
     all_accel  = [s for r in records if r["accel_samples"] for s in r["accel_samples"]]
-    all_inclin = [sample for r in records for sample in (r["inclin_samples"] or [])]
+    all_inclin = [s for r in records if r["inclin"] for s in r["inclin"]]
     all_temp   = [r["temp"]   for r in records if r["temp"]]
 
     if all_accel:
-        xs = [s[1] for s in all_accel]; ys = [s[2] for s in all_accel]; zs = [s[3] for s in all_accel]
+        xs = [s[1] for s in all_accel if s[1] is not None]; ys = [s[2] for s in all_accel if s[2] is not None]; zs = [s[3] for s in all_accel if s[3] is not None]
         ts = [s[0] for s in all_accel]
         print(f"  Accel samples : {len(all_accel)}")
         print(f"    time span   : {ts_to_str(min(ts))}  →  {ts_to_str(max(ts))}")
-        print(f"    X [{min(xs):+.4f}, {max(xs):+.4f}] g")
-        print(f"    Y [{min(ys):+.4f}, {max(ys):+.4f}] g")
-        print(f"    Z [{min(zs):+.4f}, {max(zs):+.4f}] g")
+        if xs: print(f"    X [{min(xs):+.4f}, {max(xs):+.4f}] g")
+        if ys: print(f"    Y [{min(ys):+.4f}, {max(ys):+.4f}] g")
+        if zs: print(f"    Z [{min(zs):+.4f}, {max(zs):+.4f}] g")
 
     if all_inclin:
-        rs=[v[1] for v in all_inclin]; ps=[v[2] for v in all_inclin]; ys=[v[3] for v in all_inclin]
+        rs=[v[1] for v in all_inclin if v[1] is not None]; ps=[v[2] for v in all_inclin if v[2] is not None]; ys=[v[3] for v in all_inclin if v[3] is not None]
         ts=[v[0] for v in all_inclin]
         print(f"  Inclin samples: {len(all_inclin)}")
         print(f"    time span   : {ts_to_str(min(ts))}  →  {ts_to_str(max(ts))}")
-        print(f"    roll  [{min(rs):+.4f}, {max(rs):+.4f}] °")
-        print(f"    pitch [{min(ps):+.4f}, {max(ps):+.4f}] °")
-        print(f"    yaw   [{min(ys):+.4f}, {max(ys):+.4f}] °")
+        if rs: print(f"    roll  [{min(rs):+.4f}, {max(rs):+.4f}] °")
+        if ps: print(f"    pitch [{min(ps):+.4f}, {max(ps):+.4f}] °")
+        if ys: print(f"    yaw   [{min(ys):+.4f}, {max(ys):+.4f}] °")
 
     if all_temp:
-        vs=[v[1] for v in all_temp]; ts=[v[0] for v in all_temp]
+        vs=[v[1] for v in all_temp if v[1] is not None]; ts=[v[0] for v in all_temp]
         print(f"  Temp samples  : {len(all_temp)}")
         print(f"    time span   : {ts_to_str(min(ts))}  →  {ts_to_str(max(ts))}")
-        print(f"    [{min(vs):.2f}, {max(vs):.2f}] °C")
+        if vs: print(f"    [{min(vs):.2f}, {max(vs):.2f}] °C")
     print('='*60)
 
-
 def export_csv(records, csv_path):
-    fields = ["record_index","record_type",
-              "accel_sample_idx","accel_ts","accel_x","accel_y","accel_z",
-              "inclin_ts","inclin_roll","inclin_pitch","inclin_yaw",
-              "temp_ts","temp_c"]
+    fields = ["record_index","record_type","sample_kind","sample_idx","ts","x","y","z","value"]
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for rec in records:
-            base = {
-                "record_index": rec["record_index"],
-                "record_type":  rec["record_type"],
-                "inclin_ts":    f"{rec['inclin_samples'][0][0]:.6f}" if rec["inclin_samples"] else "",
-                "inclin_roll":  f"{rec['inclin_samples'][0][1]:.3f}" if rec["inclin_samples"] else "",
-                "inclin_pitch": f"{rec['inclin_samples'][0][2]:.3f}" if rec["inclin_samples"] else "",
-                "inclin_yaw":   f"{rec['inclin_samples'][0][3]:.3f}" if rec["inclin_samples"] else "",
-                "temp_ts":      f"{rec['temp'][0]:.6f}"      if rec["temp"] else "",
-                "temp_c":       f"{rec['temp'][1]:.2f}"      if rec["temp"] else "",
-            }
             if rec["accel_samples"]:
                 for i, (ts, x, y, z) in enumerate(rec["accel_samples"]):
-                    row = dict(base)
-                    row.update(accel_sample_idx=i,
-                               accel_ts=f"{ts:.6f}", accel_x=f"{x:.3f}",
-                               accel_y=f"{y:.3f}",   accel_z=f"{z:.3f}")
-                    w.writerow(row)
-            else:
-                row = dict(base)
-                row.update(accel_sample_idx="", accel_ts="",
-                           accel_x="", accel_y="", accel_z="")
-                w.writerow(row)
+                    w.writerow({"record_index": rec["record_index"], "record_type": rec["record_type"], "sample_kind": "accel", "sample_idx": i, "ts": f"{ts:.6f}", "x": "" if x is None else f"{x:.4f}", "y": "" if y is None else f"{y:.4f}", "z": "" if z is None else f"{z:.4f}", "value": ""})
+            if rec["inclin"]:
+                for i, (ts, r, p, y) in enumerate(rec["inclin"]):
+                    w.writerow({"record_index": rec["record_index"], "record_type": rec["record_type"], "sample_kind": "inclin", "sample_idx": i, "ts": f"{ts:.6f}", "x": "" if r is None else f"{r:.4f}", "y": "" if p is None else f"{p:.4f}", "z": "" if y is None else f"{y:.4f}", "value": ""})
+            if rec["temp"]:
+                ts, v = rec["temp"]
+                w.writerow({"record_index": rec["record_index"], "record_type": rec["record_type"], "sample_kind": "temp", "sample_idx": 0, "ts": f"{ts:.6f}", "x": "", "y": "", "z": "", "value": "" if v is None else f"{v:.2f}"})
     print(f"CSV exported → {csv_path}  ({len(records)} records)")
 
 

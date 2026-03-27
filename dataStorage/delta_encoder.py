@@ -8,6 +8,7 @@ import queue
 import threading
 
 import gzip
+import math
 
 # Fault logging helper moved out of this file.
 from fault_event_ts import log_faults_from_packet
@@ -35,6 +36,17 @@ _ssd_ok        = False   # True when SSD is mounted and writable
 _ssd_last_warn = 0.0     # monotonic time of last SSD-unavailable warning
 _SSD_WARN_INTERVAL = 30.0  # seconds between repeated SSD warnings
 
+DELTA_NULL_THRESHOLD = 1
+INT32_NAN_SENTINEL = -2147483648
+
+CHANGED_TS = 0x01
+CHANGED_X = 0x02
+CHANGED_Y = 0x04
+CHANGED_Z = 0x08
+CHANGED_NAN_X = 0x10
+CHANGED_NAN_Y = 0x20
+CHANGED_NAN_Z = 0x40
+CHANGED_NAN_TEMP = CHANGED_NAN_X
 
 def _check_ssd() -> bool:
     """Return True if the SSD is mounted and the data directory is writable.
@@ -102,7 +114,7 @@ GZIP_LEVEL = 4
 
 # -------------------------------------------------------------------
 # Packet format (JSON input):
-#   {"a": [[t,x,y,z], ...], "i": [[t,x,y,z], ...], "T": [t,val]}
+#   {"a": [[t,x,y,z], ...], "i": [t,x,y,z], "T": [t,val]}
 #   Each sensor carries its own ISO 8601 UTC timestamp string.
 #
 # Binary format — each sensor tracks its own timestamps independently.
@@ -113,15 +125,10 @@ ACCEL_SCALE = 10000     # 0.0001 g -> int
 INCLIN_SCALE = 10000    # 0.0001 ° -> int
 TS_SCALE = 1_000_000    # seconds  -> µs
 
-FILE_FORMAT_VERSION = 2
+FILE_FORMAT_VERSION = 3
 
 MAX_DELTA_S = 60.0
 INT16_MAX = 32767
-
-# Deadband threshold for value deltas. If |Δ| <= threshold, the value delta is
-# omitted from the delta record (stored as null / unchanged). Units are the
-# encoder's scaled integer counts, not engineering units.
-DELTA_NULL_THRESHOLD = 1
 
 TS_MIN = 1_577_836_800.0   # 2020-01-01
 TS_MAX = 4_102_444_800.0   # 2100-01-01
@@ -180,11 +187,7 @@ def normalise_sensor_timestamps(data: dict, node_id: str) -> bool:
             sample[0] = ts
 
     if "i" in data:
-        inclin_samples = data["i"]
-        if inclin_samples and not isinstance(inclin_samples[0], (list, tuple)):
-            inclin_samples = [inclin_samples]
-            data["i"] = inclin_samples
-        for sample in inclin_samples:
+        for sample in data["i"]:
             ts = parse_iso_timestamp(str(sample[0]), node_id)
             if ts is None:
                 return False
@@ -241,30 +244,32 @@ def needs_absolute_record(data: dict, state: dict) -> tuple[bool, str]:
         if abs(gap) > MAX_DELTA_S:
             return True, f"accel timestamp gap {gap:.1f} s"
 
-        prev = state["accel"]["xyz_prev"]
+        prev = list(state["accel"]["xyz_prev"])
         for s in data["a"]:
-            xi = int(float(s[1]) * ACCEL_SCALE)
-            yi = int(float(s[2]) * ACCEL_SCALE)
-            zi = int(float(s[3]) * ACCEL_SCALE)
-            for d, name in ((xi - prev[0], "x"), (yi - prev[1], "y"), (zi - prev[2], "z")):
+            for idx, (raw, scale, name) in enumerate(((s[1], ACCEL_SCALE, "x"), (s[2], ACCEL_SCALE, "y"), (s[3], ACCEL_SCALE, "z"))):
+                if _is_nan_value(raw):
+                    continue
+                cur = int(float(raw) * scale)
+                d = cur - prev[idx]
                 if abs(d) >= INT16_MAX:
                     return True, f"accel {name} delta {d} would clip int16"
-            prev = [xi, yi, zi]
+                prev[idx] = cur
 
     if "i" in data and len(data["i"]) > 0:
         ts_s = float(data["i"][0][0])
         gap = ts_s - state["inclin"]["ts_us"] / TS_SCALE
         if abs(gap) > MAX_DELTA_S:
             return True, f"inclin timestamp gap {gap:.1f} s"
-        prev = state["inclin"]["xyz_prev"]
+        prev = list(state["inclin"]["xyz_prev"])
         for s in data["i"]:
-            ri = int(float(s[1]) * INCLIN_SCALE)
-            pi = int(float(s[2]) * INCLIN_SCALE)
-            yi = int(float(s[3]) * INCLIN_SCALE)
-            for d, name in ((ri - prev[0], "roll"), (pi - prev[1], "pitch"), (yi - prev[2], "yaw")):
+            for idx, (raw, scale, name) in enumerate(((s[1], INCLIN_SCALE, "roll"), (s[2], INCLIN_SCALE, "pitch"), (s[3], INCLIN_SCALE, "yaw"))):
+                if _is_nan_value(raw):
+                    continue
+                cur = int(float(raw) * scale)
+                d = cur - prev[idx]
                 if abs(d) >= INT16_MAX:
                     return True, f"inclin {name} delta {d} would clip int16"
-            prev = [ri, pi, yi]
+                prev[idx] = cur
 
     if "T" in data:
         ts_s = float(data["T"][0])
@@ -273,6 +278,7 @@ def needs_absolute_record(data: dict, state: dict) -> tuple[bool, str]:
             gap = ts_s - state["temp"]["ts_us"] / TS_SCALE
             if abs(gap) > MAX_DELTA_S:
                 return True, f"temp timestamp gap {gap:.1f} s"
+        if len(data["T"]) > 1 and not _is_nan_value(data["T"][1]):
             d = int(float(data["T"][1]) * TEMP_SCALE) - state["temp"]["val_prev"]
             if abs(d) >= INT16_MAX:
                 return True, f"temp delta {d} would clip int16"
@@ -295,10 +301,19 @@ def _pack_delta(value: int) -> bytes:
     """Clamp and pack a signed delta as int16."""
     return struct.pack("<h", max(-32768, min(32767, value)))
 
+def _is_nan_value(value) -> bool:
+    try:
+        return math.isnan(float(value))
+    except (TypeError, ValueError):
+        return False
 
 def _apply_null_threshold(delta: int, threshold: int = DELTA_NULL_THRESHOLD) -> int:
-    """Return 0 when |delta| is within the configured deadband threshold."""
     return 0 if abs(delta) <= threshold else delta
+
+def _encode_abs_component(value, scale: int):
+    if _is_nan_value(value):
+        return INT32_NAN_SENTINEL, False
+    return int(float(value) * scale), True
 
 
 # -------------------------------------------------------------------
@@ -314,43 +329,42 @@ def encode_first_record(data: dict, state: dict) -> bytes:
         header |= 0x01
         samples = data["a"]
         body += struct.pack("<B", len(samples))
+        prev = list(state["accel"]["xyz_prev"])
         for s in samples:
-            xi = int(float(s[1]) * ACCEL_SCALE)
-            yi = int(float(s[2]) * ACCEL_SCALE)
-            zi = int(float(s[3]) * ACCEL_SCALE)
+            xi, hx = _encode_abs_component(s[1], ACCEL_SCALE)
+            yi, hy = _encode_abs_component(s[2], ACCEL_SCALE)
+            zi, hz = _encode_abs_component(s[3], ACCEL_SCALE)
             body += _abs_ts_bytes(float(s[0]), state["accel"])
             body += struct.pack("<iii", xi, yi, zi)
-        last = samples[-1]
-        state["accel"]["xyz_prev"] = [
-            int(float(last[1]) * ACCEL_SCALE),
-            int(float(last[2]) * ACCEL_SCALE),
-            int(float(last[3]) * ACCEL_SCALE),
-        ]
+            if hx: prev[0] = xi
+            if hy: prev[1] = yi
+            if hz: prev[2] = zi
+        state["accel"]["xyz_prev"] = prev
 
     if "i" in data and len(data["i"]) > 0:
         header |= 0x02
         samples = data["i"]
         body += struct.pack("<B", len(samples))
+        prev = list(state["inclin"]["xyz_prev"])
         for s in samples:
-            ri = int(float(s[1]) * INCLIN_SCALE)
-            pi = int(float(s[2]) * INCLIN_SCALE)
-            yi = int(float(s[3]) * INCLIN_SCALE)
+            ri, hr = _encode_abs_component(s[1], INCLIN_SCALE)
+            pi, hp = _encode_abs_component(s[2], INCLIN_SCALE)
+            yi, hy = _encode_abs_component(s[3], INCLIN_SCALE)
             body += _abs_ts_bytes(float(s[0]), state["inclin"])
             body += struct.pack("<iii", ri, pi, yi)
-        last = samples[-1]
-        state["inclin"]["xyz_prev"] = [
-            int(float(last[1]) * INCLIN_SCALE),
-            int(float(last[2]) * INCLIN_SCALE),
-            int(float(last[3]) * INCLIN_SCALE),
-        ]
+            if hr: prev[0] = ri
+            if hp: prev[1] = pi
+            if hy: prev[2] = yi
+        state["inclin"]["xyz_prev"] = prev
 
     if "T" in data:
         header |= 0x04
         tv = data["T"]
-        vi = int(float(tv[1]) * TEMP_SCALE)
+        vi, have_val = _encode_abs_component(tv[1], TEMP_SCALE)
         body += _abs_ts_bytes(float(tv[0]), state["temp"])
         body += struct.pack("<i", vi)
-        state["temp"]["val_prev"] = vi
+        if have_val:
+            state["temp"]["val_prev"] = vi
 
     return struct.pack("<BB", 0xFF, header) + bytes(body)
 
@@ -360,7 +374,7 @@ def encode_first_record(data: dict, state: dict) -> bytes:
 # -------------------------------------------------------------------
 
 def encode_delta_record(data: dict, state: dict) -> bytes:
-    """Encode a DELTA record using changed-bit masks."""
+    """Encode a DELTA record using changed-bit masks plus explicit NaN flags."""
     header = 0
     body = bytearray()
 
@@ -368,16 +382,13 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
         header |= 0x01
         samples = data["a"]
         body += struct.pack("<B", len(samples))
-        prev = state["accel"]["xyz_prev"]
+        prev = list(state["accel"]["xyz_prev"])
         ss = state["accel"]
 
         for s in samples:
-            xi = int(float(s[1]) * ACCEL_SCALE)
-            yi = int(float(s[2]) * ACCEL_SCALE)
-            zi = int(float(s[3]) * ACCEL_SCALE)
-            dx = _apply_null_threshold(xi - prev[0])
-            dy = _apply_null_threshold(yi - prev[1])
-            dz = _apply_null_threshold(zi - prev[2])
+            nan_x = _is_nan_value(s[1])
+            nan_y = _is_nan_value(s[2])
+            nan_z = _is_nan_value(s[3])
 
             ts_us_new = int(float(s[0]) * TS_SCALE)
             delta_us = ts_us_new - ss["ts_us"]
@@ -385,12 +396,33 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
             changed = 0
             if delta_us != 0:
                 changed |= 0x01
-            if dx != 0:
-                changed |= 0x02
-            if dy != 0:
-                changed |= 0x04
-            if dz != 0:
-                changed |= 0x08
+
+            if nan_x:
+                dx = 0
+                changed |= CHANGED_NAN_X
+            else:
+                xi = int(float(s[1]) * ACCEL_SCALE)
+                dx = _apply_null_threshold(xi - prev[0])
+                if dx != 0:
+                    changed |= 0x02
+
+            if nan_y:
+                dy = 0
+                changed |= CHANGED_NAN_Y
+            else:
+                yi = int(float(s[2]) * ACCEL_SCALE)
+                dy = _apply_null_threshold(yi - prev[1])
+                if dy != 0:
+                    changed |= 0x04
+
+            if nan_z:
+                dz = 0
+                changed |= CHANGED_NAN_Z
+            else:
+                zi = int(float(s[3]) * ACCEL_SCALE)
+                dz = _apply_null_threshold(zi - prev[2])
+                if dz != 0:
+                    changed |= 0x08
 
             body += struct.pack("<B", changed)
             if changed & 0x01:
@@ -403,7 +435,12 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
                 body += _pack_delta(dz)
 
             ss["ts_us"] = ts_us_new
-            prev = [prev[0] + dx, prev[1] + dy, prev[2] + dz]
+            if not nan_x:
+                prev[0] += dx
+            if not nan_y:
+                prev[1] += dy
+            if not nan_z:
+                prev[2] += dz
 
         state["accel"]["xyz_prev"] = prev
 
@@ -411,16 +448,13 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
         header |= 0x02
         samples = data["i"]
         body += struct.pack("<B", len(samples))
+        prev = list(state["inclin"]["xyz_prev"])
         ss = state["inclin"]
-        prev = ss["xyz_prev"]
 
         for s in samples:
-            ri = int(float(s[1]) * INCLIN_SCALE)
-            pi = int(float(s[2]) * INCLIN_SCALE)
-            yi = int(float(s[3]) * INCLIN_SCALE)
-            dr = _apply_null_threshold(ri - prev[0])
-            dp = _apply_null_threshold(pi - prev[1])
-            dy = _apply_null_threshold(yi - prev[2])
+            nan_r = _is_nan_value(s[1])
+            nan_p = _is_nan_value(s[2])
+            nan_y = _is_nan_value(s[3])
 
             ts_us_new = int(float(s[0]) * TS_SCALE)
             delta_us = ts_us_new - ss["ts_us"]
@@ -428,12 +462,33 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
             changed = 0
             if delta_us != 0:
                 changed |= 0x01
-            if dr != 0:
-                changed |= 0x02
-            if dp != 0:
-                changed |= 0x04
-            if dy != 0:
-                changed |= 0x08
+
+            if nan_r:
+                dr = 0
+                changed |= CHANGED_NAN_X
+            else:
+                ri = int(float(s[1]) * INCLIN_SCALE)
+                dr = _apply_null_threshold(ri - prev[0])
+                if dr != 0:
+                    changed |= 0x02
+
+            if nan_p:
+                dp = 0
+                changed |= CHANGED_NAN_Y
+            else:
+                pi = int(float(s[2]) * INCLIN_SCALE)
+                dp = _apply_null_threshold(pi - prev[1])
+                if dp != 0:
+                    changed |= 0x04
+
+            if nan_y:
+                dy = 0
+                changed |= CHANGED_NAN_Z
+            else:
+                yi = int(float(s[3]) * INCLIN_SCALE)
+                dy = _apply_null_threshold(yi - prev[2])
+                if dy != 0:
+                    changed |= 0x08
 
             body += struct.pack("<B", changed)
             if changed & 0x01:
@@ -446,36 +501,46 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
                 body += _pack_delta(dy)
 
             ss["ts_us"] = ts_us_new
-            prev = [prev[0] + dr, prev[1] + dp, prev[2] + dy]
+            if not nan_r:
+                prev[0] += dr
+            if not nan_p:
+                prev[1] += dp
+            if not nan_y:
+                prev[2] += dy
 
-        ss["xyz_prev"] = prev
+        state["inclin"]["xyz_prev"] = prev
 
     if "T" in data:
         tv = data["T"]
         ss = state["temp"]
-        vi = int(float(tv[1]) * TEMP_SCALE)
         ts_us_new = int(float(tv[0]) * TS_SCALE)
         delta_us = ts_us_new - ss["ts_us"]
-        dt = _apply_null_threshold(vi - ss["val_prev"])
+        val_is_nan = _is_nan_value(tv[1])
 
-        is_frozen = (ts_us_new == ss["ts_us"] and dt == 0)
+        changed = 0
+        if delta_us != 0:
+            changed |= 0x01
+        if val_is_nan:
+            changed |= CHANGED_NAN_TEMP
+            dt = 0
+        else:
+            vi = int(float(tv[1]) * TEMP_SCALE)
+            dt = _apply_null_threshold(vi - ss["val_prev"])
+            if dt != 0:
+                changed |= 0x02
+
+        is_frozen = (changed == 0)
         ss["ts_us"] = ts_us_new
 
         if not is_frozen:
             header |= 0x04
-            changed = 0
-            if delta_us != 0:
-                changed |= 0x01
-            if dt != 0:
-                changed |= 0x02
-
             body += struct.pack("<B", changed)
             if changed & 0x01:
                 body += struct.pack("<i", delta_us)
             if changed & 0x02:
                 body += _pack_delta(dt)
-
-            ss["val_prev"] = ss["val_prev"] + dt
+            if not val_is_nan:
+                ss["val_prev"] += dt
 
     return struct.pack("<B", header) + bytes(body)
 

@@ -31,6 +31,12 @@ SENTINEL    = 0xFF
 
 FORMAT_V1 = 1
 FORMAT_V2 = 2
+FORMAT_V3 = 3
+INT32_NAN_SENTINEL = -2147483648
+CHANGED_NAN_X = 0x10
+CHANGED_NAN_Y = 0x20
+CHANGED_NAN_Z = 0x40
+CHANGED_NAN_TEMP = 0x10
 
 
 # Per-sensor inter-packet jump thresholds (seconds).
@@ -83,6 +89,9 @@ def ts_str(ts_s):
     except Exception:
         return f"<invalid {ts_s:.1f}>"
 
+def fmt_scaled_opt(raw, scale, unit_fmt="+.4f"):
+    return "NaN" if raw == INT32_NAN_SENTINEL or raw is None else format(raw / scale, unit_fmt)
+
 def _date_str(ts_s):
     try:
         return datetime.utcfromtimestamp(max(0, int(ts_s))).strftime("%Y-%m-%d")
@@ -110,7 +119,7 @@ def pass1_structural(filepath, focus_record=None):
     with open_decompressed(filepath) as f:
         ver = f.read(1)
         fv  = ver[0] if ver else FORMAT_V2
-        if fv not in (FORMAT_V1, FORMAT_V2):
+        if fv not in (FORMAT_V1, FORMAT_V2, FORMAT_V3):
             f.seek(-1, 1)  # no version byte — seek back, treat as v1
             fv = FORMAT_V1
         print(f"  File format: v{fv}")
@@ -142,15 +151,24 @@ def pass1_structural(filepath, focus_record=None):
                                       f"x={x/ACCEL_SCALE:+.4f}  y={y/ACCEL_SCALE:+.4f}  z={z/ACCEL_SCALE:+.4f} g")
 
                     if header & FLAG_INCLIN:
-                        (n,) = read_fmt(f, "<B", "inclin n")
-                        if show: print(f"  │  inclin n={n}")
-                        for i in range(n):
-                            (ts_us,) = read_fmt(f, "<q", f"inclin[{i}] ts")
-                            r, p, y  = read_fmt(f, "<iii", f"inclin[{i}] xyz")
+                        if fv >= FORMAT_V3:
+                            (n,) = read_fmt(f, "<B", "inclin n")
+                            if show: print(f"  │  inclin n={n}")
+                            for i in range(n):
+                                (ts_us,) = read_fmt(f, "<q", f"inclin[{i}] ts")
+                                r, p, y  = read_fmt(f, "<iii", f"inclin[{i}] xyz")
+                                _check_ts(ts_us, idx, "ABSOLUTE/inclin", issues)
+                                if show:
+                                    ts_s = ts_us / TS_SCALE
+                                    print(f"  │    [{i}] ts={ts_us}µs ({ts_str(ts_s)})  "
+                                          f"r={fmt_scaled_opt(r, INCLIN_SCALE)}  p={fmt_scaled_opt(p, INCLIN_SCALE)}  y={fmt_scaled_opt(y, INCLIN_SCALE)} °")
+                        else:
+                            (ts_us,) = read_fmt(f, "<q", "inclin ts")
+                            r, p, y  = read_fmt(f, "<iii", "inclin xyz")
                             _check_ts(ts_us, idx, "ABSOLUTE/inclin", issues)
                             if show:
                                 ts_s = ts_us / TS_SCALE
-                                print(f"  │    [{i}] ts={ts_us}µs ({ts_str(ts_s)})  "
+                                print(f"  │  inclin ts={ts_us}µs ({ts_str(ts_s)})  "
                                       f"r={r/INCLIN_SCALE:+.4f}  p={p/INCLIN_SCALE:+.4f}  y={y/INCLIN_SCALE:+.4f} °")
 
                     if header & FLAG_TEMP:
@@ -159,7 +177,8 @@ def pass1_structural(filepath, focus_record=None):
                         _check_ts(ts_us, idx, "ABSOLUTE/temp", issues)
                         if show:
                             ts_s = ts_us / TS_SCALE
-                            print(f"  │  temp ts={ts_us}µs ({ts_str(ts_s)})  val={val/TEMP_SCALE:.2f} °C")
+                            val_s = "NaN" if val == INT32_NAN_SENTINEL else f"{val/TEMP_SCALE:.2f}"
+                            print(f"  │  temp ts={ts_us}µs ({ts_str(ts_s)})  val={val_s} °C")
 
                     if show: print(f"  └─")
 
@@ -191,18 +210,35 @@ def pass1_structural(filepath, focus_record=None):
                                       f"Δx={dx_s}  Δy={dy_s}  Δz={dz_s} g")
 
                     if header & FLAG_INCLIN:
-                        (n,) = read_fmt(f, "<B", "inclin n")
-                        if show: print(f"  │  inclin n={n}")
-                        for i in range(n):
-                            (changed,) = read_fmt(f, "<B", f"inclin[{i}] changed")
+                        if fv >= FORMAT_V3:
+                            (n,) = read_fmt(f, "<B", "inclin n")
+                            if show: print(f"  │  inclin n={n}")
+                            for i in range(n):
+                                (changed,) = read_fmt(f, "<B", f"inclin[{i}] changed")
+                                low = changed & 0x0F
+                                nan_mask = changed & 0x70
+                                delta_ts = dr = dp = dy = None
+                                if low & 0x01:
+                                    (delta_ts,) = read_fmt(f, "<i", f"inclin[{i}] delta_ts")
+                                if low & 0x02: (dr,) = read_fmt(f, "<h", f"inclin[{i}] dr")
+                                if low & 0x04: (dp,) = read_fmt(f, "<h", f"inclin[{i}] dp")
+                                if low & 0x08: (dy,) = read_fmt(f, "<h", f"inclin[{i}] dyaw")
+                                if show:
+                                    dts_s = f"{delta_ts}µs" if delta_ts is not None else "null"
+                                    dr_s  = "NaN" if nan_mask & CHANGED_NAN_X else (f"{dr/INCLIN_SCALE:+.4f}" if dr is not None else "null")
+                                    dp_s  = "NaN" if nan_mask & CHANGED_NAN_Y else (f"{dp/INCLIN_SCALE:+.4f}" if dp is not None else "null")
+                                    dy_s  = "NaN" if nan_mask & CHANGED_NAN_Z else (f"{dy/INCLIN_SCALE:+.4f}" if dy is not None else "null")
+                                    print(f"  │    [{i}] changed=0x{changed:02X}  delta_ts={dts_s}  Δr={dr_s}  Δp={dp_s}  Δy={dy_s} °")
+                        else:
+                            (changed,) = read_fmt(f, "<B", "inclin changed")
                             delta_ts = dr = dp = dy = None
                             if changed & 0x01:
-                                (delta_ts,) = read_fmt(f, "<i", f"inclin[{i}] delta_ts")
+                                (delta_ts,) = read_fmt(f, "<i", "inclin delta_ts")
                                 if abs(delta_ts) > DOD_WARN_THRESH:
                                     issues.append((idx, "DELTA/inclin", f"delta_ts={delta_ts} near int32 overflow"))
-                            if changed & 0x02: (dr,) = read_fmt(f, "<h", f"inclin[{i}] dr")
-                            if changed & 0x04: (dp,) = read_fmt(f, "<h", f"inclin[{i}] dp")
-                            if changed & 0x08: (dy,) = read_fmt(f, "<h", f"inclin[{i}] dyaw")
+                            if changed & 0x02: (dr,) = read_fmt(f, "<h", "inclin dr")
+                            if changed & 0x04: (dp,) = read_fmt(f, "<h", "inclin dp")
+                            if changed & 0x08: (dy,) = read_fmt(f, "<h", "inclin dyaw")
                             for v, name in [(dr,"dr"),(dp,"dp")]:
                                 if v is not None and abs(v) == 32767:
                                     issues.append((idx, "DELTA/inclin", f"{name} hit int16 max — likely clipped"))
@@ -211,23 +247,23 @@ def pass1_structural(filepath, focus_record=None):
                                 dr_s  = f"{dr/INCLIN_SCALE:+.4f}" if dr is not None else "null"
                                 dp_s  = f"{dp/INCLIN_SCALE:+.4f}" if dp is not None else "null"
                                 dy_s  = f"{dy/INCLIN_SCALE:+.4f}" if dy is not None else "null"
-                                print(f"  │    [{i}] changed=0x{changed:02X}  delta_ts={dts_s}  "
-                                      f"Δr={dr_s}  Δp={dp_s}  Δy={dy_s} °")
+                                print(f"  │  inclin changed=0x{changed:02X}  delta_ts={dts_s}  Δr={dr_s}  Δp={dp_s}  Δy={dy_s} °")
 
                     if header & FLAG_TEMP:
                         (changed,) = read_fmt(f, "<B", "temp changed")
+                        low = changed & 0x0F
                         delta_ts = dt = None
-                        if changed & 0x01:
+                        if low & 0x01:
                             (delta_ts,) = read_fmt(f, "<i", "temp delta_ts")
                             if abs(delta_ts) > DOD_WARN_THRESH:
                                 issues.append((idx, "DELTA/temp", f"delta_ts={delta_ts} near int32 overflow"))
-                        if changed & 0x02:
+                        if low & 0x02:
                             (dt,) = read_fmt(f, "<h", "temp dval")
                             if abs(dt) == 32767:
                                 issues.append((idx, "DELTA/temp", f"Δtemp={dt} hit int16 max — likely clipped"))
                         if show:
                             dts_s = f"{delta_ts}µs" if delta_ts is not None else "null"
-                            dt_s  = f"{dt/TEMP_SCALE:+.4f}" if dt is not None else "null"
+                            dt_s  = "NaN" if changed & CHANGED_NAN_TEMP else (f"{dt/TEMP_SCALE:+.4f}" if dt is not None else "null")
                             print(f"  │  temp  changed=0x{changed:02X}  delta_ts={dts_s}  Δval={dt_s} °C")
 
                     if show: print(f"  └─")
@@ -316,7 +352,7 @@ def pass2_delta_trace(filepath, focus_record=None):
     with open_decompressed(filepath) as f:
         ver = f.read(1)
         fv  = ver[0] if ver else FORMAT_V2
-        if fv not in (FORMAT_V1, FORMAT_V2):
+        if fv not in (FORMAT_V1, FORMAT_V2, FORMAT_V3):
             f.seek(-1, 1)  # no version byte — seek back, treat as v1
             fv = FORMAT_V1
         print(f"  File format: v{fv}")
@@ -346,22 +382,36 @@ def pass2_delta_trace(filepath, focus_record=None):
                                 print(f"    state.accel.xyz_prev ← {[x,y,z]}  ({[fmt_a(v) for v in [x,y,z]]})")
 
                     if header & FLAG_INCLIN:
-                        ts_us = _abs_ts(f, state["inclin"], "inclin.ts", is_first_sample=True)
-                        r, p, y = read_fmt(f, "<iii", "inclin")
-                        state["inclin"]["xyz_prev"] = [r, p, y]
-                        if show:
-                            print(f"    inclin ts={ts_us}µs ({ts_str(ts_us/TS_SCALE)})  "
-                                  f"r={fmt_i(r)}  p={fmt_i(p)}  y={fmt_i(y)} °")
-                            print(f"    state.inclin.xyz_prev ← {[r,p,y]}")
+                        if fv >= FORMAT_V3:
+                            (n,) = read_fmt(f, "<B", "inclin n")
+                            ss = state["inclin"]
+                            prev = ss["xyz_prev"]
+                            for i in range(n):
+                                ts_us = _abs_ts(f, ss, f"inclin[{i}].ts", is_first_sample=(i == 0))
+                                r, p, y = read_fmt(f, "<iii", f"inclin[{i}]")
+                                if r != INT32_NAN_SENTINEL: prev[0] = r
+                                if p != INT32_NAN_SENTINEL: prev[1] = p
+                                if y != INT32_NAN_SENTINEL: prev[2] = y
+                                if show:
+                                    print(f"    inclin[{i}] ts={ts_us}µs ({ts_str(ts_us/TS_SCALE)})  r={fmt_scaled_opt(r, INCLIN_SCALE)}  p={fmt_scaled_opt(p, INCLIN_SCALE)}  y={fmt_scaled_opt(y, INCLIN_SCALE)} °")
+                        else:
+                            ts_us = _abs_ts(f, state["inclin"], "inclin.ts", is_first_sample=True)
+                            r, p, y = read_fmt(f, "<iii", "inclin")
+                            state["inclin"]["xyz_prev"] = [r, p, y]
+                            if show:
+                                print(f"    inclin ts={ts_us}µs ({ts_str(ts_us/TS_SCALE)})  r={fmt_i(r)}  p={fmt_i(p)}  y={fmt_i(y)} °")
+                                print(f"    state.inclin.xyz_prev ← {[r,p,y]}")
 
                     if header & FLAG_TEMP:
                         ts_us = _abs_ts(f, state["temp"], "temp.ts", is_first_sample=True)
                         (val,) = read_fmt(f, "<i", "temp")
-                        state["temp"]["val_prev"] = val
+                        if val != INT32_NAN_SENTINEL:
+                            state["temp"]["val_prev"] = val
                         if show:
-                            print(f"    temp ts={ts_us}µs ({ts_str(ts_us/TS_SCALE)})  "
-                                  f"val={fmt_t(val)} °C")
-                            print(f"    state.temp.val_prev ← {val}")
+                            val_s = "NaN" if val == INT32_NAN_SENTINEL else fmt_t(val)
+                            print(f"    temp ts={ts_us}µs ({ts_str(ts_us/TS_SCALE)})  val={val_s} °C")
+                            if val != INT32_NAN_SENTINEL:
+                                print(f"    state.temp.val_prev ← {val}")
 
                 else:
                     header = sentinel
@@ -386,9 +436,9 @@ def pass2_delta_trace(filepath, focus_record=None):
                             dz = read_fmt(f, "<h", f"accel[{i}] dz")[0] if changed & 0x08 else 0
                             cur = [prev[0]+dx, prev[1]+dy, prev[2]+dz]
                             if show:
-                                dx_s = str(dx) if changed & 0x02 else "null(|Δ|<=1 or unchanged)"
-                                dy_s = str(dy) if changed & 0x04 else "null(|Δ|<=1 or unchanged)"
-                                dz_s = str(dz) if changed & 0x08 else "null(|Δ|<=1 or unchanged)"
+                                dx_s = str(dx) if changed & 0x02 else "null"
+                                dy_s = str(dy) if changed & 0x04 else "null"
+                                dz_s = str(dz) if changed & 0x08 else "null"
                                 print(f"    accel[{i}] changed=0x{changed:02X}  Δ=({dx_s},{dy_s},{dz_s})  "
                                       f"prev={[fmt_a(v) for v in prev]}  "
                                       f"→ now={[fmt_a(v) for v in cur]} g")
@@ -397,26 +447,51 @@ def pass2_delta_trace(filepath, focus_record=None):
 
                     if header & FLAG_INCLIN:
                         ss = state["inclin"]
-                        (changed,) = read_fmt(f, "<B", "inclin changed")
-                        if changed & 0x01:
-                            (delta_us,) = read_fmt(f, "<i", "inclin.ts")
-                            ts_us       = _delta_ts(ss, delta_us, "inclin.ts", show, idx, is_first_sample=True)
-                        else:
-                            ts_us = ss["ts_us"]
-                            if show: print(f"    inclin.ts: null (unchanged)")
                         prev = ss["xyz_prev"]
-                        dr  = read_fmt(f, "<h", "inclin dr")[0]   if changed & 0x02 else 0
-                        dp  = read_fmt(f, "<h", "inclin dp")[0]   if changed & 0x04 else 0
-                        dy_ = read_fmt(f, "<h", "inclin dyaw")[0] if changed & 0x08 else 0
-                        cur = [prev[0]+dr, prev[1]+dp, prev[2]+dy_]
-                        ss["xyz_prev"] = cur
-                        if show:
-                            dr_s  = str(dr)  if changed & 0x02 else "null"
-                            dp_s  = str(dp)  if changed & 0x04 else "null"
-                            dy_s  = str(dy_) if changed & 0x08 else "null"
-                            print(f"    inclin changed=0x{changed:02X}  Δ=({dr_s},{dp_s},{dy_s})  "
-                                  f"prev={[fmt_i(v) for v in prev]}  "
-                                  f"→ now={[fmt_i(v) for v in cur]} °")
+                        if fv >= FORMAT_V3:
+                            (n,) = read_fmt(f, "<B", "inclin n")
+                            for i in range(n):
+                                (changed,) = read_fmt(f, "<B", f"inclin[{i}] changed")
+                                low = changed & 0x0F
+                                nan_mask = changed & 0x70
+                                if low & 0x01:
+                                    (delta_us,) = read_fmt(f, "<i", f"inclin[{i}].ts")
+                                    ts_us = _delta_ts(ss, delta_us, f"inclin[{i}].ts", show, idx, is_first_sample=(i == 0))
+                                else:
+                                    ts_us = ss["ts_us"]
+                                    if show: print(f"    inclin[{i}].ts: null (unchanged)")
+                                vals = []
+                                labels=[]
+                                for axis, delta_bit, nan_bit in ((0,0x02,CHANGED_NAN_X),(1,0x04,CHANGED_NAN_Y),(2,0x08,CHANGED_NAN_Z)):
+                                    if nan_mask & nan_bit:
+                                        vals.append('NaN')
+                                        labels.append('NaN')
+                                    else:
+                                        d = read_fmt(f, "<h", "inclin delta")[0] if (low & delta_bit) else 0
+                                        prev[axis] += d
+                                        vals.append(prev[axis])
+                                        labels.append(str(d) if (low & delta_bit) else 'null')
+                                if show:
+                                    now_fmt = [fmt_i(v) if isinstance(v,int) else v for v in vals]
+                                    print(f"    inclin[{i}] changed=0x{changed:02X}  Δ=({labels[0]},{labels[1]},{labels[2]})  → now={now_fmt} °")
+                        else:
+                            (changed,) = read_fmt(f, "<B", "inclin changed")
+                            if changed & 0x01:
+                                (delta_us,) = read_fmt(f, "<i", "inclin.ts")
+                                ts_us       = _delta_ts(ss, delta_us, "inclin.ts", show, idx, is_first_sample=True)
+                            else:
+                                ts_us = ss["ts_us"]
+                                if show: print(f"    inclin.ts: null (unchanged)")
+                            dr  = read_fmt(f, "<h", "inclin dr")[0]   if changed & 0x02 else 0
+                            dp  = read_fmt(f, "<h", "inclin dp")[0]   if changed & 0x04 else 0
+                            dy_ = read_fmt(f, "<h", "inclin dyaw")[0] if changed & 0x08 else 0
+                            cur = [prev[0]+dr, prev[1]+dp, prev[2]+dy_]
+                            ss["xyz_prev"] = cur
+                            if show:
+                                dr_s  = str(dr)  if changed & 0x02 else "null"
+                                dp_s  = str(dp)  if changed & 0x04 else "null"
+                                dy_s  = str(dy_) if changed & 0x08 else "null"
+                                print(f"    inclin changed=0x{changed:02X}  Δ=({dr_s},{dp_s},{dy_s})  prev={[fmt_i(v) for v in prev]}  → now={[fmt_i(v) for v in cur]} °")
 
                     if header & FLAG_TEMP:
                         ss = state["temp"]
@@ -436,7 +511,7 @@ def pass2_delta_trace(filepath, focus_record=None):
                             dt  = None
                             cur = prev
                         if show:
-                            dt_s = f"{dt} ({dt/TEMP_SCALE:+.2f} °C)" if dt is not None else "null(|Δ|<=1 or unchanged)"
+                            dt_s = f"{dt} ({dt/TEMP_SCALE:+.2f} °C)" if dt is not None else "null"
                             print(f"    temp changed=0x{changed:02X}  Δ={dt_s}  "
                                   f"prev={fmt_t(prev)}  → now={fmt_t(cur)} °C")
 
