@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
+import useAuth from "../../Auth/useAuth";
 import FaultLog from "../../components/FaultLog/Log";
 import NodeMap from "../../components/NodeMap/NodeMap";
 import {
@@ -39,6 +40,7 @@ function getBackendWarningMessage(state: BackendHealthBadgeState) {
 }
 
 export default function Home() {
+  const { isAdmin } = useAuth();
   const navigate = useNavigate();
 
   const [backendHealthState, setBackendHealthState] =
@@ -369,6 +371,7 @@ export default function Home() {
               <NodeMap
                 nodes={nodes}
                 warningSerials={warningSerials}
+                canEdit={isAdmin}
                 onNodeClick={(node) =>
                   navigate(
                     `/sensor-management?serial=${encodeURIComponent(node.serial)}`

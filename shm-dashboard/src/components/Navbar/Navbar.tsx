@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
-import { NavLink, useNavigate } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
+import { NavLink } from "react-router-dom";
+import useAuth from "../../Auth/useAuth";
 import { getSiteName, putSiteName } from "../../services/api";
 import "./Navbar.css";
 
@@ -8,6 +9,7 @@ interface NavItem {
   label: string;
   icon: string;
   to: string;
+  adminOnly?: boolean;
 }
 
 const navItems: NavItem[] = [
@@ -17,12 +19,17 @@ const navItems: NavItem[] = [
   { id: "fault-log", label: "Fault Log", icon: "⚠️", to: "/fault-log" },
   { id: "export", label: "Export", icon: "💾", to: "/export" },
   { id: "decoder", label: "Decoder", icon: "D", to: "/decoder" },
+  /*
+    The Users page will be added later. The nav item is defined now so the
+    navbar structure is ready once the route and page are created.
+  */
+  { id: "users", label: "Users", icon: "U", to: "/users", adminOnly: true },
 ];
 
 const DEFAULT_DASHBOARD_TITLE = "Cape Scott, BC";
 
 const Navbar = () => {
-  const navigate = useNavigate();
+  const { user, isAdmin, logout } = useAuth();
 
   // Stores the shared dashboard title loaded from the backend.
   const [dashboardTitle, setDashboardTitle] = useState(DEFAULT_DASHBOARD_TITLE);
@@ -38,6 +45,15 @@ const Navbar = () => {
 
   // Prevents duplicate saves when Enter and blur happen close together.
   const [isSavingTitle, setIsSavingTitle] = useState(false);
+
+  /*
+    Admin-only items are filtered from the nav for viewer users.
+    This keeps the Users page hidden until the user has the correct role.
+  */
+  const visibleNavItems = useMemo(
+    () => navItems.filter((item) => !item.adminOnly || isAdmin),
+    [isAdmin]
+  );
 
   // Load the shared site name from the backend when the navbar first mounts.
   useEffect(() => {
@@ -58,26 +74,33 @@ const Navbar = () => {
       }
     }
 
-    loadSiteName();
+    void loadSiteName();
 
     return () => controller.abort();
   }, []);
 
-  function handleLogout() {
-    sessionStorage.removeItem("isAuth");
-    navigate("/login", { replace: true });
+  async function handleLogout() {
+    try {
+      /*
+        Logout is delegated to the shared auth context so navbar does not
+        manage auth state directly.
+      */
+      await logout();
+    } catch (error) {
+      console.error("Failed to log out cleanly.", error);
+    }
   }
 
   // Opens title edit mode using the latest saved title.
   function handleStartEditingTitle() {
-    if (loadingTitle) return;
+    if (loadingTitle || !isAdmin) return;
     setTitleInput(dashboardTitle);
     setIsEditingTitle(true);
   }
 
   // Saves the dashboard title to the backend so all dashboards reflect the same value.
   async function handleSaveTitle() {
-    if (isSavingTitle) return;
+    if (isSavingTitle || !isAdmin) return;
 
     const trimmed = titleInput.trim();
     const nextTitle = trimmed || DEFAULT_DASHBOARD_TITLE;
@@ -121,6 +144,7 @@ const Navbar = () => {
       <div className="navbar-header">
         <div className="navbar-header-top">
           <span className="navbar-kicker">Site</span>
+          <span className="navbar-role-pill">{user?.role === "admin" ? "Admin" : "Viewer"}</span>
         </div>
 
         {isEditingTitle ? (
@@ -142,22 +166,24 @@ const Navbar = () => {
               {loadingTitle ? "Loading..." : dashboardTitle}
             </h1>
 
-            <button
-              type="button"
-              className="navbar-edit-button"
-              onClick={handleStartEditingTitle}
-              aria-label="Edit dashboard title"
-              title="Edit title"
-              disabled={loadingTitle}
-            >
-              ✎
-            </button>
+            {isAdmin && (
+              <button
+                type="button"
+                className="navbar-edit-button"
+                onClick={handleStartEditingTitle}
+                aria-label="Edit dashboard title"
+                title="Edit title"
+                disabled={loadingTitle}
+              >
+                ✎
+              </button>
+            )}
           </div>
         )}
       </div>
 
       <ul className="navbar-menu">
-        {navItems.map((item) => (
+        {visibleNavItems.map((item) => (
           <li key={item.id}>
             <NavLink
               to={item.to}
@@ -177,7 +203,12 @@ const Navbar = () => {
       </ul>
 
       <div className="navbar-footer">
-        <button className="logout-button" onClick={handleLogout}>
+        <div className="navbar-user-meta">
+          <span className="navbar-user-name">{user?.username || "Unknown user"}</span>
+          <span className="navbar-user-role">{user?.role || "viewer"}</span>
+        </div>
+
+        <button className="logout-button" onClick={() => void handleLogout()}>
           Logout
         </button>
       </div>
