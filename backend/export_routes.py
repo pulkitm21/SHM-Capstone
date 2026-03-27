@@ -10,6 +10,7 @@ from starlette.background import BackgroundTask
 
 from export_utils import (
     FAULTS_DB,
+    build_export_member_name,
     build_fault_export_filename,
     build_fault_export_where,
     build_raw_sensor_export_metadata_text,
@@ -18,6 +19,7 @@ from export_utils import (
     create_temp_export_dir,
     create_temp_export_path,
     create_zip_from_paths,
+    extract_sensor_bucket_from_filename,
     find_sensor_files_for_serial,
     is_fault_db_available,
     is_sensor_data_available,
@@ -26,7 +28,7 @@ from export_utils import (
     remove_temp_file,
     stage_files_for_zip,
     utc_now_iso,
-    validate_required_day_range,
+    validate_required_day_hour_range,
     write_fault_csv,
     write_text_file,
 )
@@ -130,9 +132,11 @@ def export_sensor_data(
     node_ids: str = Query(..., description="Comma-separated node ids, e.g. 1,2,3"),
     start_day: str = Query(...),
     end_day: str = Query(...),
+    start_hour: Optional[str] = Query(default=None),
+    end_hour: Optional[str] = Query(default=None),
 ):
     """
-    Export raw hourly sensor storage files for the selected nodes and day range.
+    Export raw hourly sensor storage files for the selected nodes and date/hour range.
 
     Output format:
     - always returns a ZIP
@@ -147,7 +151,14 @@ def export_sensor_data(
 
     try:
         parsed_node_ids = parse_node_ids_csv(node_ids)
-        start_iso, end_exclusive_iso = validate_required_day_range(start_day, end_day)
+        start_iso, end_exclusive_iso, parsed_start_hour, parsed_end_hour = (
+            validate_required_day_hour_range(
+                start_day=start_day,
+                end_day=end_day,
+                start_hour=start_hour,
+                end_hour=end_hour,
+            )
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -172,12 +183,13 @@ def export_sensor_data(
     export_dir = create_temp_export_dir(prefix="sensor_export_")
     zip_path = create_temp_export_path(prefix="sensor_export_", suffix=".zip")
 
-    matched_source_files: list[Path] = []
+    staged_sources: list[tuple[Path, str]] = []
     node_file_counts: dict[str, int] = {}
     exported_files: dict[str, list[str]] = {}
 
     try:
         for node in resolved_nodes:
+            node_id = int(node["node_id"])
             serial = str(node["serial"])
 
             matching_files = find_sensor_files_for_serial(
@@ -186,25 +198,36 @@ def export_sensor_data(
                 end_exclusive_iso=end_exclusive_iso,
             )
 
-            node_file_counts[serial] = len(matching_files)
-            exported_files[serial] = [path.name for path in matching_files]
-            matched_source_files.extend(matching_files)
+            renamed_files: list[str] = []
+            for source_path in matching_files:
+                bucket_day, bucket_hour = extract_sensor_bucket_from_filename(source_path.name)
+                export_name = build_export_member_name(
+                    node_id=node_id,
+                    bucket_day=bucket_day,
+                    bucket_hour=bucket_hour,
+                    source_name=source_path.name,
+                )
+                staged_sources.append((source_path, export_name))
+                renamed_files.append(export_name)
 
-        if not matched_source_files:
+            node_file_counts[serial] = len(matching_files)
+            exported_files[serial] = renamed_files
+
+        if not staged_sources:
             raise HTTPException(
                 status_code=404,
-                detail="No sensor files matched the selected nodes and day range.",
+                detail="No sensor files matched the selected nodes and date/hour range.",
             )
 
-        # Copy source files into the temp export folder first so the outbound ZIP
-        # contains a stable snapshot of the matched backend files.
-        staged_file_paths = stage_files_for_zip(export_dir, matched_source_files)
+        staged_file_paths = stage_files_for_zip(export_dir, staged_sources)
 
         metadata_path = export_dir / "export_metadata.txt"
         metadata_text = build_raw_sensor_export_metadata_text(
             generated_at=utc_now_iso(),
             start_day=start_day,
             end_day=end_day,
+            start_hour=parsed_start_hour,
+            end_hour=parsed_end_hour,
             nodes=resolved_nodes,
             node_file_counts=node_file_counts,
             exported_files=exported_files,
@@ -229,7 +252,9 @@ def export_sensor_data(
     filename = build_sensor_export_zip_filename(
         start_day=start_day,
         end_day=end_day,
-        node_count=len(resolved_nodes),
+        node_ids=parsed_node_ids,
+        start_hour=parsed_start_hour,
+        end_hour=parsed_end_hour,
     )
 
     return FileResponse(

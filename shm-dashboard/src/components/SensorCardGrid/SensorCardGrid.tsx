@@ -5,7 +5,7 @@ export type SensorCardItem = {
   label: string;
   value: SensorValue;
   model: string;
-  status: "online" | "offline" | "warning";
+  status: "online" | "offline" | "warning" | "idle";
 };
 
 type Props = {

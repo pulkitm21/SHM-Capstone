@@ -469,6 +469,8 @@ export type SensorExportParams = {
   node_ids: number[];
   start_day: string;
   end_day: string;
+  start_hour?: string;
+  end_hour?: string;
 };
 
 async function downloadFromEndpoint(
@@ -519,6 +521,8 @@ export async function downloadSensorExport(
   qs.set("node_ids", params.node_ids.join(","));
   qs.set("start_day", params.start_day);
   qs.set("end_day", params.end_day);
+  if (params.start_hour) qs.set("start_hour", params.start_hour);
+  if (params.end_hour) qs.set("end_hour", params.end_hour);
 
   await downloadFromEndpoint(`/api/exports/sensor-data?${qs.toString()}`, signal);
 }
@@ -555,11 +559,13 @@ export type PruneStoredDataBody = {
   older_than_days: number;
 };
 
-export type SensorHealthStatus = "online" | "offline" | "warning";
+export type SensorHealthStatus = "online" | "offline" | "warning" | "idle";
 
 export type SensorHealthDetail = {
   status: SensorHealthStatus;
   has_data: boolean;
+  has_valid_data?: boolean;
+  has_nan_data?: boolean;
   last_data_ts?: string | null;
   active_fault_count: number;
   active_faults: FaultRow[];

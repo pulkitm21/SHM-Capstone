@@ -10,8 +10,7 @@ import threading
 import gzip
 import math
 
-# Fault logging helper moved out of this file.
-from fault_event_ts import log_faults_from_packet
+from fault_logger import log_fault_events
 
 ## Addition for ACK
 from node_registry import register_serial, serial_from_topic, get_node_by_serial
@@ -26,6 +25,7 @@ BROKER_IP = "localhost"
 PORT = 1883
 TOPIC = "wind_turbine/+/data"
 STATUS_TOPIC = "wind_turbine/+/status"  # MQTT status topic for ACK/state updates
+FAULT_TOPIC = "wind_turbine/+/faults"
 
 DATA_DIR  = "/mnt/ssd/data"
 SSD_MOUNT = "/mnt/ssd"
@@ -681,7 +681,6 @@ def handle_status_message(topic: str, payload_bytes: bytes) -> None:
     """Process node status messages and update backend config/runtime state."""
     try:
         serial = serial_from_topic(topic)
-        register_serial(serial)
 
         node = get_node_by_serial(serial, timeout_seconds=60)
         if node is None:
@@ -723,12 +722,53 @@ def handle_status_message(topic: str, payload_bytes: bytes) -> None:
         print(f"Failed to process status message on {topic}: {e}")
 
 
+def handle_fault_message(topic: str, payload_bytes: bytes) -> None:
+    """
+    Process fault messages from wind_turbine/{serial}/faults.
+    Expected payload:
+    {"ts": "...", "f": 7} OR {"ts": "...", "f": [7,10]}
+    """
+    try:
+        serial = serial_from_topic(topic)
+
+        # keep node registry activity fresh for fault-only traffic too
+        register_serial(serial)
+
+        data = json.loads(payload_bytes.decode())
+
+        ts = data.get("ts")
+        faults = data.get("f")
+
+        if ts is None or faults is None:
+            print(f"[faults] Invalid payload from {serial}: {data}")
+            return
+
+        # normalize to list
+        if isinstance(faults, int):
+            faults = [faults]
+        elif not isinstance(faults, list):
+            print(f"[faults] Invalid fault format from {serial}: {faults}")
+            return
+
+        # build events [(code, ts), ...]
+        fault_events = [(int(code), ts) for code in faults]
+
+        # log directly
+        log_fault_events(
+            serial_number=serial,
+            fault_events=fault_events,
+        )
+
+    except Exception as e:
+        print(f"Error processing fault message on {topic}: {e}")
+
+
 # -------------------------------------------------------------------
 # MQTT callbacks
 # -------------------------------------------------------------------
 
 def on_connect(client, userdata, flags, reason_code, properties):
-    """Subscribe to data and status topics on successful MQTT connect."""
+    """Subscribe to data, status, and fault topics on successful MQTT connect."""
     if reason_code == 0:
         print("[MQTT] Connected to broker")
     else:
@@ -737,6 +777,7 @@ def on_connect(client, userdata, flags, reason_code, properties):
 
     client.subscribe(TOPIC)
     client.subscribe(STATUS_TOPIC)
+    client.subscribe(FAULT_TOPIC)
 
 
 def on_disconnect(client, userdata, flags, reason_code, properties):
@@ -751,10 +792,14 @@ def on_disconnect(client, userdata, flags, reason_code, properties):
 
 
 def on_message(client, userdata, msg):
-    """Handle incoming MQTT packets for status updates and sensor data."""
+    """Handle incoming MQTT packets for status updates, fault events, and sensor data."""
     try:
         if msg.topic.endswith("/status"):
             handle_status_message(msg.topic, msg.payload)
+            return
+
+        if msg.topic.endswith("/faults"):
+            handle_fault_message(msg.topic, msg.payload)
             return
 
         if not msg.topic.endswith("/data"):
@@ -762,6 +807,8 @@ def on_message(client, userdata, msg):
 
         topic_parts = msg.topic.split("/")
         node_id = topic_parts[1]
+
+        # keep node registry activity fresh for data traffic
         register_serial(node_id)
 
         # Raw backup is written first so the original packet is preserved.
@@ -769,13 +816,6 @@ def on_message(client, userdata, msg):
 
         # Parse the JSON payload.
         data = json.loads(msg.payload.decode())
-
-        # Fault logging is handled in a separate helper so this file stays focused on storage.
-        log_faults_from_packet(
-            serial_number=node_id,
-            packet=data,
-            receive_iso=now_iso(),
-        )
 
         # Normalize sensor timestamps only for binary storage.
         if not normalise_sensor_timestamps(data, node_id):

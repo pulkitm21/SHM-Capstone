@@ -44,7 +44,7 @@ type PlotCacheRecord = {
   data: ApiResponse;
 };
 
-type SensorStatusValue = "online" | "offline" | "warning";
+type SensorStatusValue = "online" | "offline" | "warning" | "idle";
 
 type SensorStatusMap = Record<
   SensorValue,
@@ -279,9 +279,9 @@ function buildFallbackSensorStatus(
     }
 
     return {
-      status: "online" as const,
+      status: "idle" as const,
       count: 0,
-      hasData: true,
+      hasData: false,
       lastDataTs: null,
     };
   };
