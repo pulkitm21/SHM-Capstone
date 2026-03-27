@@ -142,13 +142,16 @@ def pass1_structural(filepath, focus_record=None):
                                       f"x={x/ACCEL_SCALE:+.4f}  y={y/ACCEL_SCALE:+.4f}  z={z/ACCEL_SCALE:+.4f} g")
 
                     if header & FLAG_INCLIN:
-                        (ts_us,) = read_fmt(f, "<q", "inclin ts")
-                        r, p, y  = read_fmt(f, "<iii", "inclin xyz")
-                        _check_ts(ts_us, idx, "ABSOLUTE/inclin", issues)
-                        if show:
-                            ts_s = ts_us / TS_SCALE
-                            print(f"  │  inclin ts={ts_us}µs ({ts_str(ts_s)})  "
-                                  f"r={r/INCLIN_SCALE:+.4f}  p={p/INCLIN_SCALE:+.4f}  y={y/INCLIN_SCALE:+.4f} °")
+                        (n,) = read_fmt(f, "<B", "inclin n")
+                        if show: print(f"  │  inclin n={n}")
+                        for i in range(n):
+                            (ts_us,) = read_fmt(f, "<q", f"inclin[{i}] ts")
+                            r, p, y  = read_fmt(f, "<iii", f"inclin[{i}] xyz")
+                            _check_ts(ts_us, idx, "ABSOLUTE/inclin", issues)
+                            if show:
+                                ts_s = ts_us / TS_SCALE
+                                print(f"  │    [{i}] ts={ts_us}µs ({ts_str(ts_s)})  "
+                                      f"r={r/INCLIN_SCALE:+.4f}  p={p/INCLIN_SCALE:+.4f}  y={y/INCLIN_SCALE:+.4f} °")
 
                     if header & FLAG_TEMP:
                         (ts_us,) = read_fmt(f, "<q", "temp ts")
@@ -188,25 +191,28 @@ def pass1_structural(filepath, focus_record=None):
                                       f"Δx={dx_s}  Δy={dy_s}  Δz={dz_s} g")
 
                     if header & FLAG_INCLIN:
-                        (changed,) = read_fmt(f, "<B", "inclin changed")
-                        delta_ts = dr = dp = dy = None
-                        if changed & 0x01:
-                            (delta_ts,) = read_fmt(f, "<i", "inclin delta_ts")
-                            if abs(delta_ts) > DOD_WARN_THRESH:
-                                issues.append((idx, "DELTA/inclin", f"delta_ts={delta_ts} near int32 overflow"))
-                        if changed & 0x02: (dr,) = read_fmt(f, "<h", "inclin dr")
-                        if changed & 0x04: (dp,) = read_fmt(f, "<h", "inclin dp")
-                        if changed & 0x08: (dy,) = read_fmt(f, "<h", "inclin dyaw")
-                        for v, name in [(dr,"dr"),(dp,"dp")]:
-                            if v is not None and abs(v) == 32767:
-                                issues.append((idx, "DELTA/inclin", f"{name} hit int16 max — likely clipped"))
-                        if show:
-                            dts_s = f"{delta_ts}µs" if delta_ts is not None else "null"
-                            dr_s  = f"{dr/INCLIN_SCALE:+.4f}" if dr is not None else "null"
-                            dp_s  = f"{dp/INCLIN_SCALE:+.4f}" if dp is not None else "null"
-                            dy_s  = f"{dy/INCLIN_SCALE:+.4f}" if dy is not None else "null"
-                            print(f"  │  inclin changed=0x{changed:02X}  delta_ts={dts_s}  "
-                                  f"Δr={dr_s}  Δp={dp_s}  Δy={dy_s} °")
+                        (n,) = read_fmt(f, "<B", "inclin n")
+                        if show: print(f"  │  inclin n={n}")
+                        for i in range(n):
+                            (changed,) = read_fmt(f, "<B", f"inclin[{i}] changed")
+                            delta_ts = dr = dp = dy = None
+                            if changed & 0x01:
+                                (delta_ts,) = read_fmt(f, "<i", f"inclin[{i}] delta_ts")
+                                if abs(delta_ts) > DOD_WARN_THRESH:
+                                    issues.append((idx, "DELTA/inclin", f"delta_ts={delta_ts} near int32 overflow"))
+                            if changed & 0x02: (dr,) = read_fmt(f, "<h", f"inclin[{i}] dr")
+                            if changed & 0x04: (dp,) = read_fmt(f, "<h", f"inclin[{i}] dp")
+                            if changed & 0x08: (dy,) = read_fmt(f, "<h", f"inclin[{i}] dyaw")
+                            for v, name in [(dr,"dr"),(dp,"dp")]:
+                                if v is not None and abs(v) == 32767:
+                                    issues.append((idx, "DELTA/inclin", f"{name} hit int16 max — likely clipped"))
+                            if show:
+                                dts_s = f"{delta_ts}µs" if delta_ts is not None else "null"
+                                dr_s  = f"{dr/INCLIN_SCALE:+.4f}" if dr is not None else "null"
+                                dp_s  = f"{dp/INCLIN_SCALE:+.4f}" if dp is not None else "null"
+                                dy_s  = f"{dy/INCLIN_SCALE:+.4f}" if dy is not None else "null"
+                                print(f"  │    [{i}] changed=0x{changed:02X}  delta_ts={dts_s}  "
+                                      f"Δr={dr_s}  Δp={dp_s}  Δy={dy_s} °")
 
                     if header & FLAG_TEMP:
                         (changed,) = read_fmt(f, "<B", "temp changed")

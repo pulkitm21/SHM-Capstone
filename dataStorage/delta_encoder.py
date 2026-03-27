@@ -102,7 +102,7 @@ GZIP_LEVEL = 4
 
 # -------------------------------------------------------------------
 # Packet format (JSON input):
-#   {"a": [[t,x,y,z], ...], "i": [t,x,y,z], "T": [t,val]}
+#   {"a": [[t,x,y,z], ...], "i": [[t,x,y,z], ...], "T": [t,val]}
 #   Each sensor carries its own ISO 8601 UTC timestamp string.
 #
 # Binary format — each sensor tracks its own timestamps independently.
@@ -180,10 +180,15 @@ def normalise_sensor_timestamps(data: dict, node_id: str) -> bool:
             sample[0] = ts
 
     if "i" in data:
-        ts = parse_iso_timestamp(str(data["i"][0]), node_id)
-        if ts is None:
-            return False
-        data["i"][0] = ts
+        inclin_samples = data["i"]
+        if inclin_samples and not isinstance(inclin_samples[0], (list, tuple)):
+            inclin_samples = [inclin_samples]
+            data["i"] = inclin_samples
+        for sample in inclin_samples:
+            ts = parse_iso_timestamp(str(sample[0]), node_id)
+            if ts is None:
+                return False
+            sample[0] = ts
 
     if "T" in data:
         ts = parse_iso_timestamp(str(data["T"][0]), node_id)
@@ -246,16 +251,20 @@ def needs_absolute_record(data: dict, state: dict) -> tuple[bool, str]:
                     return True, f"accel {name} delta {d} would clip int16"
             prev = [xi, yi, zi]
 
-    if "i" in data:
-        ts_s = float(data["i"][0])
+    if "i" in data and len(data["i"]) > 0:
+        ts_s = float(data["i"][0][0])
         gap = ts_s - state["inclin"]["ts_us"] / TS_SCALE
         if abs(gap) > MAX_DELTA_S:
             return True, f"inclin timestamp gap {gap:.1f} s"
         prev = state["inclin"]["xyz_prev"]
-        for idx, name in enumerate(("roll", "pitch")):
-            d = int(float(data["i"][idx + 1]) * INCLIN_SCALE) - prev[idx]
-            if abs(d) >= INT16_MAX:
-                return True, f"inclin {name} delta {d} would clip int16"
+        for s in data["i"]:
+            ri = int(float(s[1]) * INCLIN_SCALE)
+            pi = int(float(s[2]) * INCLIN_SCALE)
+            yi = int(float(s[3]) * INCLIN_SCALE)
+            for d, name in ((ri - prev[0], "roll"), (pi - prev[1], "pitch"), (yi - prev[2], "yaw")):
+                if abs(d) >= INT16_MAX:
+                    return True, f"inclin {name} delta {d} would clip int16"
+            prev = [ri, pi, yi]
 
     if "T" in data:
         ts_s = float(data["T"][0])
@@ -318,15 +327,22 @@ def encode_first_record(data: dict, state: dict) -> bytes:
             int(float(last[3]) * ACCEL_SCALE),
         ]
 
-    if "i" in data:
+    if "i" in data and len(data["i"]) > 0:
         header |= 0x02
-        iv = data["i"]
-        ri = int(float(iv[1]) * INCLIN_SCALE)
-        pi = int(float(iv[2]) * INCLIN_SCALE)
-        yi = int(float(iv[3]) * INCLIN_SCALE)
-        body += _abs_ts_bytes(float(iv[0]), state["inclin"])
-        body += struct.pack("<iii", ri, pi, yi)
-        state["inclin"]["xyz_prev"] = [ri, pi, yi]
+        samples = data["i"]
+        body += struct.pack("<B", len(samples))
+        for s in samples:
+            ri = int(float(s[1]) * INCLIN_SCALE)
+            pi = int(float(s[2]) * INCLIN_SCALE)
+            yi = int(float(s[3]) * INCLIN_SCALE)
+            body += _abs_ts_bytes(float(s[0]), state["inclin"])
+            body += struct.pack("<iii", ri, pi, yi)
+        last = samples[-1]
+        state["inclin"]["xyz_prev"] = [
+            int(float(last[1]) * INCLIN_SCALE),
+            int(float(last[2]) * INCLIN_SCALE),
+            int(float(last[3]) * INCLIN_SCALE),
+        ]
 
     if "T" in data:
         header |= 0x04
@@ -391,43 +407,48 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
 
         state["accel"]["xyz_prev"] = prev
 
-    if "i" in data:
+    if "i" in data and len(data["i"]) > 0:
         header |= 0x02
-        iv = data["i"]
+        samples = data["i"]
+        body += struct.pack("<B", len(samples))
         ss = state["inclin"]
-        ri = int(float(iv[1]) * INCLIN_SCALE)
-        pi = int(float(iv[2]) * INCLIN_SCALE)
-        yi = int(float(iv[3]) * INCLIN_SCALE)
         prev = ss["xyz_prev"]
-        dr = _apply_null_threshold(ri - prev[0])
-        dp = _apply_null_threshold(pi - prev[1])
-        dy = _apply_null_threshold(yi - prev[2])
 
-        ts_us_new = int(float(iv[0]) * TS_SCALE)
-        delta_us = ts_us_new - ss["ts_us"]
+        for s in samples:
+            ri = int(float(s[1]) * INCLIN_SCALE)
+            pi = int(float(s[2]) * INCLIN_SCALE)
+            yi = int(float(s[3]) * INCLIN_SCALE)
+            dr = _apply_null_threshold(ri - prev[0])
+            dp = _apply_null_threshold(pi - prev[1])
+            dy = _apply_null_threshold(yi - prev[2])
 
-        changed = 0
-        if delta_us != 0:
-            changed |= 0x01
-        if dr != 0:
-            changed |= 0x02
-        if dp != 0:
-            changed |= 0x04
-        if dy != 0:
-            changed |= 0x08
+            ts_us_new = int(float(s[0]) * TS_SCALE)
+            delta_us = ts_us_new - ss["ts_us"]
 
-        body += struct.pack("<B", changed)
-        if changed & 0x01:
-            body += struct.pack("<i", delta_us)
-        if changed & 0x02:
-            body += _pack_delta(dr)
-        if changed & 0x04:
-            body += _pack_delta(dp)
-        if changed & 0x08:
-            body += _pack_delta(dy)
+            changed = 0
+            if delta_us != 0:
+                changed |= 0x01
+            if dr != 0:
+                changed |= 0x02
+            if dp != 0:
+                changed |= 0x04
+            if dy != 0:
+                changed |= 0x08
 
-        ss["ts_us"] = ts_us_new
-        ss["xyz_prev"] = [prev[0] + dr, prev[1] + dp, prev[2] + dy]
+            body += struct.pack("<B", changed)
+            if changed & 0x01:
+                body += struct.pack("<i", delta_us)
+            if changed & 0x02:
+                body += _pack_delta(dr)
+            if changed & 0x04:
+                body += _pack_delta(dp)
+            if changed & 0x08:
+                body += _pack_delta(dy)
+
+            ss["ts_us"] = ts_us_new
+            prev = [prev[0] + dr, prev[1] + dp, prev[2] + dy]
+
+        ss["xyz_prev"] = prev
 
     if "T" in data:
         tv = data["T"]
