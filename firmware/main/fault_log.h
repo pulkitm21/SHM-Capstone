@@ -73,6 +73,14 @@ extern "C" {
  * If the buffer fills up, older faults are overwritten (newest wins). */
 #define FAULT_LOG_MAX_PENDING       16
 
+/* Dedicated MQTT topic suffix for individual fault events.
+ * Full topic:  wind_turbine/<SERIAL>/faults
+ * Subscribe to wind_turbine/+/faults to receive faults from all nodes.
+ * Each message is a self-contained JSON object:
+ *   {"ts":"2025-01-15T12:34:56.000000Z","f":7}
+ * "ts" falls back to "tick:NNNNNNNNNN" (µs) before SNTP has synced. */
+#define FAULT_LOG_TOPIC_SUFFIX      "faults"
+
 /******************************************************************************
  * PUBLIC API
  *****************************************************************************/
@@ -84,9 +92,56 @@ extern "C" {
  * Do NOT call from an ISR — use the processing task to detect and log
  * faults that originate in the ISR (e.g. sample overflows).
  *
+ * If a publish callback has been registered via fault_log_set_publish_cb(),
+ * each fault is also immediately dispatched as an individual MQTT packet on
+ * wind_turbine/<SERIAL>/faults, regardless of sensor state (idle or recording).
+ * The timestamp uses SNTP-derived UTC when available, falling back to a
+ * microsecond tick string before the first SNTP sync.
+ *
  * @param fault_code  One of the FAULT_* defines above.
  */
 void fault_log_record(uint8_t fault_code);
+
+/**
+ * @brief Callback type for immediate per-fault MQTT publishing.
+ *
+ * Called by fault_log_record() with the fully-formed JSON payload.
+ * The implementor (in main.c) is responsible for constructing the full
+ * topic string using mqtt_get_serial_no() and FAULT_LOG_TOPIC_SUFFIX,
+ * then forwarding to mqtt_publish(). This keeps fault_log free of any
+ * dependency on mqtt.
+ *
+ * @param payload  Null-terminated JSON, e.g. {"ts":"2025-01-15T12:34:56.000000Z","f":7}
+ * @param len      Length of payload in bytes (excluding null terminator).
+ */
+typedef void (*fault_publish_cb_t)(const char *payload, int len);
+
+/**
+ * @brief Register the callback used to immediately publish individual faults.
+ *
+ * Call this from main.c after mqtt_init() succeeds. Until it is called,
+ * fault_log_record() still records faults into the pending buffer — they
+ * will be included in the next data packet — but no immediate publish occurs.
+ *
+ * Pass NULL to unregister (e.g. before mqtt_deinit()).
+ *
+ * @param cb  Function matching fault_publish_cb_t, or NULL to disable.
+ */
+void fault_log_set_publish_cb(fault_publish_cb_t cb);
+
+/**
+ * @brief Immediately publish all faults currently sitting in the pending buffer.
+ *
+ * Call this once from main.c immediately after fault_log_set_publish_cb(),
+ * to flush any faults that were recorded before the callback was registered
+ * (e.g. boot-time reset causes, sensor init failures). Each buffered fault
+ * is dispatched as an individual MQTT packet via the registered callback and
+ * then removed from the pending buffer.
+ *
+ * Has no effect if no callback is registered or the buffer is empty.
+ * Thread-safe.
+ */
+void fault_log_flush_pending(void);
 
 /**
  * @brief Returns true if there are unread fault codes waiting to be sent.

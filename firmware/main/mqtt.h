@@ -10,6 +10,12 @@
  *
  * - Data topic:   wind_turbine/<SERIAL>/data    e.g. wind_turbine/WT01-N03/data
  * - Status topic: wind_turbine/<SERIAL>/status  e.g. wind_turbine/WT01-N03/status
+ * - Faults topic: wind_turbine/<SERIAL>/faults  e.g. wind_turbine/WT01-N03/faults
+ *
+ * The faults topic receives one packet per fault event, published immediately
+ * via fault_log_record() regardless of sensor state (idle or recording).
+ * Format: {"ts":"2025-01-15T12:34:56.000000Z","f":7}
+ * Subscribe to wind_turbine/+/faults to receive faults from all nodes.
  *
  * ============================================================================
  * PROVISIONING A NODE (one-time setup per device)
@@ -52,6 +58,7 @@
  * To receive data from ALL nodes automatically, use:
  *
  *   Subscribe to:  wind_turbine/+/data
+ *   Subscribe to:  wind_turbine/+/faults   (per-fault events, published in any state)
  */
 
 #ifndef MQTT_H
@@ -97,6 +104,7 @@ extern "C" {
 
 #define MQTT_PUBLISH_QOS        0
 #define MQTT_ACCEL_BATCH_SIZE   200
+#define MQTT_INCL_BATCH_SIZE    20
 
 #define MQTT_TOPIC_PREFIX       "wind_turbine"
 
@@ -115,17 +123,22 @@ typedef struct {
     float z;
 } mqtt_accel_sample_t;
 
+typedef struct {
+    char  ts[MQTT_TS_LEN];
+    float x;
+    float y;
+    float z;
+} mqtt_incl_sample_t;
+
 /* Sensor data packet — every field carries its own timestamp */
 typedef struct {
     mqtt_accel_sample_t accel[MQTT_ACCEL_BATCH_SIZE];
-    int accel_count;
+    int  accel_count;
+    bool accel_valid;       /**< false = sensor disconnected, emit NaN array */
 
-    bool  has_angle;
-    bool  angle_valid;
-    char  angle_ts[MQTT_TS_LEN];
-    float angle_x;
-    float angle_y;
-    float angle_z;
+    mqtt_incl_sample_t incl[MQTT_INCL_BATCH_SIZE];
+    int  incl_count;        /**< number of valid incl samples in this packet */
+    bool incl_valid;        /**< false = sensor disconnected, emit NaN array */
 
     bool  has_temp;
     bool  temp_valid;
@@ -219,9 +232,16 @@ void mqtt_set_cmd_handler(mqtt_cmd_handler_t handler);
 /**
  * @brief Publish a structured status JSON to the status topic.
  *
- * Builds:
- *   {"state":"recording","odr_hz":1000,"range_g":2,"output_hz":200,
- *    "selftest_ok":true,"seq_ack":42}
+ * Builds (configure ACK example):
+ *   {"state":"configured","odr_hz":1000,"range_g":2,"hpf_corner":0,
+ *    "output_hz":200,"selftest_ok":true,"seq_ack":42}
+ *
+ * Builds (control ACK example):
+ *   {"state":"recording","cmd_ack":"start","seq_ack":101,"odr_hz":1000,
+ *    "range_g":2,"hpf_corner":0,"output_hz":200,"selftest_ok":true}
+ *
+ * @param cmd_ack  If non-NULL, emitted as "cmd_ack":"<value>" (for control ACKs).
+ *                 Pass NULL for configure ACKs.
  */
 esp_err_t mqtt_publish_status_json(const char *state_str,
                                    uint32_t odr_hz,
@@ -230,6 +250,7 @@ esp_err_t mqtt_publish_status_json(const char *state_str,
                                    uint8_t hpf_corner,
                                    bool selftest_ok,
                                    uint32_t seq_ack,
+                                   const char *cmd_ack,
                                    const char *error_msg);
 
 /**

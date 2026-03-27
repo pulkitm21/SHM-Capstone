@@ -9,6 +9,7 @@
  */
 
 #include "ethernet.h"
+#include "fault_log.h"
 
 #include <stdlib.h>
 
@@ -50,6 +51,7 @@ static esp_netif_t *s_eth_netif = NULL;
 static esp_eth_handle_t s_eth_handle = NULL;
 static esp_eth_netif_glue_handle_t s_eth_glue = NULL;
 static bool s_initialized = false;
+static bool s_eth_ever_connected = false; // distinguish first link-up from recovery
 
 // ethernet_init_all() allocates an array of handles
 static esp_eth_handle_t *s_eth_handles = NULL;
@@ -77,6 +79,12 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
         if (s_eth_event_group) {
             xEventGroupSetBits(s_eth_event_group, ETH_CONNECTED_BIT);
         }
+        /* Only log recovery for reconnects, not the initial link-up at boot */
+        if (s_eth_ever_connected) {
+            fault_log_record(FAULT_ETH_LINK_RECOVERED);
+        } else {
+            s_eth_ever_connected = true;
+        }
         break;
 
     case ETHERNET_EVENT_DISCONNECTED:
@@ -84,6 +92,7 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
         if (s_eth_event_group) {
             xEventGroupClearBits(s_eth_event_group, ETH_CONNECTED_BIT | ETH_GOT_IP_BIT);
         }
+        fault_log_record(FAULT_ETH_LINK_DOWN);
         break;
 
     case ETHERNET_EVENT_START:
@@ -313,6 +322,7 @@ esp_err_t ethernet_wait_for_ip(uint32_t timeout_ms)
         return ESP_OK;
     }
     ESP_LOGW(TAG, "Timeout waiting for IP address");
+    fault_log_record(FAULT_ETH_NO_IP);
     return ESP_ERR_TIMEOUT;
 }
 

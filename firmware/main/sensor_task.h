@@ -259,6 +259,34 @@ void sensor_acquisition_get_stats(uint32_t *samples_acquired,
 void sensor_acquisition_reset_stats(void);
 
 /**
+ * @brief Reset the SCL3300 ISR pipeline state.
+ *
+ * Call this from task context after re-initializing the SCL3300 sensor
+ * (e.g. after a hot-plug reconnect). Forces the ISR to re-prime the
+ * off-frame pipeline on the next tick, ensuring the rolling command/response
+ * sequence is properly synchronised with the freshly-initialised sensor.
+ */
+void scl3300_reset_isr_pipeline(void);
+
+/**
+ * @brief Inhibit/allow ADXL355 reads in the ISR.
+ *
+ * Set to true before reinitialising the ADXL355 from task context so the
+ * ISR does not issue SPI transactions that would collide with the init
+ * sequence. Set back to false after reinit completes.
+ */
+void adxl355_isr_set_inhibit(bool inhibit);
+
+/**
+ * @brief Inhibit/allow SCL3300 reads in the ISR.
+ *
+ * Set to true before reinitialising the SCL3300 from task context so the
+ * ISR does not issue SPI transactions that would collide with the init
+ * sequence. Set back to false after reinit completes.
+ */
+void scl3300_isr_set_inhibit(bool inhibit);
+
+/**
  * @brief Get current timer tick count
  * 
  * @return Current tick count (increments at 8000 Hz)
@@ -271,13 +299,19 @@ uint32_t get_tick_count(void);
  * Use these to determine whether the SCL3300 ISR block is firing and
  * what read_scl3300_raw() is returning, without needing a logic analyser.
  *
- * @param[out] calls    Total times read_scl3300_raw() was called
- * @param[out] valid    Times it returned true (sample written to ring buffer)
- * @param[out] primes   Times the pipeline was (re)primed
- * @param[out] discards Times the first-sample discard fired
+ * @param[out] isr_fired     Total times SCL3300 ISR block was entered
+ * @param[out] prime_count   Times the pipeline was (re)primed
+ * @param[out] discard_count Times the first-sample discard fired
+ * @param[out] valid_count   Times read returned true (sample pushed to ring buf)
+ * @param[out] invalid_count Times read returned false (not prime, not discard)
+ * @param[out] overflow_dbg  Ring buffer full events at ISR time
  */
-void scl3300_get_isr_diagnostics(uint32_t *calls, uint32_t *valid,
-                                  uint32_t *primes, uint32_t *discards);
+void scl3300_get_isr_diag(uint32_t *isr_fired,
+                           uint32_t *prime_count,
+                           uint32_t *discard_count,
+                           uint32_t *valid_count,
+                           uint32_t *invalid_count,
+                           uint32_t *overflow_dbg);
 
 /******************************************************************************
  * CONVERSION HELPER MACROS

@@ -28,6 +28,7 @@
  */
 
 #include "mqtt.h"
+#include "fault_log.h"
 #include "mqtt_client.h"
 #include "esp_log.h"
 #include "esp_mac.h"          // esp_read_mac(), ESP_MAC_ETH
@@ -38,6 +39,8 @@
 #include "freertos/event_groups.h"
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+#include <sys/time.h>
 
 static const char *TAG = "MQTT";
 
@@ -47,6 +50,7 @@ static const char *TAG = "MQTT";
 static esp_mqtt_client_handle_t s_mqtt_client = NULL;
 static EventGroupHandle_t s_mqtt_event_group = NULL;
 static bool s_is_connected = false;
+static bool s_mqtt_ever_connected = false; /* distinguish first connect from reconnects */
 
 /* Command handler registered by the application layer */
 static mqtt_cmd_handler_t s_cmd_handler = NULL;
@@ -61,8 +65,8 @@ static const char s_topic_cmd_all[] = "wind_turbine/all/cmd/control";
 #define CMD_PAYLOAD_MAX_LEN  256
 static char s_cmd_payload_buf[CMD_PAYLOAD_MAX_LEN];
 
-/* 200 samples x ~60 chars each + inclinometer + temperature + framing = ~14000 chars */
-#define JSON_BUFFER_SIZE    16384
+/* 200 accel samples x ~60 chars + 20 incl samples x ~60 chars + temperature + framing = ~15400 chars */
+#define JSON_BUFFER_SIZE    20480
 static char *s_json_buffer = NULL;
 
 /*
@@ -200,6 +204,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd_all,       0);
                 ESP_LOGI(TAG, "Re-subscribed to cmd topics after reconnect");
             }
+            /* Log recovery fault on reconnects; skip the initial connection at boot */
+            if (s_mqtt_ever_connected) {
+                fault_log_record(FAULT_MQTT_RECONNECTED);
+            } else {
+                s_mqtt_ever_connected = true;
+            }
             break;
 
         case MQTT_EVENT_DATA:
@@ -237,6 +247,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 xEventGroupSetBits(s_mqtt_event_group, MQTT_DISCONNECTED_BIT);
                 xEventGroupClearBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
             }
+            fault_log_record(FAULT_MQTT_DISCONNECTED);
             break;
 
         case MQTT_EVENT_ERROR:
@@ -315,7 +326,7 @@ esp_err_t mqtt_init(void)
     ESP_LOGI(TAG, "  Client ID: %s", s_client_id);
     ESP_LOGI(TAG, "  Data topic:   %s", s_topic_data);
     ESP_LOGI(TAG, "  Status topic: %s", s_topic_status);
-    ESP_LOGI(TAG, "  Data integrity: null for invalid/stale data");
+    ESP_LOGI(TAG, "  Data integrity: NaN for disconnected sensors, omitted for no-fault");
 
     s_mqtt_event_group = xEventGroupCreate();
     if (s_mqtt_event_group == NULL) {
@@ -336,7 +347,7 @@ esp_err_t mqtt_init(void)
         .session.keepalive               = 60,
         .network.reconnect_timeout_ms   = 5000,
         .buffer.size                    = 1024,
-        .buffer.out_size                = 6144,
+        .buffer.out_size                = 8192,
     };
 
     s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
@@ -402,56 +413,140 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
     /*
      * JSON FORMAT:
      * {
-     *   "a": [["2026-03-21T20:49:06.305421Z", x, y, z], ...],
-     *   "i": ["2026-03-21T20:49:06.355000Z", x, y, z] | null,
-     *   "T": ["2026-03-21T20:49:06.355000Z", val]      | null
+     *   "a": [["ts", x, y, z], ...],           200 samples or NaN array
+     *   "i": [["ts", x, y, z], ...],           20 samples or NaN array
+     *   "T": ["ts", val] | ["ts", NaN],         1 sample
+     *   "f": [1, 7]                             optional fault codes
      * }
      */
 
     int offset = 0;
 
+    /* ---- Acceleration ---- */
     offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, "{\"a\":[");
 
-    for (int i = 0; i < packet->accel_count && i < MQTT_ACCEL_BATCH_SIZE; i++) {
-        if (i > 0) {
-            offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, ",");
-        }
-        offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                           "[\"%s\",%.4f,%.4f,%.4f]",
-                           packet->accel[i].ts,
-                           packet->accel[i].x,
-                           packet->accel[i].y,
-                           packet->accel[i].z);
+    if (packet->accel_valid && packet->accel_count > 0) {
+        for (int i = 0; i < packet->accel_count && i < MQTT_ACCEL_BATCH_SIZE; i++) {
+            if (i > 0) {
+                offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, ",");
+            }
+            offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
+                               "[\"%s\",%.4f,%.4f,%.4f]",
+                               packet->accel[i].ts,
+                               packet->accel[i].x,
+                               packet->accel[i].y,
+                               packet->accel[i].z);
 
-        if (offset >= JSON_BUFFER_SIZE - 200) {
-            ESP_LOGE(TAG, "JSON buffer overflow at sample %d!", i);
-            return ESP_ERR_NO_MEM;
+            if (offset >= JSON_BUFFER_SIZE - 200) {
+                ESP_LOGE(TAG, "JSON buffer overflow at accel sample %d!", i);
+                return ESP_ERR_NO_MEM;
+            }
+        }
+    } else {
+        /* Sensor disconnected: emit exactly MQTT_ACCEL_BATCH_SIZE (200) NaN entries
+         * so the Pi always receives a fixed-size 200 Hz acceleration array.
+         * Timestamps are spaced 5 ms apart (1/200 Hz) starting from now. */
+        struct timeval _tv_a; gettimeofday(&_tv_a, NULL);
+        for (int i = 0; i < MQTT_ACCEL_BATCH_SIZE; i++) {
+            if (i > 0) {
+                offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, ",");
+            }
+            char nan_ts_a[MQTT_TS_LEN];
+            if (_tv_a.tv_sec > 1700000000L) {
+                /* Compute timestamp for this sample: base + i * 5000 us */
+                int64_t sample_us = (int64_t)_tv_a.tv_sec * 1000000LL
+                                  + (int64_t)_tv_a.tv_usec
+                                  + (int64_t)i * 5000LL;
+                time_t sec = (time_t)(sample_us / 1000000LL);
+                int    us  = (int)(sample_us % 1000000LL);
+                struct tm _tm_a; gmtime_r(&sec, &_tm_a);
+                strftime(nan_ts_a, sizeof(nan_ts_a), "%Y-%m-%dT%H:%M:%S", &_tm_a);
+                snprintf(nan_ts_a + 19, sizeof(nan_ts_a) - 19, ".%06dZ", us);
+            } else {
+                snprintf(nan_ts_a, sizeof(nan_ts_a), "tick:disconnected");
+            }
+            offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
+                               "[\"%s\",NaN,NaN,NaN]", nan_ts_a);
+
+            if (offset >= JSON_BUFFER_SIZE - 200) {
+                ESP_LOGE(TAG, "JSON buffer overflow at NaN accel sample %d!", i);
+                return ESP_ERR_NO_MEM;
+            }
         }
     }
 
     offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, "]");
 
-    if (packet->has_angle) {
-        if (packet->angle_valid) {
+    /* ---- Inclination (batched, 20 samples/sec) ---- */
+    offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, ",\"i\":[");
+
+    if (packet->incl_valid && packet->incl_count > 0) {
+        for (int i = 0; i < packet->incl_count && i < MQTT_INCL_BATCH_SIZE; i++) {
+            if (i > 0) {
+                offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, ",");
+            }
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                               ",\"i\":[\"%s\",%.4f,%.4f,%.4f]",
-                               packet->angle_ts,
-                               packet->angle_x, packet->angle_y, packet->angle_z);
-        } else {
+                               "[\"%s\",%.4f,%.4f,%.4f]",
+                               packet->incl[i].ts,
+                               packet->incl[i].x,
+                               packet->incl[i].y,
+                               packet->incl[i].z);
+        }
+    } else {
+        /* Sensor disconnected: emit exactly MQTT_INCL_BATCH_SIZE (20) NaN entries
+         * so the Pi always receives a fixed-size 20 Hz inclination array.
+         * Timestamps are spaced 50 ms apart (1/20 Hz) starting from now. */
+        struct timeval _tv_i; gettimeofday(&_tv_i, NULL);
+        for (int i = 0; i < MQTT_INCL_BATCH_SIZE; i++) {
+            if (i > 0) {
+                offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, ",");
+            }
+            char nan_ts_i[MQTT_TS_LEN];
+            if (_tv_i.tv_sec > 1700000000L) {
+                /* Compute timestamp for this sample: base + i * 50000 us */
+                int64_t sample_us = (int64_t)_tv_i.tv_sec * 1000000LL
+                                  + (int64_t)_tv_i.tv_usec
+                                  + (int64_t)i * 50000LL;
+                time_t sec = (time_t)(sample_us / 1000000LL);
+                int    us  = (int)(sample_us % 1000000LL);
+                struct tm _tm_i; gmtime_r(&sec, &_tm_i);
+                strftime(nan_ts_i, sizeof(nan_ts_i), "%Y-%m-%dT%H:%M:%S", &_tm_i);
+                snprintf(nan_ts_i + 19, sizeof(nan_ts_i) - 19, ".%06dZ", us);
+            } else {
+                snprintf(nan_ts_i, sizeof(nan_ts_i), "tick:disconnected");
+            }
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                               ",\"i\":null");
+                               "[\"%s\",NaN,NaN,NaN]", nan_ts_i);
         }
     }
 
+    offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, "]");
+
+    /* ---- Temperature (1 sample/sec) ---- */
     if (packet->has_temp) {
         if (packet->temp_valid) {
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
                                ",\"T\":[\"%s\",%.2f]",
                                packet->temp_ts, packet->temperature);
         } else {
+            /* Sensor disconnected: emit NaN with current timestamp */
+            char nan_ts_t[MQTT_TS_LEN];
+            struct timeval _tv_t; gettimeofday(&_tv_t, NULL);
+            if (_tv_t.tv_sec > 1700000000L) {
+                struct tm _tm_t; gmtime_r(&_tv_t.tv_sec, &_tm_t);
+                strftime(nan_ts_t, sizeof(nan_ts_t), "%Y-%m-%dT%H:%M:%S", &_tm_t);
+                snprintf(nan_ts_t + 19, sizeof(nan_ts_t) - 19, ".%06dZ", (int)_tv_t.tv_usec);
+            } else {
+                snprintf(nan_ts_t, sizeof(nan_ts_t), "tick:disconnected");
+            }
             offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset,
-                               ",\"T\":null");
+                               ",\"T\":[\"%s\",NaN]", nan_ts_t);
         }
+    }
+
+    /* Append any pending fault codes before closing the JSON object */
+    if (fault_log_has_pending()) {
+        offset = fault_log_append_to_json(s_json_buffer, JSON_BUFFER_SIZE, offset);
     }
 
     offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, "}");
@@ -463,13 +558,15 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
 
     if (msg_id < 0) {
         ESP_LOGE(TAG, "Failed to publish sensor data");
+        fault_log_record(FAULT_MQTT_PUBLISH_FAIL);
         return ESP_FAIL;
     }
 
-    ESP_LOGD(TAG, "Published %d bytes to %s (%d accel, angle=%s, temp=%s)",
-             offset, s_topic_data, packet->accel_count,
-             packet->angle_valid ? "valid" : "NULL",
-             packet->temp_valid ? "valid" : "NULL");
+    ESP_LOGD(TAG, "Published %d bytes to %s (accel=%d/%s, incl=%d/%s, temp=%s)",
+             offset, s_topic_data,
+             packet->accel_count, packet->accel_valid ? "ok" : "NaN",
+             packet->incl_count,  packet->incl_valid  ? "ok" : "NaN",
+             packet->temp_valid ? "ok" : "NaN");
 
     return ESP_OK;
 }
@@ -603,31 +700,40 @@ esp_err_t mqtt_publish_status_json(const char *state_str,
                                    uint8_t hpf_corner,
                                    bool selftest_ok,
                                    uint32_t seq_ack,
+                                   const char *cmd_ack,
                                    const char *error_msg)
 {
     if (!s_is_connected) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    char buf[320];
+    char buf[384];
     int offset = 0;
     int range_g = (range == 1) ? 2 : (range == 2) ? 4 : 8;
 
     offset += snprintf(buf + offset, sizeof(buf) - offset,
-                       "{\"state\":\"%s\","
-                       "\"odr_hz\":%lu,"
-                       "\"range_g\":%d,"
-                       "\"output_hz\":%lu,"
-                       "\"hpf_corner\":%u,"
-                       "\"selftest_ok\":%s,"
-                       "\"seq_ack\":%lu",
-                       state_str ? state_str : "unknown",
+                       "{\"state\":\"%s\"",
+                       state_str ? state_str : "unknown");
+
+    /* cmd_ack is only present for control command acknowledgements */
+    if (cmd_ack && cmd_ack[0] != '\0') {
+        offset += snprintf(buf + offset, sizeof(buf) - offset,
+                           ",\"cmd_ack\":\"%s\"", cmd_ack);
+    }
+
+    offset += snprintf(buf + offset, sizeof(buf) - offset,
+                       ",\"seq_ack\":%lu"
+                       ",\"odr_hz\":%lu"
+                       ",\"range_g\":%d"
+                       ",\"hpf_corner\":%u"
+                       ",\"output_hz\":%lu"
+                       ",\"selftest_ok\":%s",
+                       (unsigned long)seq_ack,
                        (unsigned long)odr_hz,
                        range_g,
-                       (unsigned long)output_hz,
                        (unsigned)hpf_corner,
-                       selftest_ok ? "true" : "false",
-                       (unsigned long)seq_ack);
+                       (unsigned long)output_hz,
+                       selftest_ok ? "true" : "false");
 
     if (error_msg && error_msg[0] != '\0') {
         offset += snprintf(buf + offset, sizeof(buf) - offset,

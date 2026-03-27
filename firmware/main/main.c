@@ -50,6 +50,29 @@
 #include "fault_log.h"
 #include "sntp_sync.h"
 
+/******************************************************************************
+ * FAULT PUBLISH CALLBACK
+ * Registered with fault_log_set_publish_cb() after mqtt_init() succeeds.
+ * Builds the full topic from the node serial and the FAULT_LOG_TOPIC_SUFFIX
+ * defined in fault_log.h, then forwards to mqtt_publish().
+ * Called from fault_log_record() on every fault, regardless of sensor state.
+ ******************************************************************************/
+static void on_fault_publish(const char *payload, int len)
+{
+    if (!mqtt_is_connected()) {
+        return;
+    }
+    char topic[80];
+    snprintf(topic, sizeof(topic), "%s/%s/%s",
+             MQTT_TOPIC_PREFIX,
+             mqtt_get_serial_no(),
+             FAULT_LOG_TOPIC_SUFFIX);
+    esp_err_t ret = mqtt_publish(topic, payload, len);
+    if (ret != ESP_OK) {
+        ESP_LOGW("MAIN", "Immediate fault publish failed — fault retained in pending buffer");
+    }
+}
+
 static const char *TAG = "main";
 
 // Timeouts
@@ -139,6 +162,7 @@ static void handle_critical_failure(const char *reason)
                  (unsigned long)s_reboot_count,
                  MAX_REBOOT_ATTEMPTS);
 
+        fault_log_record(FAULT_REBOOT_ATTEMPT);
         vTaskDelay(pdMS_TO_TICKS(REBOOT_DELAY_MS));
 
         ESP_LOGW(TAG, "Rebooting now...");
@@ -258,12 +282,14 @@ static esp_err_t init_buses(void)
 
     if (i2c_bus_init() != ESP_OK) {
         ESP_LOGE(TAG, "I2C bus init failed");
+        fault_log_record(FAULT_I2C_ERROR);
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "I2C bus initialized");
 
     if (spi_bus_init() != ESP_OK) {
         ESP_LOGE(TAG, "SPI bus init failed");
+        fault_log_record(FAULT_SPI_ERROR);
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "SPI bus initialized");
@@ -394,7 +420,8 @@ static esp_err_t init_sensors(bool *temp_available)
         *temp_available = true;
         ESP_LOGI(TAG, "ADT7420 initialized");
     } else {
-        ESP_LOGW(TAG, "ADT7420 init failed - continuing without temperature");
+        ESP_LOGW(TAG, "ADT7420 init failed - continuing without temperature (NaN will be sent)");
+        fault_log_record(FAULT_ADT7420_INIT_FAIL);
     }
 
 #ifdef SPI_CS_SCL3300_IO
@@ -405,10 +432,14 @@ static esp_err_t init_sensors(bool *temp_available)
     ESP_LOGI(TAG, "Initializing ADXL355 accelerometer...");
     ret = adxl355_init();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "ADXL355 init failed - CRITICAL");
-        return ESP_FAIL;
+        ESP_LOGW(TAG, "ADXL355 init failed - continuing without accelerometer (NaN will be sent)");
+        fault_log_record(FAULT_ADXL355_INIT_FAIL);
+        /* Non-critical: node will keep running and send NaN for acceleration.
+         * The data processing task watchdog will detect "no samples" and emit
+         * NaN packets so the Pi always receives data. */
+    } else {
+        ESP_LOGI(TAG, "ADXL355 initialized");
     }
-    ESP_LOGI(TAG, "ADXL355 initialized");
 
     /*
      * Do NOT manually touch SPI_CS_ADXL355_IO here.
@@ -423,10 +454,12 @@ static esp_err_t init_sensors(bool *temp_available)
     ESP_LOGI(TAG, "Initializing SCL3300 inclinometer...");
     ret = scl3300_init();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "SCL3300 init failed - CRITICAL");
-        return ESP_FAIL;
+        ESP_LOGW(TAG, "SCL3300 init failed - continuing without inclinometer (NaN will be sent)");
+        fault_log_record(FAULT_SCL3300_INIT_FAIL);
+        /* Non-critical: node will keep running and send NaN for inclination. */
+    } else {
+        ESP_LOGI(TAG, "SCL3300 initialized");
     }
-    ESP_LOGI(TAG, "SCL3300 initialized");
 
 #ifdef SPI_CS_SCL3300_IO
     gpio_set_level(SPI_CS_SCL3300_IO, 1);
@@ -504,14 +537,14 @@ static bool json_str_equals(const char *json, const char *key, const char *expec
 }
 
 static void publish_node_status(uint32_t seq_ack, bool selftest_ok,
-                                 const char *error_msg)
+                                 const char *cmd_ack, const char *error_msg)
 {
     const node_runtime_config_t *cfg = node_config_get();
     mqtt_publish_status_json(
         node_state_str(node_config_get_state()),
         cfg->odr_hz, cfg->range, 200,
         cfg->hpf_corner,
-        selftest_ok, seq_ack, error_msg
+        selftest_ok, seq_ack, cmd_ack, error_msg
     );
 }
 
@@ -523,7 +556,7 @@ static void on_mqtt_cmd(const char *topic, const char *payload)
     /* ---- configure ---- */
     if (strstr(topic, "/cmd/configure")) {
         if (state == NODE_STATE_ERROR) {
-            publish_node_status(0, false, "node in error state, send reset first");
+            publish_node_status(0, false, NULL, "node in error state, send reset first");
             return;
         }
 
@@ -533,15 +566,15 @@ static void on_mqtt_cmd(const char *topic, const char *payload)
         int32_t seq        = json_get_int(payload, "seq",        0);
 
         if (odr_index < 0 || odr_index > 2) {
-            publish_node_status((uint32_t)seq, false, "invalid odr_index");
+            publish_node_status((uint32_t)seq, false, NULL, "invalid odr_index");
             return;
         }
         if (range < 1 || range > 3) {
-            publish_node_status((uint32_t)seq, false, "invalid range");
+            publish_node_status((uint32_t)seq, false, NULL, "invalid range");
             return;
         }
         if (hpf_corner < 0 || hpf_corner > 6) {
-            publish_node_status((uint32_t)seq, false, "invalid hpf_corner");
+            publish_node_status((uint32_t)seq, false, NULL, "invalid hpf_corner");
             return;
         }
 
@@ -553,7 +586,7 @@ static void on_mqtt_cmd(const char *topic, const char *payload)
         );
 
         if (err != ESP_OK) {
-            publish_node_status((uint32_t)seq, false, "register write failed");
+            publish_node_status((uint32_t)seq, false, NULL, "register write failed");
             return;
         }
 
@@ -561,38 +594,41 @@ static void on_mqtt_cmd(const char *topic, const char *payload)
         if (state == NODE_STATE_RECORDING) {
             esp_err_t start_err = sensor_acquisition_start();
             if (start_err != ESP_OK) {
+                fault_log_record(FAULT_SPI_ERROR);
                 node_config_set_error(FAULT_SPI_ERROR);
-                publish_node_status((uint32_t)seq, false, "ISR restart failed");
+                publish_node_status((uint32_t)seq, false, NULL, "ISR restart failed");
                 return;
             }
             node_config_set_recording();
             ESP_LOGI("CMD", "Reconfiguration complete — recording resumed");
         }
 
-        publish_node_status((uint32_t)seq, st_result.passed, NULL);
+        publish_node_status((uint32_t)seq, st_result.passed, NULL, NULL);
         return;
     }
 
     /* ---- control ---- */
     if (strstr(topic, "/cmd/control")) {
+        int32_t seq = json_get_int(payload, "seq", 0);
 
         if (json_str_equals(payload, "cmd", "start")) {
             if (state == NODE_STATE_CONFIGURED) {
                 esp_err_t err = sensor_acquisition_start();
                 if (err != ESP_OK) {
+                    fault_log_record(FAULT_SPI_ERROR);
                     node_config_set_error(FAULT_SPI_ERROR);
-                    publish_node_status(0, false, "ISR start failed");
+                    publish_node_status((uint32_t)seq, false, "start", "ISR start failed");
                     return;
                 }
                 node_config_set_recording();
-                publish_node_status(0, true, NULL);
+                publish_node_status((uint32_t)seq, true, "start", NULL);
             } else if (state == NODE_STATE_RECORDING) {
                 ESP_LOGW("CMD", "Already recording");
-                publish_node_status(0, true, NULL);
+                publish_node_status((uint32_t)seq, true, "start", NULL);
             } else {
                 ESP_LOGW("CMD", "Cannot start from state '%s' — send configure first",
                          node_state_str(state));
-                publish_node_status(0, false, "must configure before start");
+                publish_node_status((uint32_t)seq, false, "start", "must configure before start");
             }
             return;
         }
@@ -602,7 +638,7 @@ static void on_mqtt_cmd(const char *topic, const char *payload)
                 sensor_acquisition_stop();
                 node_config_set_configured();
             }
-            publish_node_status(0, true, NULL);
+            publish_node_status((uint32_t)seq, true, "stop", NULL);
             return;
         }
 
@@ -613,10 +649,10 @@ static void on_mqtt_cmd(const char *topic, const char *payload)
             adxl355_selftest_result_t st_result;
             esp_err_t err = node_config_apply(2, NODE_RANGE_2G, 0, 0, &st_result);
             if (err != ESP_OK) {
-                publish_node_status(0, false, "init failed");
+                publish_node_status((uint32_t)seq, false, "init", "init failed");
                 return;
             }
-            publish_node_status(0, st_result.passed, NULL);
+            publish_node_status((uint32_t)seq, st_result.passed, "init", NULL);
             return;
         }
 
@@ -625,7 +661,7 @@ static void on_mqtt_cmd(const char *topic, const char *payload)
                 sensor_acquisition_stop();
             }
             node_config_reset();
-            publish_node_status(0, true, NULL);
+            publish_node_status((uint32_t)seq, true, "reset", NULL);
             return;
         }
 
@@ -648,6 +684,20 @@ void app_main(void)
     node_config_init();
 
     init_reboot_counter();
+
+    /* Detect and log the cause of the previous reset at boot time */
+    esp_reset_reason_t reset_reason = esp_reset_reason();
+    if (reset_reason == ESP_RST_WDT ||
+        reset_reason == ESP_RST_INT_WDT ||
+        reset_reason == ESP_RST_TASK_WDT) {
+        ESP_LOGW(TAG, "Reset reason: watchdog (reason=%d)", reset_reason);
+        fault_log_record(FAULT_WATCHDOG_RESET);
+    } else if (reset_reason == ESP_RST_BROWNOUT ||
+               reset_reason == ESP_RST_POWERON) {
+        ESP_LOGW(TAG, "Reset reason: power loss / brownout (reason=%d)", reset_reason);
+        fault_log_record(FAULT_POWER_LOSS);
+        fault_log_record(FAULT_POWER_RESTORED);
+    }
     print_banner();
 
     /* Register cmd handler BEFORE mqtt_init so no message can arrive
@@ -677,7 +727,7 @@ void app_main(void)
     ESP_LOGI(TAG, "");
 
     if (init_sensors(&temp_sensor_available) != ESP_OK) {
-        handle_critical_failure("Critical sensor initialization failed (ADXL355 or SCL3300)");
+        ESP_LOGW(TAG, "Sensor initialization had issues — node will send NaN for failed sensors");
     }
     ESP_LOGI(TAG, "");
 
@@ -702,6 +752,21 @@ void app_main(void)
         ESP_LOGI(TAG, "");
     }
 
+    /* Register the fault publish callback only after SNTP has synced (or
+     * timed out). This guarantees that every fault timestamp published on
+     * wind_turbine/<SERIAL>/faults uses real UTC time, not the tick fallback.
+     * Faults that fired earlier in boot are already in the pending buffer
+     * and will be flushed with the first data packet once recording starts. */
+    if (mqtt_ok) {
+        fault_log_set_publish_cb(on_fault_publish);
+        ESP_LOGI(TAG, "Fault publish callback registered — immediate fault reporting active");
+        /* Flush any faults that accumulated during boot (reset cause, sensor
+         * init failures, etc.) before the callback was registered. These are
+         * published now with a valid UTC timestamp so the subscriber receives
+         * them regardless of whether the node ever enters RECORDING state. */
+        fault_log_flush_pending();
+    }
+
     if (init_acquisition(temp_sensor_available) != ESP_OK) {
         handle_critical_failure("ISR acquisition initialization failed");
     }
@@ -722,7 +787,7 @@ void app_main(void)
 
     /* Publish initial IDLE status so the Pi knows the node is up */
     if (mqtt_ok) {
-        publish_node_status(0, true, NULL);
+        publish_node_status(0, true, NULL, NULL);
     }
 
     ESP_LOGI(TAG, "--- Creating Statistics Monitor ---");
