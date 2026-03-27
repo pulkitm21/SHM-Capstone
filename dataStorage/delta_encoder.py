@@ -128,6 +128,7 @@ TS_SCALE = 1_000_000    # seconds  -> µs
 FILE_FORMAT_VERSION = 3
 
 MAX_DELTA_S = 60.0
+ABSOLUTE_RECORD_INTERVAL_S = 60.0
 INT16_MAX = 32767
 
 TS_MIN = 1_577_836_800.0   # 2020-01-01
@@ -223,6 +224,7 @@ def _fresh_state() -> dict:
         "file_hour": None,
         "is_first": True,
         "header_written": False,
+        "last_absolute_record_ts_us": 0,
     }
 
 
@@ -545,6 +547,22 @@ def encode_delta_record(data: dict, state: dict) -> bytes:
     return struct.pack("<B", header) + bytes(body)
 
 
+def _packet_max_ts_us(data: dict) -> int:
+    """Return the latest sensor timestamp in this normalized packet, in µs."""
+    max_ts_us = 0
+
+    if "a" in data and len(data["a"]) > 0:
+        max_ts_us = max(max_ts_us, max(int(float(s[0]) * TS_SCALE) for s in data["a"]))
+
+    if "i" in data and len(data["i"]) > 0:
+        max_ts_us = max(max_ts_us, max(int(float(s[0]) * TS_SCALE) for s in data["i"]))
+
+    if "T" in data and len(data["T"]) > 0:
+        max_ts_us = max(max_ts_us, int(float(data["T"][0]) * TS_SCALE))
+
+    return max_ts_us
+
+
 # -------------------------------------------------------------------
 # Write record
 # -------------------------------------------------------------------
@@ -604,10 +622,17 @@ def write_record(node_id: str, data: dict):
         state["file_hour"] = hour_str
         state["is_first"] = True
         state["header_written"] = False
+        state["last_absolute_record_ts_us"] = 0
         print(f"[{node_id}] New hourly file: {filepath}")
 
     if not state["is_first"]:
         force_abs, reason = needs_absolute_record(data, state)
+        if not force_abs:
+            packet_max_ts_us = _packet_max_ts_us(data)
+            last_abs_ts_us = state.get("last_absolute_record_ts_us", 0)
+            if packet_max_ts_us and last_abs_ts_us and                (packet_max_ts_us - last_abs_ts_us) >= int(ABSOLUTE_RECORD_INTERVAL_S * TS_SCALE):
+                force_abs = True
+                reason = f"absolute refresh interval {ABSOLUTE_RECORD_INTERVAL_S:.0f} s reached"
         if force_abs:
             print(f"[{node_id}] Forcing ABSOLUTE record: {reason}")
             state["is_first"] = True
@@ -615,6 +640,7 @@ def write_record(node_id: str, data: dict):
     if state["is_first"]:
         record = encode_first_record(data, state)
         state["is_first"] = False
+        state["last_absolute_record_ts_us"] = _packet_max_ts_us(data)
     else:
         record = encode_delta_record(data, state)
 
