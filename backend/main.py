@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, Request, HTTPException
+from fastapi import FastAPI, Query, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from datetime import datetime, timezone, timedelta
@@ -50,6 +50,11 @@ from server_management import (
     restart_mqtt_service as restart_mqtt_service_action,
 )
 
+from auth.auth_routes import router as auth_router
+from auth.auth_db import init_db
+from auth.auth_repository import create_user, get_user
+from auth.auth_dependencies import get_current_user, require_admin
+
 app = FastAPI()
 
 app.add_middleware(
@@ -63,7 +68,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(export_router)
+# Protect export routes as authenticated read-only API routes.
+app.include_router(export_router, dependencies=[Depends(get_current_user)])
+app.include_router(auth_router)
 
 DATA_DIR = Path("/mnt/ssd")
 
@@ -400,7 +407,7 @@ def health():
 
 
 @app.get("/api/events/health")
-async def health_events(request: Request):
+async def health_events(request: Request, user=Depends(get_current_user)):
     # SSE code for backend status live updates on the frontend dashboard.
     # This endpoint should remain independent of SSD availability.
     async def event_generator():
@@ -428,7 +435,7 @@ async def health_events(request: Request):
 
 
 @app.get("/api/storage")
-def get_storage():
+def get_storage(user=Depends(get_current_user)):
     mount_status = get_ssd_mount_status()
 
     if not mount_status["available"]:
@@ -464,7 +471,7 @@ def get_storage():
 
 
 @app.get("/api/storage/status")
-def get_storage_status():
+def get_storage_status(user=Depends(get_current_user)):
     """
     Returns SSD mount diagnostic information for the dashboard.
     """
@@ -472,7 +479,7 @@ def get_storage_status():
 
 
 @app.post("/api/storage/unmount")
-def unmount_storage():
+def unmount_storage(user=Depends(require_admin)):
     """
     Unmount the SSD safely.
     """
@@ -505,7 +512,7 @@ def unmount_storage():
 
 
 @app.get("/api/server/status")
-def get_server_status():
+def get_server_status(user=Depends(get_current_user)):
     """
     Detailed Pi/server status for the Server Management page.
     """
@@ -513,7 +520,7 @@ def get_server_status():
 
 
 @app.get("/api/server/network")
-def get_server_network():
+def get_server_network(user=Depends(get_current_user)):
     """
     Connectivity details for VPN reachability and certificate health.
     """
@@ -521,7 +528,7 @@ def get_server_network():
 
 
 @app.post("/api/server/restart-backend")
-def restart_backend_service():
+def restart_backend_service(user=Depends(require_admin)):
     """
     Restart the backend service running on the Raspberry Pi.
     """
@@ -537,7 +544,7 @@ def restart_backend_service():
 
 
 @app.post("/api/server/restart-mqtt")
-def restart_mqtt_service():
+def restart_mqtt_service(user=Depends(require_admin)):
     """
     Restart the MQTT broker service on the Raspberry Pi.
     """
@@ -553,7 +560,7 @@ def restart_mqtt_service():
 
 
 @app.post("/api/server/reboot")
-def reboot_server():
+def reboot_server(user=Depends(require_admin)):
     """
     Reboot the Raspberry Pi.
     """
@@ -569,7 +576,7 @@ def reboot_server():
 
 
 @app.post("/api/server/renew-vpn-certificate")
-def renew_vpn_certificate():
+def renew_vpn_certificate(user=Depends(require_admin)):
     """
     Run the configured VPN certificate renewal command.
     """
@@ -585,7 +592,7 @@ def renew_vpn_certificate():
 
 
 @app.post("/api/server/prune-data")
-def prune_data(payload: PruneStoredDataRequest):
+def prune_data(payload: PruneStoredDataRequest, user=Depends(require_admin)):
     """
     Delete raw sensor data files older than the requested retention window.
     """
@@ -601,12 +608,12 @@ def prune_data(payload: PruneStoredDataRequest):
 
 
 @app.get("/api/nodes")
-def get_nodes():
+def get_nodes(user=Depends(get_current_user)):
     return {"nodes": list_nodes(timeout_seconds=60)}
 
 
 @app.get("/api/nodes/{node_id}")
-def get_node(node_id: int):
+def get_node(node_id: int, user=Depends(get_current_user)):
     node = get_node_by_id(node_id, timeout_seconds=60)
     if node is None:
         raise HTTPException(status_code=404, detail="Node not found")
@@ -617,6 +624,7 @@ def get_node(node_id: int):
 def get_node_sensor_status(
     node_id: int,
     window_seconds: int = Query(default=SENSOR_STATUS_WINDOW_SECONDS, ge=30, le=3600),
+    user=Depends(get_current_user),
 ):
     """
     Return per-sensor health for one node using recent data presence + active faults.
@@ -625,7 +633,7 @@ def get_node_sensor_status(
 
 
 @app.put("/api/nodes/{node_id}/position")
-def put_node_position(node_id: int, payload: NodePositionUpdate):
+def put_node_position(node_id: int, payload: NodePositionUpdate, user=Depends(require_admin)):
     updated = update_node_position(node_id=node_id, x=payload.x, y=payload.y)
     if updated is None:
         raise HTTPException(status_code=404, detail="Node not found")
@@ -639,6 +647,15 @@ mqtt_status_client = None
 @app.on_event("startup")
 def startup_event():
     global mqtt_status_client
+
+    # Initialize auth DB on backend startup.
+    init_db()
+
+    # Create the default local admin once.
+    if not get_user("devadmin"):
+        create_user("devadmin", "devadmin", "admin")
+        print("[auth] Created default devadmin user")
+
     try:
         mqtt_status_client = start_listener()
     except Exception as e:
@@ -683,7 +700,7 @@ class BulkNodePositionUpdate(BaseModel):
 
 
 @app.put("/api/nodes/positions")
-def put_node_positions(payload: BulkNodePositionUpdate):
+def put_node_positions(payload: BulkNodePositionUpdate, user=Depends(require_admin)):
     updated_nodes = []
 
     for item in payload.positions:
@@ -708,7 +725,7 @@ def put_node_positions(payload: BulkNodePositionUpdate):
 
 
 @app.get("/api/settings")
-def get_settings():
+def get_settings(user=Depends(get_current_user)):
     for node in list_nodes(timeout_seconds=60):
         ensure_node_defaults(node["node_id"])
 
@@ -717,7 +734,7 @@ def get_settings():
 
 
 @app.put("/api/settings")
-def put_settings(payload: SettingsModel):
+def put_settings(payload: SettingsModel, user=Depends(require_admin)):
     merged = copy_deep(load_settings())
 
     merged.site_name = payload.site_name
@@ -737,12 +754,12 @@ def put_settings(payload: SettingsModel):
 
 
 @app.get("/api/settings/site-name")
-def api_get_site_name():
+def api_get_site_name(user=Depends(get_current_user)):
     return {"site_name": get_site_name()}
 
 
 @app.put("/api/settings/site-name")
-def api_put_site_name(payload: SiteNameUpdate):
+def api_put_site_name(payload: SiteNameUpdate, user=Depends(require_admin)):
     updated_name = update_site_name(payload.site_name)
     return {"ok": True, "site_name": updated_name}
 
@@ -750,7 +767,11 @@ def api_put_site_name(payload: SiteNameUpdate):
 # Publish config immediately without seq/ack tracking.
 # The older pending-sync workflow is intentionally commented out for now.
 @app.post("/api/nodes/{node_id}/config/accelerometer/apply")
-def apply_accelerometer_config(node_id: int, payload: AccelerometerConfigApplyRequest):
+def apply_accelerometer_config(
+    node_id: int,
+    payload: AccelerometerConfigApplyRequest,
+    user=Depends(require_admin),
+):
     node = get_node_by_id(node_id, timeout_seconds=60)
     if node is None:
         raise HTTPException(status_code=404, detail="Node not found")
@@ -786,7 +807,7 @@ def apply_accelerometer_config(node_id: int, payload: AccelerometerConfigApplyRe
 
 # Publish runtime control commands immediately without seq/ack tracking.
 @app.post("/api/nodes/{node_id}/control")
-def control_node(node_id: int, payload: NodeControlRequest):
+def control_node(node_id: int, payload: NodeControlRequest, user=Depends(require_admin)):
     node = get_node_by_id(node_id, timeout_seconds=60)
     if node is None:
         raise HTTPException(status_code=404, detail="Node not found")
@@ -1140,6 +1161,7 @@ def get_faults(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=15, ge=1, le=200),
     limit: int = Query(default=200, ge=1, le=5000),
+    user=Depends(get_current_user),
 ):
     return read_fault_rows(
         serial_number=serial_number,
@@ -1155,7 +1177,7 @@ def get_faults(
 
 
 @app.get("/api/faults/summary")
-def get_fault_summary():
+def get_fault_summary(user=Depends(get_current_user)):
     return read_active_fault_summary()
 
 
@@ -1164,6 +1186,7 @@ async def fault_events(
     request: Request,
     serial_number: Optional[str] = Query(default=None),
     limit: int = Query(default=200, ge=1, le=5000),
+    user=Depends(get_current_user),
 ):
     # SSE code for live fault log updates on the frontend dashboard.
     # This now sends one initial snapshot, then only newly inserted fault rows.
@@ -1229,6 +1252,7 @@ async def fault_events(
 def get_accel_data(
     node: int = Query(1, ge=1),
     minutes: int = Query(1, ge=1, le=5),
+    user=Depends(get_current_user),
 ):
     pts = read_accel_points(node_id=node, minutes=minutes)
     return {
@@ -1243,6 +1267,7 @@ def get_accel_data(
 def api_inclinometer(
     node: int = Query(1, ge=1),
     minutes: int = Query(10, ge=1, le=60),
+    user=Depends(get_current_user),
 ):
     pts = read_inclinometer_points(node_id=node, minutes=minutes)
     return {
@@ -1257,6 +1282,7 @@ def api_inclinometer(
 def api_temperature(
     node: int = Query(1, ge=1),
     minutes: int = Query(60, ge=1, le=1440),
+    user=Depends(get_current_user),
 ):
     pts = read_temperature_points(node_id=node, minutes=minutes)
     return {

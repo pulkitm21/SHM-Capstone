@@ -17,8 +17,8 @@ type CreateFormState = {
   role: AuthRole;
 };
 
-type PasswordDrafts = Record<number, string>;
-type SavingUserMap = Record<number, boolean>;
+type PasswordDrafts = Record<string, string>;
+type SavingUserMap = Record<string, boolean>;
 
 const PASSWORD_RULE_MESSAGE =
   "Password must be at least 8 characters and include uppercase, lowercase, number, and special character.";
@@ -63,7 +63,7 @@ function Users() {
   const [createError, setCreateError] = useState("");
 
   const [passwordDrafts, setPasswordDrafts] = useState<PasswordDrafts>({});
-  const [passwordErrors, setPasswordErrors] = useState<Record<number, string>>({});
+  const [passwordErrors, setPasswordErrors] = useState<Record<string, string>>({});
   const [roleSavingMap, setRoleSavingMap] = useState<SavingUserMap>({});
   const [passwordSavingMap, setPasswordSavingMap] = useState<SavingUserMap>({});
   const [deleteSavingMap, setDeleteSavingMap] = useState<SavingUserMap>({});
@@ -160,17 +160,19 @@ function Users() {
   }
 
   async function handleRoleChange(nextRole: AuthRole, targetUser: AuthUser) {
-    if (!targetUser.id) return;
+    const username = targetUser.username;
 
     setPageError("");
     setPageMessage("");
-    setRoleSavingMap((prev) => ({ ...prev, [targetUser.id as number]: true }));
+    setRoleSavingMap((prev) => ({ ...prev, [username]: true }));
 
     try {
-      const response = await updateUserRole(targetUser.id, { role: nextRole });
+      const response = await updateUserRole(username, { role: nextRole });
 
       setUsers((prev) =>
-        prev.map((item) => (item.id === targetUser.id ? response.user : item))
+        prev.map((item) =>
+          item.username === targetUser.username ? response.user : item
+        )
       );
 
       setPageMessage(`Role updated for "${response.user.username}".`);
@@ -179,44 +181,44 @@ function Users() {
         error instanceof Error ? error.message : "Failed to update role.";
       setPageError(message);
     } finally {
-      setRoleSavingMap((prev) => ({ ...prev, [targetUser.id as number]: false }));
+      setRoleSavingMap((prev) => ({ ...prev, [username]: false }));
     }
   }
 
-  function handlePasswordDraftChange(userId: number, value: string) {
-    setPasswordDrafts((prev) => ({ ...prev, [userId]: value }));
+  function handlePasswordDraftChange(username: string, value: string) {
+    setPasswordDrafts((prev) => ({ ...prev, [username]: value }));
 
     /*
       Clear the row-level password error when the admin edits the field again.
     */
     setPasswordErrors((prev) => {
-      if (!prev[userId]) return prev;
-      return { ...prev, [userId]: "" };
+      if (!prev[username]) return prev;
+      return { ...prev, [username]: "" };
     });
   }
 
   async function handlePasswordReset(targetUser: AuthUser) {
-    if (!targetUser.id) return;
+    const username = targetUser.username;
 
-    const nextPassword = (passwordDrafts[targetUser.id] || "").trim();
+    const nextPassword = (passwordDrafts[username] || "").trim();
 
     if (!isStrongPassword(nextPassword)) {
       setPasswordErrors((prev) => ({
         ...prev,
-        [targetUser.id as number]: PASSWORD_RULE_MESSAGE,
+        [username]: PASSWORD_RULE_MESSAGE,
       }));
       return;
     }
 
     setPageError("");
     setPageMessage("");
-    setPasswordSavingMap((prev) => ({ ...prev, [targetUser.id as number]: true }));
+    setPasswordSavingMap((prev) => ({ ...prev, [username]: true }));
 
     try {
-      await resetUserPassword(targetUser.id, { password: nextPassword });
+      await resetUserPassword(username, { password: nextPassword });
 
-      setPasswordDrafts((prev) => ({ ...prev, [targetUser.id as number]: "" }));
-      setPasswordErrors((prev) => ({ ...prev, [targetUser.id as number]: "" }));
+      setPasswordDrafts((prev) => ({ ...prev, [username]: "" }));
+      setPasswordErrors((prev) => ({ ...prev, [username]: "" }));
       setPageMessage(`Password updated for "${targetUser.username}".`);
     } catch (error) {
       const message =
@@ -224,17 +226,15 @@ function Users() {
 
       setPasswordErrors((prev) => ({
         ...prev,
-        [targetUser.id as number]: message,
+        [username]: message,
       }));
     } finally {
-      setPasswordSavingMap((prev) => ({ ...prev, [targetUser.id as number]: false }));
+      setPasswordSavingMap((prev) => ({ ...prev, [username]: false }));
     }
   }
 
   async function handleDeleteUser(targetUser: AuthUser) {
-    if (!targetUser.id) return;
-
-    if (currentUser?.id === targetUser.id) {
+    if (currentUser?.username === targetUser.username) {
       setPageError("You cannot delete the currently signed-in account.");
       return;
     }
@@ -247,19 +247,21 @@ function Users() {
 
     setPageError("");
     setPageMessage("");
-    setDeleteSavingMap((prev) => ({ ...prev, [targetUser.id as number]: true }));
+    setDeleteSavingMap((prev) => ({ ...prev, [targetUser.username]: true }));
 
     try {
-      await deleteUser(targetUser.id);
+      await deleteUser(targetUser.username);
 
-      setUsers((prev) => prev.filter((item) => item.id !== targetUser.id));
+      setUsers((prev) =>
+        prev.filter((item) => item.username !== targetUser.username)
+      );
       setPageMessage(`User "${targetUser.username}" deleted successfully.`);
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Failed to delete user.";
       setPageError(message);
     } finally {
-      setDeleteSavingMap((prev) => ({ ...prev, [targetUser.id as number]: false }));
+      setDeleteSavingMap((prev) => ({ ...prev, [targetUser.username]: false }));
     }
   }
 
@@ -362,11 +364,11 @@ function Users() {
 
                 <tbody>
                   {users.map((item) => {
-                    const userId = item.id;
-                    const isCurrentUser = currentUser?.id === item.id;
+                    const username = item.username;
+                    const isCurrentUser = currentUser?.username === item.username;
 
                     return (
-                      <tr key={item.id ?? item.username}>
+                      <tr key={item.username}>
                         <td>
                           <div className="users-username-cell">
                             <span className="users-username">{item.username}</span>
@@ -380,7 +382,7 @@ function Users() {
                           <select
                             className="users-role-select"
                             value={item.role}
-                            disabled={!userId || !!roleSavingMap[userId]}
+                            disabled={!!roleSavingMap[username]}
                             onChange={(event) =>
                               void handleRoleChange(
                                 event.target.value as AuthRole,
@@ -399,29 +401,26 @@ function Users() {
                           <div className="users-password-cell">
                             <input
                               type="password"
-                              value={(userId && passwordDrafts[userId]) || ""}
+                              value={passwordDrafts[username] || ""}
                               onChange={(event) =>
-                                userId &&
-                                handlePasswordDraftChange(userId, event.target.value)
+                                handlePasswordDraftChange(username, event.target.value)
                               }
                               placeholder="Enter new password"
-                              disabled={!userId || !!passwordSavingMap[userId]}
+                              disabled={!!passwordSavingMap[username]}
                             />
 
                             <button
                               type="button"
                               className="users-secondary-button"
-                              disabled={!userId || !!passwordSavingMap[userId]}
+                              disabled={!!passwordSavingMap[username]}
                               onClick={() => void handlePasswordReset(item)}
                             >
-                              {userId && passwordSavingMap[userId]
-                                ? "Saving..."
-                                : "Reset"}
+{passwordSavingMap[username] ? "Saving..." : "Reset"}
                             </button>
 
-                            {userId && passwordErrors[userId] ? (
+                            {passwordErrors[username] ? (
                               <div className="users-row-error">
-                                {passwordErrors[userId]}
+                                {passwordErrors[username]}
                               </div>
                             ) : null}
                           </div>
@@ -432,7 +431,7 @@ function Users() {
                             type="button"
                             className="users-danger-button"
                             disabled={
-                              !userId || isCurrentUser || !!deleteSavingMap[userId]
+                              isCurrentUser || !!deleteSavingMap[username]
                             }
                             onClick={() => void handleDeleteUser(item)}
                             title={
@@ -441,11 +440,7 @@ function Users() {
                                 : "Delete user"
                             }
                           >
-                            {userId && deleteSavingMap[userId]
-                              ? "Deleting..."
-                              : isCurrentUser
-                              ? "Blocked"
-                              : "Delete"}
+{deleteSavingMap[username] ? "Deleting..." : isCurrentUser ? "Blocked" : "Delete"}
                           </button>
                         </td>
                       </tr>

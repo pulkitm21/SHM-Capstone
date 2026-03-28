@@ -93,6 +93,10 @@ export type DeleteUserResponse = {
   ok: boolean;
 };
 
+function encodeUsernamePath(username: string) {
+  return encodeURIComponent(username.trim());
+}
+
 export function login(body: LoginRequest, signal?: AbortSignal) {
   return request<LoginResponse>("/api/auth/login", {
     method: "POST",
@@ -127,36 +131,45 @@ export function createUser(body: CreateUserRequest, signal?: AbortSignal) {
 }
 
 export function updateUserRole(
-  userId: number,
+  username: string,
   body: UpdateUserRoleRequest,
   signal?: AbortSignal
 ) {
-  return request<UpdateUserRoleResponse>(`/api/users/${userId}/role`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal,
-  });
+  return request<UpdateUserRoleResponse>(
+    `/api/users/${encodeUsernamePath(username)}/role`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    }
+  );
 }
 
 export function resetUserPassword(
-  userId: number,
+  username: string,
   body: ResetUserPasswordRequest,
   signal?: AbortSignal
 ) {
-  return request<ResetUserPasswordResponse>(`/api/users/${userId}/password`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal,
-  });
+  return request<ResetUserPasswordResponse>(
+    `/api/users/${encodeUsernamePath(username)}/password`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    }
+  );
 }
 
-export function deleteUser(userId: number, signal?: AbortSignal) {
-  return request<DeleteUserResponse>(`/api/users/${userId}`, {
-    method: "DELETE",
-    signal,
-  });
+export function deleteUser(username: string, signal?: AbortSignal) {
+  return request<DeleteUserResponse>(
+    `/api/users/${encodeUsernamePath(username)}`,
+    {
+      method: "DELETE",
+      signal,
+    }
+  );
 }
 
 export type AccelerometerPlotPoint = {
