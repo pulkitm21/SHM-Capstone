@@ -12,6 +12,7 @@ type NodeMapProps = {
   nodes: NodeRecord[];
   warningSerials?: string[];
   onNodeClick?: (node: NodeRecord) => void;
+  canEdit?: boolean;
 };
 
 const MIN_X = 0.06;
@@ -88,6 +89,7 @@ export default function NodeMap({
   nodes,
   warningSerials = [],
   onNodeClick,
+  canEdit = true,
 }: NodeMapProps) {
   const sortedNodes = useMemo(
     () => [...nodes].sort((a, b) => a.node_id - b.node_id),
@@ -120,7 +122,24 @@ export default function NodeMap({
     }
   }, [sortedNodes, isEditing]);
 
+  /*
+    If edit permission is removed while the user is in edit mode,
+    return the map to its saved, locked state.
+  */
+  useEffect(() => {
+    if (!canEdit && isEditing) {
+      setSaveError("");
+      setDraggingSerial(null);
+      pointerStartRef.current = null;
+      movedRef.current = false;
+      setDraftPositions(savedPositions);
+      setIsEditing(false);
+    }
+  }, [canEdit, isEditing, savedPositions]);
+
   function beginEditMode() {
+    if (!canEdit) return;
+
     setSaveError("");
     setDraftPositions(savedPositions);
     setIsEditing(true);
@@ -136,6 +155,8 @@ export default function NodeMap({
   }
 
   async function handleSave() {
+    if (!canEdit) return;
+
     try {
       setIsSaving(true);
       setSaveError("");
@@ -168,6 +189,7 @@ export default function NodeMap({
   }
 
   function handleReset() {
+    if (!canEdit) return;
     setDraftPositions(buildResetPositions(sortedNodes));
   }
 
@@ -195,7 +217,7 @@ export default function NodeMap({
   }
 
   function onPointerDown(serial: string, e: React.PointerEvent) {
-    if (!isEditing) return;
+    if (!isEditing || !canEdit) return;
 
     e.preventDefault();
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
@@ -205,7 +227,7 @@ export default function NodeMap({
   }
 
   function onPointerMove(e: React.PointerEvent) {
-    if (!isEditing || !draggingSerial) return;
+    if (!isEditing || !draggingSerial || !canEdit) return;
 
     const start = pointerStartRef.current;
     if (start) {
@@ -226,14 +248,14 @@ export default function NodeMap({
     movedRef.current = false;
   }
 
-function handleMarkerClick(node: NodeRecord) {
-  // Prevent accidental click after drag
-  if (movedRef.current) return;
+  function handleMarkerClick(node: NodeRecord) {
+    // Prevent accidental click after drag
+    if (movedRef.current) return;
 
-  if (isEditing) return;
+    if (isEditing) return;
 
-  onNodeClick?.(node);
-}
+    onNodeClick?.(node);
+  }
 
   return (
     <div
@@ -245,48 +267,54 @@ function handleMarkerClick(node: NodeRecord) {
     >
       <div className="node-map-toolbar">
         <div className="node-map-toolbar-hint">
-          {isEditing ? "Drag to reposition" : "Positions locked"}
+          {isEditing
+            ? "Drag to reposition"
+            : canEdit
+            ? "Positions locked"
+            : "View only"}
         </div>
 
         <div className="node-map-toolbar-actions">
-          {!isEditing ? (
-            <button
-              className="node-map-text-btn"
-              onClick={beginEditMode}
-              type="button"
-            >
-              Edit
-            </button>
-          ) : (
-            <>
+          {canEdit ? (
+            !isEditing ? (
               <button
                 className="node-map-text-btn"
-                onClick={handleSave}
+                onClick={beginEditMode}
                 type="button"
-                disabled={isSaving}
               >
-                {isSaving ? "Saving..." : "Save"}
+                Edit
               </button>
+            ) : (
+              <>
+                <button
+                  className="node-map-text-btn"
+                  onClick={handleSave}
+                  type="button"
+                  disabled={isSaving}
+                >
+                  {isSaving ? "Saving..." : "Save"}
+                </button>
 
-              <button
-                className="node-map-text-btn"
-                onClick={handleReset}
-                type="button"
-                disabled={isSaving}
-              >
-                Reset
-              </button>
+                <button
+                  className="node-map-text-btn"
+                  onClick={handleReset}
+                  type="button"
+                  disabled={isSaving}
+                >
+                  Reset
+                </button>
 
-              <button
-                className="node-map-text-btn"
-                onClick={cancelEditMode}
-                type="button"
-                disabled={isSaving}
-              >
-                Cancel
-              </button>
-            </>
-          )}
+                <button
+                  className="node-map-text-btn"
+                  onClick={cancelEditMode}
+                  type="button"
+                  disabled={isSaving}
+                >
+                  Cancel
+                </button>
+              </>
+            )
+          ) : null}
         </div>
 
         {saveError ? <div className="node-map-toolbar-error">{saveError}</div> : null}

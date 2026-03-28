@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import useAuth from "../../Auth/useAuth";
 import {
   getHealth,
   getServerNetwork,
@@ -86,6 +87,8 @@ function getPillLabel(state: BackendHealthBadgeState) {
 }
 
 export default function ServerManagementPage() {
+  const { isAdmin } = useAuth();
+
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [serverStatus, setServerStatus] =
     useState<ServerStatusResponse | null>(null);
@@ -208,6 +211,7 @@ export default function ServerManagementPage() {
     actionFn: () => Promise<ServerActionResponse>,
     confirmMessage?: string
   ) {
+    if (!isAdmin) return;
     if (confirmMessage && !window.confirm(confirmMessage)) return;
 
     try {
@@ -233,6 +237,8 @@ export default function ServerManagementPage() {
 
   // Dedicated unmount flow because it uses a custom confirmation message.
   async function handleUnmountStorage() {
+    if (!isAdmin) return;
+
     const confirmed = window.confirm(
       "This will unmount the SSD and stop data storage until it is mounted again. Continue?"
     );
@@ -260,6 +266,8 @@ export default function ServerManagementPage() {
 
   // Delete raw data files older than the selected retention window.
   async function handlePruneData() {
+    if (!isAdmin) return;
+
     if (!Number.isFinite(retentionDays) || retentionDays < 1) {
       setPageError("Retention days must be at least 1.");
       return;
@@ -283,6 +291,11 @@ export default function ServerManagementPage() {
       <section className="server-hero">
         <div>
           <h1 className="server-title">Server Management</h1>
+          {!isAdmin ? (
+            <p className="server-page-subtitle">
+              Viewer access: operational controls are disabled.
+            </p>
+          ) : null}
         </div>
 
         <div className="server-hero-actions">
@@ -459,7 +472,8 @@ export default function ServerManagementPage() {
               type="button"
               className="server-action-btn server-action-btn-danger"
               onClick={() => void handleUnmountStorage()}
-              disabled={runningAction === "unmount-storage"}
+              disabled={!isAdmin || runningAction === "unmount-storage"}
+              title={!isAdmin ? "Admin only" : "Unmount SSD"}
             >
               {runningAction === "unmount-storage"
                 ? "Unmounting..."
@@ -528,7 +542,8 @@ export default function ServerManagementPage() {
                   "Restart the backend service now?"
                 )
               }
-              disabled={runningAction === "restart-backend"}
+              disabled={!isAdmin || runningAction === "restart-backend"}
+              title={!isAdmin ? "Admin only" : "Restart Backend"}
             >
               {runningAction === "restart-backend"
                 ? "Restarting..."
@@ -546,7 +561,8 @@ export default function ServerManagementPage() {
                   "Restart the MQTT broker service now?"
                 )
               }
-              disabled={runningAction === "restart-mqtt"}
+              disabled={!isAdmin || runningAction === "restart-mqtt"}
+              title={!isAdmin ? "Admin only" : "Restart MQTT"}
             >
               {runningAction === "restart-mqtt"
                 ? "Restarting..."
@@ -564,7 +580,8 @@ export default function ServerManagementPage() {
                   "Renew the VPN certificate now?"
                 )
               }
-              disabled={runningAction === "renew-vpn"}
+              disabled={!isAdmin || runningAction === "renew-vpn"}
+              title={!isAdmin ? "Admin only" : "Renew VPN Certificate"}
             >
               {runningAction === "renew-vpn"
                 ? "Renewing..."
@@ -582,7 +599,8 @@ export default function ServerManagementPage() {
                   "Reboot the Raspberry Pi now? This will disconnect the dashboard temporarily."
                 )
               }
-              disabled={runningAction === "reboot-server"}
+              disabled={!isAdmin || runningAction === "reboot-server"}
+              title={!isAdmin ? "Admin only" : "Reboot Pi"}
             >
               {runningAction === "reboot-server" ? "Rebooting..." : "Reboot Pi"}
             </button>
@@ -617,6 +635,7 @@ export default function ServerManagementPage() {
                       setRetentionDays(Number(event.target.value))
                     }
                     className="server-input"
+                    disabled={!isAdmin}
                   />
                 </label>
 
@@ -624,7 +643,8 @@ export default function ServerManagementPage() {
                   type="button"
                   className="server-action-btn server-action-btn-danger"
                   onClick={() => void handlePruneData()}
-                  disabled={runningAction === "prune-data"}
+                  disabled={!isAdmin || runningAction === "prune-data"}
+                  title={!isAdmin ? "Admin only" : "Delete Old Data"}
                 >
                   {runningAction === "prune-data"
                     ? "Deleting..."

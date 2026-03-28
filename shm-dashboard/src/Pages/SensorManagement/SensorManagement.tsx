@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
+import useAuth from "../../Auth/useAuth";
 import SensorConfigCard, {
   type SensorConfig,
 } from "../../components/SensorConfig/SensorConfig";
@@ -311,6 +312,7 @@ function buildFallbackSensorStatus(
 }
 
 export default function SensorManagement() {
+  const { isAdmin } = useAuth();
   const [searchParams] = useSearchParams();
   const requestedSerial = searchParams.get("serial");
 
@@ -524,7 +526,7 @@ export default function SensorManagement() {
     range: 1 | 2 | 3;
     hpf_corner: number;
   }) {
-    if (!nodeId || !selectedNode) return;
+    if (!nodeId || !selectedNode || !isAdmin) return;
 
     const currentNodeConfig = configByNode[nodeId] ?? FALLBACK_CONFIG;
 
@@ -573,7 +575,7 @@ export default function SensorManagement() {
 
   // Send node start/stop control and update UI state optimistically.
   async function handleNodeControl(cmd: "start" | "stop") {
-    if (!nodeId || !selectedNode) return;
+    if (!nodeId || !selectedNode || !isAdmin) return;
 
     if (UI_PREVIEW_MODE) {
       setConfigByNode((prev) => ({
@@ -886,6 +888,11 @@ export default function SensorManagement() {
             <p className="sm-inline-status">{settingsStatus}</p>
           )}
           {faultStatus && <p className="sm-inline-status">{faultStatus}</p>}
+          {!isAdmin && (
+            <p className="sm-inline-status">
+              Viewer access: configuration controls are disabled.
+            </p>
+          )}
         </div>
       </div>
 
@@ -919,7 +926,11 @@ export default function SensorManagement() {
               onApply={handleApplyAccelerometerConfig}
               onStart={() => handleNodeControl("start")}
               onStop={() => handleNodeControl("stop")}
-              disabled={!selectedNode || sensor !== "accelerometer"}
+              disabled={
+                !selectedNode ||
+                sensor !== "accelerometer" ||
+                !isAdmin
+              }
             />
 
             <div className="sm-panel sm-full-width-panel">
