@@ -1,0 +1,21 @@
+[Unit]
+Description=MQTT Listener Data Service
+After=network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/windturbine
+ExecStart=/usr/bin/python3 /home/pi/windturbine/mqtt_listener_data.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+# Logs go to journalctl
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

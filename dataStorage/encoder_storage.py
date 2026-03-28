@@ -258,6 +258,115 @@ def _pack_delta(value: int) -> bytes:
     return struct.pack("<h", max(-32768, min(32767, value)))
 
 
+def _read_exact_or_raise(f, n: int, label: str = "") -> bytes:
+    data = f.read(n)
+    if len(data) != n:
+        raise EOFError(f"EOF reading {label!r}: got {len(data)}/{n} bytes")
+    return data
+
+
+def _skip_v3_changed_samples(f, n: int, label_prefix: str):
+    for _ in range(n):
+        changed = _read_exact_or_raise(f, 1, f"{label_prefix} changed")[0]
+        if changed & CHANGED_TS:
+            _read_exact_or_raise(f, 4, f"{label_prefix} delta_ts")
+        if changed & CHANGED_X:
+            _read_exact_or_raise(f, 2, f"{label_prefix} dx")
+        if changed & CHANGED_Y:
+            _read_exact_or_raise(f, 2, f"{label_prefix} dy")
+        if changed & CHANGED_Z:
+            _read_exact_or_raise(f, 2, f"{label_prefix} dz")
+
+
+def _recover_active_hourly_file(node_id: str, filepath: str) -> bool:
+    """Prepare an existing active-hour file for safe append after restart.
+
+    Returns True when the file already contains the version header and should be
+    appended to without writing another FILE_FORMAT_VERSION byte.
+    Truncates any incomplete trailing record left by an unexpected stop.
+    """
+    if not os.path.exists(filepath):
+        return False
+
+    try:
+        size = os.path.getsize(filepath)
+    except OSError as e:
+        print(f"[{node_id}] WARNING: cannot inspect existing file {filepath}: {e}")
+        return False
+
+    if size == 0:
+        return False
+
+    try:
+        with open(filepath, "r+b") as f:
+            version_raw = f.read(1)
+            if not version_raw:
+                return False
+
+            if version_raw[0] != FILE_FORMAT_VERSION:
+                print(
+                    f"[{node_id}] WARNING: existing file {os.path.basename(filepath)} "
+                    f"starts with version {version_raw[0]}, expected {FILE_FORMAT_VERSION}; "
+                    f"appending without rewriting header."
+                )
+                return True
+
+            last_good_offset = f.tell()
+
+            while True:
+                record_start = f.tell()
+                marker = f.read(1)
+                if not marker:
+                    break
+
+                try:
+                    if marker[0] == 0xFF:
+                        header = _read_exact_or_raise(f, 1, "abs header")[0]
+                        if header & 0x01:
+                            n = _read_exact_or_raise(f, 1, "accel n")[0]
+                            _read_exact_or_raise(f, n * (8 + 12), "accel abs payload")
+                        if header & 0x02:
+                            n = _read_exact_or_raise(f, 1, "inclin n")[0]
+                            _read_exact_or_raise(f, n * (8 + 12), "inclin abs payload")
+                        if header & 0x04:
+                            _read_exact_or_raise(f, 8 + 4, "temp abs payload")
+                    else:
+                        header = marker[0]
+                        if header & 0x01:
+                            n = _read_exact_or_raise(f, 1, "accel n")[0]
+                            _skip_v3_changed_samples(f, n, "accel")
+                        if header & 0x02:
+                            n = _read_exact_or_raise(f, 1, "inclin n")[0]
+                            _skip_v3_changed_samples(f, n, "inclin")
+                        if header & 0x04:
+                            changed = _read_exact_or_raise(f, 1, "temp changed")[0]
+                            if changed & CHANGED_TS:
+                                _read_exact_or_raise(f, 4, "temp delta_ts")
+                            if changed & CHANGED_X:
+                                _read_exact_or_raise(f, 2, "temp dval")
+                except EOFError:
+                    f.truncate(record_start)
+                    print(
+                        f"[{node_id}] Recovered active file {os.path.basename(filepath)}: "
+                        f"truncated incomplete tail from {size} to {record_start} bytes."
+                    )
+                    return True
+
+                last_good_offset = f.tell()
+
+            if last_good_offset < size:
+                f.truncate(last_good_offset)
+                print(
+                    f"[{node_id}] Recovered active file {os.path.basename(filepath)}: "
+                    f"trimmed trailing bytes from {size} to {last_good_offset}."
+                )
+
+    except OSError as e:
+        print(f"[{node_id}] WARNING: failed to recover existing file {filepath}: {e}")
+
+    return True
+
+
 def encode_first_record(data: dict, state: dict) -> bytes:
     """Encode an ABSOLUTE record."""
     header = 0
@@ -543,7 +652,12 @@ def write_record(node_id: str, data: dict):
         state["is_first"] = True
         state["header_written"] = False
         state["last_absolute_record_ts_us"] = 0
-        print(f"[{node_id}] New hourly file: {filepath}")
+
+        if os.path.exists(filepath):
+            state["header_written"] = _recover_active_hourly_file(node_id, filepath)
+            print(f"[{node_id}] Resuming hourly file: {filepath} (next record forced ABSOLUTE)")
+        else:
+            print(f"[{node_id}] New hourly file: {filepath}")
 
     if not state["is_first"]:
         force_abs, reason = needs_absolute_record(data, state)
