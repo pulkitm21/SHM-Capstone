@@ -50,6 +50,8 @@ from server_management import (
     restart_mqtt_service as restart_mqtt_service_action,
 )
 
+from fault_logger import ensure_fault_db_schema
+
 from auth.auth_routes import router as auth_router
 from auth.auth_db import init_db
 from auth.auth_repository import create_user, get_user
@@ -80,6 +82,13 @@ FAULTS_DB = FAULT_DIR / "faults.db"
 # Sensor status values returned to the frontend.
 SENSOR_STATUS_WINDOW_SECONDS = 120
 SENSOR_KEYS = ("accelerometer", "inclinometer", "temperature")
+
+# Stateful fault types that should be reduced to current state.
+STATEFUL_FAULT_TYPES = (
+    "ethernet_link",
+    "mqtt_connection",
+    "power_loss",
+)
 
 
 class NodePositionUpdate(BaseModel):
@@ -185,7 +194,7 @@ def empty_fault_response(page: int = 1, page_size: int = 15) -> Dict[str, Any]:
 
 def _active_sensor_faults_for_serial(serial: str) -> dict[str, list[dict[str, Any]]]:
     """
-    Return active unresolved sensor faults grouped by sensor type for one node serial.
+    Return currently active stateful sensor faults grouped by sensor type for one node serial.
     Only accelerometer / inclinometer / temperature faults are included.
     """
     grouped: dict[str, list[dict[str, Any]]] = {
@@ -204,12 +213,63 @@ def _active_sensor_faults_for_serial(serial: str) -> dict[str, list[dict[str, An
         con.row_factory = sqlite3.Row
         cur = con.cursor()
 
+        # Reduce stateful fault history into one latest row per state key.
         cur.execute(
             """
-            SELECT id, serial_number, sensor_type, fault_type, severity, fault_status, description, ts
-            FROM faults
-            WHERE serial_number = ?
-              AND LOWER(fault_status) != 'resolved'
+            WITH normalized_faults AS (
+                SELECT
+                    id,
+                    serial_number,
+                    sensor_type,
+                    fault_type,
+                    COALESCE(state_key, fault_type) AS normalized_state_key,
+                    COALESCE(
+                        is_stateful,
+                        CASE
+                            WHEN fault_type IN ('ethernet_link', 'mqtt_connection', 'power_loss') THEN 1
+                            ELSE 0
+                        END
+                    ) AS normalized_is_stateful,
+                    severity,
+                    fault_status,
+                    description,
+                    ts
+                FROM faults
+                WHERE serial_number = ?
+            ),
+            ranked_faults AS (
+                SELECT
+                    id,
+                    serial_number,
+                    sensor_type,
+                    fault_type,
+                    normalized_state_key AS state_key,
+                    normalized_is_stateful AS is_stateful,
+                    severity,
+                    fault_status,
+                    description,
+                    ts,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY serial_number, sensor_type, normalized_state_key
+                        ORDER BY ts DESC, id DESC
+                    ) AS rn
+                FROM normalized_faults
+                WHERE normalized_is_stateful = 1
+            )
+            SELECT
+                id,
+                serial_number,
+                sensor_type,
+                fault_type,
+                state_key,
+                is_stateful,
+                severity,
+                fault_status,
+                description,
+                ts
+            FROM ranked_faults
+            WHERE rn = 1
+              AND LOWER(fault_status) = 'active'
               AND LOWER(sensor_type) IN ('accelerometer', 'inclinometer', 'temperature')
             ORDER BY ts DESC
             """,
@@ -657,6 +717,11 @@ def startup_event():
         print("[auth] Created default devadmin user")
 
     try:
+        ensure_fault_db_schema()
+    except Exception as e:
+        print(f"[startup] Fault DB schema check failed: {e}")
+
+    try:
         mqtt_status_client = start_listener()
     except Exception as e:
         mqtt_status_client = None
@@ -1008,7 +1073,18 @@ def read_fault_rows(
 
         cur.execute(
             f"""
-            SELECT id, serial_number, sensor_type, fault_type, severity, fault_status, description, ts
+            SELECT
+                id,
+                serial_number,
+                fault_code,
+                sensor_type,
+                fault_type,
+                state_key,
+                is_stateful,
+                severity,
+                fault_status,
+                description,
+                ts
             FROM faults
             {where_sql}
             ORDER BY ts DESC
@@ -1038,8 +1114,6 @@ def read_fault_rows(
             con.close()
 
 
-
-
 def read_active_fault_summary() -> Dict[str, Any]:
     if not is_ssd_available() or not FAULTS_DB.exists():
         return {
@@ -1056,11 +1130,48 @@ def read_active_fault_summary() -> Dict[str, Any]:
         con.row_factory = sqlite3.Row
         cur = con.cursor()
 
+        # Reduce stateful fault history into one latest row per state key.
         cur.execute(
             """
+            WITH normalized_faults AS (
+                SELECT
+                    id,
+                    serial_number,
+                    sensor_type,
+                    fault_type,
+                    COALESCE(state_key, fault_type) AS normalized_state_key,
+                    COALESCE(
+                        is_stateful,
+                        CASE
+                            WHEN fault_type IN ('ethernet_link', 'mqtt_connection', 'power_loss') THEN 1
+                            ELSE 0
+                        END
+                    ) AS normalized_is_stateful,
+                    fault_status,
+                    ts
+                FROM faults
+            ),
+            ranked_faults AS (
+                SELECT
+                    id,
+                    serial_number,
+                    sensor_type,
+                    fault_type,
+                    normalized_state_key AS state_key,
+                    normalized_is_stateful AS is_stateful,
+                    fault_status,
+                    ts,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY serial_number, sensor_type, normalized_state_key
+                        ORDER BY ts DESC, id DESC
+                    ) AS rn
+                FROM normalized_faults
+                WHERE normalized_is_stateful = 1
+            )
             SELECT serial_number, COUNT(*) AS active_count, MAX(ts) AS latest_active_ts
-            FROM faults
-            WHERE LOWER(fault_status) = 'active'
+            FROM ranked_faults
+            WHERE rn = 1
+              AND LOWER(fault_status) = 'active'
             GROUP BY serial_number
             ORDER BY serial_number COLLATE NOCASE ASC
             """
@@ -1130,7 +1241,18 @@ def read_fault_rows_since_id(
 
         cur.execute(
             f"""
-            SELECT id, serial_number, sensor_type, fault_type, severity, fault_status, description, ts
+            SELECT
+                id,
+                serial_number,
+                fault_code,
+                sensor_type,
+                fault_type,
+                state_key,
+                is_stateful,
+                severity,
+                fault_status,
+                description,
+                ts
             FROM faults
             {where_sql}
             ORDER BY id ASC
