@@ -33,7 +33,7 @@ FAULT_CODE_MAP: dict[int, FaultDefinition] = {
     14: FaultDefinition( "ADXL355 init failed", "accelerometer", "init_failed", 3, "active", "accelerometer", False, None),
     15: FaultDefinition( "SCL3300 init failed", "inclinometer", "init_failed", 3, "active", "inclinometer", False, None),
     16: FaultDefinition( "ADT7420 init failed", "temperature", "init_failed", 3, "active", "temperature", False, None),
-    17: FaultDefinition( "SPI bus error", "accelerometer", "spi_bus", 3,("Reboot attempt"), 'system', 'reboot_attempt', 2, 'active', 'node', False, None),
+    17: FaultDefinition( "SPI bus error", "accelerometer", "spi_bus", 3, "active", "node", False, None),
     18: FaultDefinition( "I2C bus error", "system", "i2c_bus", 3, "active", "node", False, None),
 }
 
