@@ -18,6 +18,7 @@ SENTINEL = 0xFF
 
 FORMAT_V1 = 1
 FORMAT_V2 = 2
+FORMAT_V3 = 3
 
 
 def read_bytes(f, n, label=""):
@@ -148,6 +149,60 @@ def _decode_accel_delta(f, state):
     return out or None
 
 
+
+def _decode_accel_delta_v3(f, state):
+    (n,) = read_fmt(f, "<B", "accel n")
+    out = []
+    ss = state["accel"]
+    prev = ss["xyz_prev"]
+
+    for _ in range(n):
+        (changed,) = read_fmt(f, "<B", "accel changed")
+
+        if changed & 0x01:
+            (delta_us,) = read_fmt(f, "<i", "accel delta_ts")
+            ts_us = ss["ts_us"] + delta_us
+            ss["ts_us"] = ts_us
+        else:
+            ts_us = ss["ts_us"]
+
+        if changed & 0x10:
+            x = None
+        else:
+            dx = read_fmt(f, "<h", "accel dx")[0] if changed & 0x02 else 0
+            x = prev[0] + dx
+
+        if changed & 0x20:
+            y = None
+        else:
+            dy = read_fmt(f, "<h", "accel dy")[0] if changed & 0x04 else 0
+            y = prev[1] + dy
+
+        if changed & 0x40:
+            z = None
+        else:
+            dz = read_fmt(f, "<h", "accel dz")[0] if changed & 0x08 else 0
+            z = prev[2] + dz
+
+        out.append(
+            (
+                ts_us / TS_SCALE,
+                None if x is None else x / ACCEL_SCALE,
+                None if y is None else y / ACCEL_SCALE,
+                None if z is None else z / ACCEL_SCALE,
+            )
+        )
+
+        prev = [
+            prev[0] if x is None else x,
+            prev[1] if y is None else y,
+            prev[2] if z is None else z,
+        ]
+
+    ss["xyz_prev"] = prev
+    return out or None
+
+
 def _decode_inclin_abs(f, state):
     ts_us = _reconstruct_abs_ts(f, state["inclin"])
     roll, pitch, yaw = read_fmt(f, "<iii", "inclin abs")
@@ -204,6 +259,60 @@ def _decode_inclin_delta(f, state):
     )
 
 
+
+def _decode_inclin_delta_v3(f, state):
+    (n,) = read_fmt(f, "<B", "inclin n")
+    out = []
+    ss = state["inclin"]
+    prev = ss["xyz_prev"]
+
+    for _ in range(n):
+        (changed,) = read_fmt(f, "<B", "inclin changed")
+
+        if changed & 0x01:
+            (delta_us,) = read_fmt(f, "<i", "inclin delta_ts")
+            ts_us = ss["ts_us"] + delta_us
+            ss["ts_us"] = ts_us
+        else:
+            ts_us = ss["ts_us"]
+
+        if changed & 0x10:
+            roll = None
+        else:
+            dr = read_fmt(f, "<h", "inclin dr")[0] if changed & 0x02 else 0
+            roll = prev[0] + dr
+
+        if changed & 0x20:
+            pitch = None
+        else:
+            dp = read_fmt(f, "<h", "inclin dp")[0] if changed & 0x04 else 0
+            pitch = prev[1] + dp
+
+        if changed & 0x40:
+            yaw = None
+        else:
+            dy = read_fmt(f, "<h", "inclin dy")[0] if changed & 0x08 else 0
+            yaw = prev[2] + dy
+
+        out.append(
+            (
+                ts_us / TS_SCALE,
+                None if roll is None else roll / INCLIN_SCALE,
+                None if pitch is None else pitch / INCLIN_SCALE,
+                None if yaw is None else yaw / INCLIN_SCALE,
+            )
+        )
+
+        prev = [
+            prev[0] if roll is None else roll,
+            prev[1] if pitch is None else pitch,
+            prev[2] if yaw is None else yaw,
+        ]
+
+    ss["xyz_prev"] = prev
+    return out or None
+
+
 def _decode_temp_abs(f, state):
     ts_us = _reconstruct_abs_ts(f, state["temp"])
     (val,) = read_fmt(f, "<i", "temp abs")
@@ -249,6 +358,33 @@ def _decode_temp_delta(f, state):
     )
 
 
+def _decode_temp_delta_v3(f, state):
+    ss = state["temp"]
+    (changed,) = read_fmt(f, "<B", "temp changed")
+
+    if changed & 0x01:
+        (delta_us,) = read_fmt(f, "<i", "temp delta_ts")
+        ts_us = ss["ts_us"] + delta_us
+        ss["ts_us"] = ts_us
+    else:
+        ts_us = ss["ts_us"]
+
+    if changed & 0x04:
+        return (
+            ts_us / TS_SCALE,
+            None,
+        )
+
+    if changed & 0x02:
+        (dt,) = read_fmt(f, "<h", "temp dval")
+        ss["val_prev"] = ss["val_prev"] + dt
+
+    return (
+        ts_us / TS_SCALE,
+        ss["val_prev"] / TEMP_SCALE,
+    )
+
+
 @contextmanager
 def open_record_stream(filepath: str):
     """
@@ -280,7 +416,7 @@ def iter_decoded_records_for_export(
 
     This now matches the frontend decoder behavior more closely:
     - supports .bin and .bin.gz
-    - supports FORMAT_V1 and FORMAT_V2
+    - supports FORMAT_V1, FORMAT_V2, and FORMAT_V3
     - tolerates a truncated tail record by stopping cleanly
     - yields one decoded record at a time for low-memory processing
 
@@ -295,7 +431,7 @@ def iter_decoded_records_for_export(
             return
 
         fv = ver[0]
-        if fv not in (FORMAT_V1, FORMAT_V2):
+        if fv not in (FORMAT_V1, FORMAT_V2, FORMAT_V3):
             # Legacy file with no explicit version byte.
             f.seek(-1, 1)
             fv = FORMAT_V1
@@ -343,13 +479,20 @@ def iter_decoded_records_for_export(
                             rec["inclin"] = _decode_inclin_delta_v1(f, state)
                         if header & FLAG_TEMP:
                             rec["temp"] = _decode_temp_delta_v1(f, state)
-                    else:
+                    elif fv == FORMAT_V2:
                         if header & FLAG_ACCEL:
                             rec["accel_samples"] = _decode_accel_delta(f, state)
                         if header & FLAG_INCLIN:
                             rec["inclin"] = _decode_inclin_delta(f, state)
                         if header & FLAG_TEMP:
                             rec["temp"] = _decode_temp_delta(f, state)
+                    else:
+                        if header & FLAG_ACCEL:
+                            rec["accel_samples"] = _decode_accel_delta_v3(f, state)
+                        if header & FLAG_INCLIN:
+                            rec["inclin"] = _decode_inclin_delta_v3(f, state)
+                        if header & FLAG_TEMP:
+                            rec["temp"] = _decode_temp_delta_v3(f, state)
 
                 yield rec
                 idx += 1

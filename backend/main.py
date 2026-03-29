@@ -1462,6 +1462,13 @@ def _min_spacing_seconds(minutes: int, target_points: int) -> float:
     return max(0.0, window_seconds / max(1, target_points))
 
 
+
+def _plot_float_or_none(value):
+    if value is None:
+        return None
+    return float(value)
+
+
 def read_accel_points(node_id: int, minutes: int, limit: int = 1200):
     if not is_ssd_available():
         return []
@@ -1495,9 +1502,9 @@ def read_accel_points(node_id: int, minutes: int, limit: int = 1200):
                 points.append(
                     {
                         "ts": _iso_from_epoch_seconds(ts),
-                        "x": float(x),
-                        "y": float(y),
-                        "z": float(z),
+                        "x": _plot_float_or_none(x),
+                        "y": _plot_float_or_none(y),
+                        "z": _plot_float_or_none(z),
                     }
                 )
                 last_kept_ts = ts
@@ -1528,22 +1535,24 @@ def read_inclinometer_points(node_id: int, minutes: int, limit: int = 1200):
             if not inclin:
                 continue
 
-            ts, roll, pitch, yaw = inclin
-            if ts < start_ts or ts >= end_ts:
-                continue
+            inclin_samples = inclin if isinstance(inclin, list) else [inclin]
 
-            if last_kept_ts is not None and (ts - last_kept_ts) < min_spacing:
-                continue
+            for ts, roll, pitch, yaw in inclin_samples:
+                if ts < start_ts or ts >= end_ts:
+                    continue
 
-            points.append(
-                {
-                    "ts": _iso_from_epoch_seconds(ts),
-                    "roll": float(roll),
-                    "pitch": float(pitch),
-                    "yaw": float(yaw),
-                }
-            )
-            last_kept_ts = ts
+                if last_kept_ts is not None and (ts - last_kept_ts) < min_spacing:
+                    continue
+
+                points.append(
+                    {
+                        "ts": _iso_from_epoch_seconds(ts),
+                        "roll": _plot_float_or_none(roll),
+                        "pitch": _plot_float_or_none(pitch),
+                        "yaw": _plot_float_or_none(yaw),
+                    }
+                )
+                last_kept_ts = ts
 
     return list(points)
 
@@ -1576,7 +1585,7 @@ def read_temperature_points(node_id: int, minutes: int, limit: int = 2000):
             points.append(
                 {
                     "ts": _iso_from_epoch_seconds(ts),
-                    "value": float(value),
+                    "value": _plot_float_or_none(value),
                 }
             )
 
