@@ -65,13 +65,19 @@ const Navbar = () => {
         const nextTitle = response.site_name?.trim() || DEFAULT_DASHBOARD_TITLE;
         setDashboardTitle(nextTitle);
         setTitleInput(nextTitle);
-      } catch (error) {
-        console.warn("Failed to load site name from backend, using default.", error);
-        setDashboardTitle(DEFAULT_DASHBOARD_TITLE);
-        setTitleInput(DEFAULT_DASHBOARD_TITLE);
-      } finally {
-        setLoadingTitle(false);
-      }
+      } catch (error: any) {
+  if (error?.name === "AbortError") {
+    return;
+  }
+
+  console.warn("Failed to load site name from backend, using default.", error);
+  setDashboardTitle(DEFAULT_DASHBOARD_TITLE);
+  setTitleInput(DEFAULT_DASHBOARD_TITLE);
+} finally {
+  if (!controller.signal.aborted) {
+    setLoadingTitle(false);
+  }
+}
     }
 
     void loadSiteName();
@@ -144,7 +150,6 @@ const Navbar = () => {
       <div className="navbar-header">
         <div className="navbar-header-top">
           <span className="navbar-kicker">Site</span>
-          <span className="navbar-role-pill">{user?.role === "admin" ? "Admin" : "Viewer"}</span>
         </div>
 
         {isEditingTitle ? (
@@ -203,11 +208,6 @@ const Navbar = () => {
       </ul>
 
       <div className="navbar-footer">
-        <div className="navbar-user-meta">
-          <span className="navbar-user-name">{user?.username || "Unknown user"}</span>
-          <span className="navbar-user-role">{user?.role || "viewer"}</span>
-        </div>
-
         <button className="logout-button" onClick={() => void handleLogout()}>
           Logout
         </button>
