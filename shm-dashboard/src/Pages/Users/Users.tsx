@@ -270,9 +270,6 @@ function Users() {
       <div className="users-hero">
         <div>
           <h1 className="users-title">Users</h1>
-          <p className="users-subtitle">
-            Manage dashboard access, assign roles, and reset user passwords.
-          </p>
         </div>
       </div>
 
@@ -280,7 +277,6 @@ function Users() {
         <section className="users-card">
           <div className="users-card-header">
             <h2>Create User</h2>
-            <p>Add a new dashboard account and assign its role.</p>
           </div>
 
           <form className="users-create-form" onSubmit={handleCreateUser}>
@@ -337,7 +333,6 @@ function Users() {
         <section className="users-card users-card-wide">
           <div className="users-card-header">
             <h2>User Management</h2>
-            <p>Change roles, reset passwords, or remove existing accounts.</p>
           </div>
 
           {pageError ? <div className="users-banner users-banner-error">{pageError}</div> : null}
