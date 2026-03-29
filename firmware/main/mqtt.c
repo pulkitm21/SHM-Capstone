@@ -55,7 +55,7 @@ static bool s_mqtt_ever_connected = false; /* distinguish first connect from rec
 /* Command handler registered by the application layer */
 static mqtt_cmd_handler_t s_cmd_handler = NULL;
 
-/* Command topic strings — built at subscribe time from s_serial_no */
+/* Command topic strings -- built at subscribe time from s_serial_no */
 #define CMD_TOPIC_MAX_LEN  80
 static char s_topic_cmd_configure[CMD_TOPIC_MAX_LEN];
 static char s_topic_cmd_control[CMD_TOPIC_MAX_LEN];
@@ -77,8 +77,8 @@ static char *s_json_buffer = NULL;
  *
  * Sizes:
  *   serial_no  = MQTT_SERIAL_MAX_LEN (32)
- *   client_id  = "wind_turbine_" (13) + serial (32) + '\0' = 46  → use 64
- *   topic      = "wind_turbine/" (13) + serial (32) + "/data" (5) + '\0' = 51 → use 64
+ *   client_id  = "wind_turbine_" (13) + serial (32) + '\0' = 46  -> use 64
+ *   topic      = "wind_turbine/" (13) + serial (32) + "/data" (5) + '\0' = 51 -> use 64
  */
 #define CLIENT_ID_MAX_LEN   64
 #define TOPIC_MAX_LEN       64
@@ -98,7 +98,7 @@ static char s_topic_status[TOPIC_MAX_LEN];
  * Opens the "node_cfg" namespace and reads the "serial_no" string key.
  * On success, copies the value into s_serial_no and returns ESP_OK.
  * On any failure (NVS not initialised, key absent, etc.) returns an error
- * code — the caller should then fall back to the MAC address.
+ * code -- the caller should then fall back to the MAC address.
  */
 static esp_err_t read_serial_from_nvs(void)
 {
@@ -118,8 +118,8 @@ static esp_err_t read_serial_from_nvs(void)
     nvs_handle_t handle;
     ret = nvs_open(MQTT_NVS_NAMESPACE, NVS_READONLY, &handle);
     if (ret != ESP_OK) {
-        /* Namespace does not exist yet — node has never been provisioned */
-        ESP_LOGW(TAG, "NVS namespace '%s' not found — node is unprovisioned",
+        /* Namespace does not exist yet -- node has never been provisioned */
+        ESP_LOGW(TAG, "NVS namespace '%s' not found -- node is unprovisioned",
                  MQTT_NVS_NAMESPACE);
         return ret;
     }
@@ -129,7 +129,7 @@ static esp_err_t read_serial_from_nvs(void)
     nvs_close(handle);
 
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "NVS key '%s' not found in namespace '%s' — node is unprovisioned",
+        ESP_LOGW(TAG, "NVS key '%s' not found in namespace '%s' -- node is unprovisioned",
                  MQTT_NVS_SERIAL_KEY, MQTT_NVS_NAMESPACE);
         return ret;
     }
@@ -158,7 +158,7 @@ static void build_mac_fallback(void)
     snprintf(s_serial_no, sizeof(s_serial_no), "MAC-%02X%02X%02X%02X%02X%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-    ESP_LOGW(TAG, "Node is UNPROVISIONED — using MAC fallback ID: %s", s_serial_no);
+    ESP_LOGW(TAG, "Node is UNPROVISIONED -- using MAC fallback ID: %s", s_serial_no);
     ESP_LOGW(TAG, "Flash a serial number via NVS to assign a proper identity.");
 }
 
@@ -166,8 +166,8 @@ static void build_mac_fallback(void)
  * @brief Resolve the node identity and build client ID + topic strings.
  *
  * Priority:
- *   1. NVS serial number (e.g. "WT01-N03")   — provisioned node
- *   2. MAC-based fallback (e.g. "MAC-AABBCCDDEEFF") — unprovisioned node
+ *   1. NVS serial number (e.g. "WT01-N03")   -- provisioned node
+ *   2. MAC-based fallback (e.g. "MAC-AABBCCDDEEFF") -- unprovisioned node
  */
 static void build_identity_strings(void)
 {
@@ -192,11 +192,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG, "Connected to MQTT broker");
-            s_is_connected = true;
-            if (s_mqtt_event_group) {
-                xEventGroupSetBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
-                xEventGroupClearBits(s_mqtt_event_group, MQTT_DISCONNECTED_BIT);
-            }
             /* Re-subscribe to cmd topics after reconnect */
             if (s_topic_cmd_configure[0] != '\0') {
                 esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd_configure, 0);
@@ -204,11 +199,19 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd_all,       0);
                 ESP_LOGI(TAG, "Re-subscribed to cmd topics after reconnect");
             }
-            /* Log recovery fault on reconnects; skip the initial connection at boot */
-            if (s_mqtt_ever_connected) {
-                fault_log_record(FAULT_MQTT_RECONNECTED);
-            } else {
+            /* Log recovery fault only on genuine reconnect transitions:
+             * - skip the very first connection at boot (s_mqtt_ever_connected guard)
+             * - skip if we were already marked connected (duplicate event during storm) */
+            if (!s_mqtt_ever_connected) {
                 s_mqtt_ever_connected = true;
+            } else if (!s_is_connected) {
+                /* Was disconnected, now connected -- genuine recovery */
+                fault_log_record(FAULT_MQTT_RECONNECTED);
+            }
+            s_is_connected = true;
+            if (s_mqtt_event_group) {
+                xEventGroupSetBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
+                xEventGroupClearBits(s_mqtt_event_group, MQTT_DISCONNECTED_BIT);
             }
             break;
 
@@ -241,13 +244,22 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             break;
 
         case MQTT_EVENT_DISCONNECTED:
-            ESP_LOGW(TAG, "Disconnected from MQTT broker");
-            s_is_connected = false;
-            if (s_mqtt_event_group) {
-                xEventGroupSetBits(s_mqtt_event_group, MQTT_DISCONNECTED_BIT);
-                xEventGroupClearBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
+            /* Only record and log if we were actually connected -- prevents
+             * repeated FAULT_MQTT_DISCONNECTED (code 4) during reconnect storms
+             * where the broker drops the connection immediately after each attempt. */
+            if (s_is_connected) {
+                ESP_LOGW(TAG, "Disconnected from MQTT broker");
+                s_is_connected = false;
+                if (s_mqtt_event_group) {
+                    xEventGroupSetBits(s_mqtt_event_group, MQTT_DISCONNECTED_BIT);
+                    xEventGroupClearBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
+                }
+                fault_log_record(FAULT_MQTT_DISCONNECTED);
+            } else {
+                /* Already disconnected -- silent reconnect attempt failure,
+                 * no new fault recorded, event group already set correctly. */
+                ESP_LOGD(TAG, "MQTT_EVENT_DISCONNECTED while already disconnected -- skipping duplicate fault");
             }
-            fault_log_record(FAULT_MQTT_DISCONNECTED);
             break;
 
         case MQTT_EVENT_ERROR:
@@ -273,7 +285,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 esp_err_t mqtt_mdns_init(esp_netif_t *netif)
 {
    if (netif == NULL) {
-        ESP_LOGE(TAG, "mqtt_mdns_init: netif is NULL — pass ethernet_get_netif()");
+        ESP_LOGE(TAG, "mqtt_mdns_init: netif is NULL -- pass ethernet_get_netif()");
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -309,13 +321,18 @@ esp_err_t mqtt_mdns_init(esp_netif_t *netif)
         ESP_LOGI(TAG, "mDNS hostname set: %s.local", mdns_hostname);
     }
 
-    ESP_LOGI(TAG, "mDNS initialized — broker '%s' will be resolved at connect time",
+    ESP_LOGI(TAG, "mDNS initialized -- broker '%s' will be resolved at connect time",
              MQTT_BROKER_HOSTNAME);
     return ESP_OK;
 }
 
 esp_err_t mqtt_init(void)
 {
+    if (s_mqtt_client != NULL) {
+        ESP_LOGW(TAG, "mqtt_init called but client already running -- ignoring");
+        return ESP_OK;
+    }
+
     ESP_LOGI(TAG, "Initializing MQTT client...");
 
     /* Build unique client ID and topics from the hardware MAC address */
@@ -343,9 +360,11 @@ esp_err_t mqtt_init(void)
 
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri             = MQTT_BROKER_URI,
-        .credentials.client_id          = s_client_id,   // MAC-derived, unique per device
+        .credentials.client_id          = s_client_id,
         .session.keepalive               = 60,
-        .network.reconnect_timeout_ms   = 5000,
+        .session.disable_clean_session   = false,  /* clean session: broker discards old state on reconnect */
+        .network.reconnect_timeout_ms   = 10000,   /* 10 s between reconnect attempts -- gives broker time to clear old TCP socket */
+        .network.timeout_ms             = 10000,
         .buffer.size                    = 1024,
         .buffer.out_size                = 8192,
     };
@@ -544,11 +563,6 @@ esp_err_t mqtt_publish_sensor_data(const mqtt_sensor_packet_t *packet)
         }
     }
 
-    /* Append any pending fault codes before closing the JSON object */
-    if (fault_log_has_pending()) {
-        offset = fault_log_append_to_json(s_json_buffer, JSON_BUFFER_SIZE, offset);
-    }
-
     offset += snprintf(s_json_buffer + offset, JSON_BUFFER_SIZE - offset, "}");
 
     // Publish to the serial-number-derived data topic
@@ -663,15 +677,20 @@ void mqtt_set_cmd_handler(mqtt_cmd_handler_t handler)
 
 esp_err_t mqtt_subscribe_cmd(void)
 {
-    if (!s_is_connected || s_mqtt_client == NULL) {
-        ESP_LOGE(TAG, "mqtt_subscribe_cmd: not connected");
-        return ESP_ERR_INVALID_STATE;
-    }
-
+    /* Always build the topic strings -- they must be populated before the first
+     * MQTT_EVENT_CONNECTED fires so the event handler's re-subscribe guard
+     * (s_topic_cmd_configure[0] != '\0') passes even on the very first connect
+     * when the broker wasn't reachable at boot time. */
     snprintf(s_topic_cmd_configure, sizeof(s_topic_cmd_configure),
              "%s/%s/cmd/configure", MQTT_TOPIC_PREFIX, s_serial_no);
     snprintf(s_topic_cmd_control,   sizeof(s_topic_cmd_control),
              "%s/%s/cmd/control",   MQTT_TOPIC_PREFIX, s_serial_no);
+
+    /* If not connected yet, topic strings are ready for when the broker comes up */
+    if (!s_is_connected || s_mqtt_client == NULL) {
+        ESP_LOGI(TAG, "mqtt_subscribe_cmd: topics built, subscription deferred until connected");
+        return ESP_OK;
+    }
 
     int r1 = esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd_configure, 0);
     int r2 = esp_mqtt_client_subscribe(s_mqtt_client, s_topic_cmd_control,   0);

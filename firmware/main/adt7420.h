@@ -34,4 +34,20 @@ esp_err_t adt7420_init(void);
  */
 esp_err_t adt7420_read_temperature(float *temperature);
 
+/**
+ * @brief Power-on self-test: read temperature and verify it is physically plausible.
+ *
+ * Reads the STATUS register to confirm the sensor is present and a conversion
+ * has completed, then reads temperature and checks it falls within the sensor's
+ * rated operating range (-20 °C to +85 °C). A value outside this range
+ * indicates a sensor fault or floating bus line.
+ *
+ * Call after adt7420_init() succeeds.
+ *
+ * @param[out] temperature_c  Measured temperature in °C.
+ * @return ESP_OK if the read succeeded and the value is plausible.
+ *         ESP_ERR_INVALID_RESPONSE if out of range or STATUS is 0xFF.
+ */
+esp_err_t adt7420_selftest(float *temperature_c);
+
 #endif // ADT7420_H

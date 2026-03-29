@@ -53,6 +53,14 @@ static esp_eth_netif_glue_handle_t s_eth_glue = NULL;
 static bool s_initialized = false;
 static bool s_eth_ever_connected = false; // distinguish first link-up from recovery
 
+/* Optional callback invoked every time an IP is obtained */
+static ethernet_got_ip_cb_t s_got_ip_cb = NULL;
+
+void ethernet_set_got_ip_cb(ethernet_got_ip_cb_t cb)
+{
+    s_got_ip_cb = cb;
+}
+
 // ethernet_init_all() allocates an array of handles
 static esp_eth_handle_t *s_eth_handles = NULL;
 static uint8_t s_eth_port_cnt = 0;
@@ -128,6 +136,12 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
 
     if (s_eth_event_group) {
         xEventGroupSetBits(s_eth_event_group, ETH_GOT_IP_BIT);
+    }
+
+    /* Notify application layer — used to start MQTT/SNTP on first IP,
+     * and to allow reconnection logic on subsequent IP events. */
+    if (s_got_ip_cb) {
+        s_got_ip_cb(s_eth_netif);
     }
 }
 

@@ -84,6 +84,9 @@ static uint32_t s_scl3300_sample_last  = 0;
 static uint32_t s_scl3300_watchdog_ms  = 0;
 static bool     s_scl3300_disconnected = false;
 
+/* ADT7420 uses I2C — no ISR sample counter, track via consecutive read errors */
+static bool     s_adt7420_disconnected = false;
+
 /*
  * Batch buffers sized for the maximum possible batch.
  * ODR=4000Hz with decim=20 -> 200 output samples/sec = 200 per packet.
@@ -299,31 +302,10 @@ static void data_processing_task(void *pvParameters)
     while (s_task_running) {
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
-        /* ------------------------------------------------------------------ */
-        /* Only run the data pipeline in RECORDING state                      */
-        /* ------------------------------------------------------------------ */
-        node_state_t state = node_config_get_state();
-        if (state != NODE_STATE_RECORDING) {
-            drain_ring_buffers();
-            decim_count       = 0;
-            sum_x = sum_y = sum_z = 0;
-            accel_batch_count  = 0;
-            s_incl_batch_count = 0;
-            /* Reset watchdog timers so stale counters don't fire on next start */
-            s_adxl355_sample_last  = adxl355_get_sample_count();
-            s_scl3300_sample_last  = scl3300_get_sample_count();
-            s_adxl355_watchdog_ms  = 0;
-            s_scl3300_watchdog_ms  = 0;
-            s_adxl355_disconnected = false;
-            s_scl3300_disconnected = false;
-            incl_ever_received     = false;
-            s_last_accel_publish_ms = now_ms;
-            vTaskDelay(pdMS_TO_TICKS(PROCESSING_INTERVAL_MS));
-            continue;
-        }
-
-        /* Snapshot runtime config once per iteration */
+        /* Snapshot runtime config — needed by both health watchdog and
+         * recording pipeline, so taken unconditionally every iteration. */
         const node_runtime_config_t *cfg = node_config_get();
+        node_state_t state = node_config_get_state();
         uint32_t decim_factor      = cfg->decim_factor;
         uint32_t batch_size        = cfg->batch_size;
         float    sensitivity_lsb_g = cfg->sensitivity_lsb_g;
@@ -341,15 +323,15 @@ static void data_processing_task(void *pvParameters)
             uint32_t scl_cnt  = scl3300_get_sample_count();
 
             /* --- Overflow faults --- */
-            if (adxl_ov != s_adxl355_overflow_last) {
+            if (adxl_ov != s_adxl355_overflow_last && !s_adxl355_disconnected) {
                 fault_log_record(FAULT_ADXL355_DROPPED);
                 s_adxl355_overflow_last = adxl_ov;
             }
-            if (scl_ov != s_scl3300_overflow_last) {
+            if (scl_ov != s_scl3300_overflow_last && !s_scl3300_disconnected) {
                 fault_log_record(FAULT_SCL3300_DROPPED);
                 s_scl3300_overflow_last = scl_ov;
             }
-            if (adt_ov != s_adt7420_overflow_last) {
+            if (adt_ov != s_adt7420_overflow_last && !s_adt7420_disconnected) {
                 fault_log_record(FAULT_ADT7420_DROPPED);
                 s_adt7420_overflow_last = adt_ov;
             }
@@ -360,7 +342,10 @@ static void data_processing_task(void *pvParameters)
                 s_adxl355_watchdog_ms  = 0;
                 if (s_adxl355_disconnected) {
                     ESP_LOGI(TAG, "ADXL355 reconnected");
+                    fault_log_record(FAULT_ADXL355_RECONNECTED);
                     s_adxl355_disconnected = false;
+                    /* Sync shadow so stale overflow delta doesn't fire again */
+                    s_adxl355_overflow_last = adxl_ov;
                 }
             } else {
                 s_adxl355_watchdog_ms += PROCESSING_INTERVAL_MS;
@@ -378,7 +363,10 @@ static void data_processing_task(void *pvParameters)
                 s_scl3300_watchdog_ms  = 0;
                 if (s_scl3300_disconnected) {
                     ESP_LOGI(TAG, "SCL3300 reconnected");
+                    fault_log_record(FAULT_SCL3300_RECONNECTED);
                     s_scl3300_disconnected = false;
+                    /* Sync shadow so stale overflow delta doesn't fire again */
+                    s_scl3300_overflow_last = scl_ov;
                 }
             } else {
                 s_scl3300_watchdog_ms += PROCESSING_INTERVAL_MS;
@@ -389,13 +377,6 @@ static void data_processing_task(void *pvParameters)
                     s_scl3300_disconnected = true;
                 }
             }
-        }
-
-        if (odr_hz != last_logged_odr) {
-            ESP_LOGI(TAG, "Recording: ODR=%lu Hz decim=%lu batch=%lu sens=%.0f LSB/g",
-                     (unsigned long)odr_hz, (unsigned long)decim_factor,
-                     (unsigned long)batch_size, sensitivity_lsb_g);
-            last_logged_odr = odr_hz;
         }
 
         /* ------------------------------------------------------------------ */
@@ -418,13 +399,31 @@ static void data_processing_task(void *pvParameters)
 
             if (s_adxl355_disconnected) {
                 ESP_LOGI(TAG, "Attempting ADXL355 reinit...");
-                esp_err_t err;
-                err = adxl355_write_reg_pub(ADXL355_REG_RESET, 0x52);
+
+                /*
+                 * Full reinit sequence mirroring adxl355_init():
+                 * soft-reset -> verify IDs -> standby -> configure -> measure.
+                 * This ensures the sensor comes up in a fully known state
+                 * rather than relying on retained register values after a
+                 * hot-plug (power may have been interrupted on disconnect).
+                 */
+                esp_err_t err = adxl355_write_reg_pub(ADXL355_REG_RESET, 0x52);
                 if (err == ESP_OK) {
                     vTaskDelay(pdMS_TO_TICKS(10));
-                    uint8_t devid = 0;
-                    err = adxl355_read_reg_pub(ADXL355_REG_DEVID_AD, &devid, 1);
-                    if (err == ESP_OK && devid == ADXL355_DEVID_AD_EXPECTED) {
+
+                    uint8_t devid_ad  = 0;
+                    uint8_t devid_mst = 0;
+                    uint8_t partid    = 0;
+                    err = adxl355_read_reg_pub(ADXL355_REG_DEVID_AD,  &devid_ad,  1);
+                    if (err == ESP_OK) adxl355_read_reg_pub(ADXL355_REG_DEVID_MST, &devid_mst, 1);
+                    if (err == ESP_OK) adxl355_read_reg_pub(ADXL355_REG_PARTID,    &partid,    1);
+
+                    if (err == ESP_OK &&
+                        devid_ad  == ADXL355_DEVID_AD_EXPECTED &&
+                        devid_mst == ADXL355_DEVID_MST_EXPECTED &&
+                        partid    == ADXL355_PARTID_EXPECTED) {
+
+                        /* Full configuration sequence */
                         const adxl355_odr_config_t *odr_cfg = node_config_get_odr(cfg->odr_index);
                         adxl355_write_reg_pub(ADXL355_REG_POWER_CTL, ADXL355_POWER_STANDBY_BIT);
                         vTaskDelay(pdMS_TO_TICKS(2));
@@ -434,7 +433,32 @@ static void data_processing_task(void *pvParameters)
                         adxl355_write_reg_pub(ADXL355_REG_INT_MAP, ADXL355_INT_RDY_EN1);
                         adxl355_set_range(cfg->range);
                         adxl355_write_reg_pub(ADXL355_REG_POWER_CTL, 0x00);
-                        ESP_LOGI(TAG, "ADXL355 reinit succeeded — waiting for samples");
+
+                        /* Self-test to verify the sensing element is healthy */
+                        vTaskDelay(pdMS_TO_TICKS(5)); /* allow measurement mode to settle */
+                        bool st_passed = false;
+                        esp_err_t st_err = adxl355_selftest(&st_passed);
+                        if (st_err == ESP_OK && st_passed) {
+                            ESP_LOGI(TAG, "ADXL355 reinit + self-test OK — waiting for samples");
+                        } else {
+                            ESP_LOGW(TAG, "ADXL355 reinit OK but self-test FAILED — sensor may be damaged");
+                            fault_log_record(FAULT_ADXL355_SELFTEST_FAIL);
+                        }
+
+                        /*
+                         * Drain stale samples that accumulated in the ring
+                         * buffer during or just before reinit — mirrors the
+                         * SCL3300 pipeline reset that already does this.
+                         * Also reset the decimation accumulator so a partial
+                         * batch from before the disconnect is not mixed with
+                         * fresh post-reinit samples.
+                         */
+                        adxl355_raw_sample_t dummy_a;
+                        while (adxl355_data_available()) adxl355_read_sample(&dummy_a);
+                        decim_count       = 0;
+                        sum_x = sum_y = sum_z = 0;
+                        accel_batch_count = 0;
+
                     } else {
                         ESP_LOGD(TAG, "ADXL355 reinit: sensor not responding yet");
                     }
@@ -443,10 +467,28 @@ static void data_processing_task(void *pvParameters)
 
             if (s_scl3300_disconnected) {
                 ESP_LOGI(TAG, "Attempting SCL3300 reinit...");
+
+                /*
+                 * scl3300_init() runs the full datasheet Table 11 startup
+                 * sequence (SW reset, mode set, ANG_CTRL, status clear,
+                 * WHOAMI verify).  This is what we need after a hot-plug —
+                 * a partial register poke is not sufficient because the
+                 * sensor may have lost power and returned to POR state.
+                 */
                 esp_err_t err = scl3300_init();
                 if (err == ESP_OK) {
+                    /* Self-test to verify STO register and RS bits */
+                    bool st_passed = false;
+                    esp_err_t st_err = scl3300_selftest(&st_passed);
+                    if (st_err == ESP_OK && st_passed) {
+                        ESP_LOGI(TAG, "SCL3300 reinit + self-test OK — waiting for samples");
+                    } else {
+                        ESP_LOGW(TAG, "SCL3300 reinit OK but self-test FAILED — sensor may be damaged");
+                        fault_log_record(FAULT_SCL3300_SELFTEST_FAIL);
+                    }
+
+                    /* Reset ISR pipeline so it re-primes cleanly */
                     scl3300_reset_isr_pipeline();
-                    ESP_LOGI(TAG, "SCL3300 reinit succeeded — waiting for samples");
                 } else {
                     ESP_LOGD(TAG, "SCL3300 reinit: sensor not responding yet");
                 }
@@ -468,17 +510,49 @@ static void data_processing_task(void *pvParameters)
                 current_temp = tc;
                 temp_valid   = true;
                 s_temp_read_errors = 0;
+                if (s_adt7420_disconnected) {
+                    ESP_LOGI(TAG, "ADT7420 reconnected");
+                    fault_log_record(FAULT_ADT7420_RECONNECTED);
+                    s_adt7420_disconnected = false;
+                    /* Sync overflow shadow so a stale delta doesn't re-fire */
+                    s_adt7420_overflow_last = adt7420_get_overflow_count();
+                }
                 format_ts(current_temp_ts, get_tick_count());
             } else {
                 temp_valid = false;
                 s_temp_read_errors++;
                 ESP_LOGW(TAG, "Temp read failed: %s (#%lu)",
                          esp_err_to_name(err), (unsigned long)s_temp_read_errors);
-                if (s_temp_read_errors == 1 || (s_temp_read_errors % 10) == 0) {
+                if (!s_adt7420_disconnected) {
+                    /* Log fault once on first failure, then stay quiet until recovery */
                     fault_log_record(FAULT_ADT7420_DROPPED);
                     fault_log_record(FAULT_I2C_ERROR);
+                    s_adt7420_disconnected = true;
                 }
             }
+        }
+
+        /* ================================================================== */
+        /* DATA PIPELINE — recording state only                               */
+        /* ================================================================== */
+        if (state != NODE_STATE_RECORDING) {
+            /* Drain ring buffers so they don't fill up and overflow during idle */
+            drain_ring_buffers();
+            decim_count        = 0;
+            sum_x = sum_y = sum_z = 0;
+            accel_batch_count  = 0;
+            s_incl_batch_count = 0;
+            incl_ever_received = false;
+            s_last_accel_publish_ms = now_ms;
+            vTaskDelay(pdMS_TO_TICKS(PROCESSING_INTERVAL_MS));
+            continue;
+        }
+
+        if (odr_hz != last_logged_odr) {
+            ESP_LOGI(TAG, "Recording: ODR=%lu Hz decim=%lu batch=%lu sens=%.0f LSB/g",
+                     (unsigned long)odr_hz, (unsigned long)decim_factor,
+                     (unsigned long)batch_size, sensitivity_lsb_g);
+            last_logged_odr = odr_hz;
         }
 
         /* ------------------------------------------------------------------ */
@@ -591,6 +665,7 @@ esp_err_t data_processing_and_mqtt_task_init(void)
     s_packets_sent      = 0;
     s_samples_dropped   = 0;
     s_temp_read_errors  = 0;
+    s_adt7420_disconnected = false;
 
     s_task_running = true;
 

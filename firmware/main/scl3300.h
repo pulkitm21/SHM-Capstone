@@ -168,6 +168,21 @@ esp_err_t scl3300_enable_angles(void);
  */
 esp_err_t scl3300_read_whoami(uint16_t *whoami);
 
+/**
+ * @brief Power-on self-test: read the STO register and verify RS bits.
+ *
+ * Checks that the sensor is electrically present, communicating over SPI,
+ * and its internal diagnostics report no fault (RS = 0x01, STO != 0).
+ * Does not interrupt normal measurement — the STO register is a continuous
+ * internal diagnostic, not an externally triggered test mode.
+ *
+ * Call after scl3300_init() succeeds.
+ *
+ * @param[out] passed  true if all checks pass, false otherwise.
+ * @return ESP_OK if the SPI transfer succeeded (check *passed for result).
+ */
+esp_err_t scl3300_selftest(bool *passed);
+
 #ifdef __cplusplus
 }
 #endif

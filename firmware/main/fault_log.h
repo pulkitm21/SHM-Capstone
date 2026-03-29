@@ -64,6 +64,11 @@ extern "C" {
 #define FAULT_ADT7420_INIT_FAIL     16
 #define FAULT_SPI_ERROR             17
 #define FAULT_I2C_ERROR             18
+#define FAULT_ADXL355_RECONNECTED   19
+#define FAULT_SCL3300_RECONNECTED   20
+#define FAULT_ADT7420_RECONNECTED   21
+#define FAULT_ADXL355_SELFTEST_FAIL 22
+#define FAULT_SCL3300_SELFTEST_FAIL 23
 
 /******************************************************************************
  * CONFIGURATION

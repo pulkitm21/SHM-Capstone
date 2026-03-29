@@ -386,3 +386,70 @@ esp_err_t scl3300_read_whoami(uint16_t *whoami)
     *whoami = (uint16_t)((resp >> 8) & 0xFFFF);
     return ESP_OK;
 }
+
+/**
+ * @brief Self-test: read the STO (self-test output) register and verify
+ *        the RS bits indicate normal operation.
+ *
+ * The SCL3300 does not have a dedicated self-test activation command like
+ * the ADXL355 — the STO register is a built-in continuous self-diagnostic
+ * that the sensor runs internally. Reading it via SCL3300_CMD_READ_STO and
+ * checking that:
+ *   1. The SPI transfer succeeds (sensor is electrically present)
+ *   2. The RS bits in the response are 0x01 (normal operation, no error flags)
+ *   3. The STO value is non-zero (internal self-test signal is active)
+ *
+ * This is sufficient as a POST check — it confirms the sensor is present,
+ * communicating correctly, and its internal diagnostics report no fault.
+ *
+ * @param[out] passed  Set to true if all checks pass, false otherwise.
+ * @return ESP_OK if the SPI transfer succeeded (check *passed for result).
+ *         ESP_ERR_INVALID_STATE if the sensor is not initialised.
+ */
+esp_err_t scl3300_selftest(bool *passed)
+{
+    if (passed == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_scl3300 == NULL) {
+        ESP_LOGE(TAG, "SCL3300 not initialized");
+        *passed = false;
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    *passed = false;
+
+    uint32_t resp = 0;
+
+    /* Off-frame protocol: send READ_STO twice — first is prime, second has data */
+    esp_err_t ret = scl3300_transfer(SCL3300_CMD_READ_STO, &resp);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Self-test STO prime failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = scl3300_transfer(SCL3300_CMD_READ_STO, &resp);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Self-test STO read failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    uint8_t  rs  = scl3300_extract_rs(resp);
+    uint16_t sto = (uint16_t)((resp >> 8) & 0xFFFF);
+
+    ESP_LOGI(TAG, "Self-test: RS=0x%02X STO=0x%04X", rs, sto);
+
+    if (rs != SCL3300_RS_NORMAL) {
+        ESP_LOGW(TAG, "Self-test FAIL: RS bits = 0x%02X (expected 0x01 normal)", rs);
+        return ESP_OK;  /* transfer succeeded but test failed */
+    }
+
+    if (sto == 0x0000) {
+        ESP_LOGW(TAG, "Self-test FAIL: STO value is zero (internal self-test signal absent)");
+        return ESP_OK;
+    }
+
+    *passed = true;
+    ESP_LOGI(TAG, "Self-test PASS");
+    return ESP_OK;
+}

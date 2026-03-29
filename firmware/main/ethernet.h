@@ -53,6 +53,26 @@ esp_err_t ethernet_get_ip_info(esp_netif_ip_info_t *ip_info);
 esp_netif_t *ethernet_get_netif(void);
 
 /**
+ * @brief Callback type invoked every time the Ethernet interface obtains an IP.
+ *
+ * Called from the IP_EVENT_ETH_GOT_IP handler — both at boot and after any
+ * reconnect. Use this to start MQTT / SNTP the first time, and let the MQTT
+ * client's own reconnect logic handle subsequent broker reconnects.
+ *
+ * @param netif  The esp_netif that got the IP (same as ethernet_get_netif()).
+ */
+typedef void (*ethernet_got_ip_cb_t)(esp_netif_t *netif);
+
+/**
+ * @brief Register a callback invoked every time an IP address is obtained.
+ *
+ * Call this before ethernet_init() so the callback is in place before the
+ * first IP_EVENT_ETH_GOT_IP fires. Replaces any previously registered callback.
+ * Pass NULL to unregister.
+ */
+void ethernet_set_got_ip_cb(ethernet_got_ip_cb_t cb);
+
+/**
  * @brief Deinitialize Ethernet (stop driver, unregister events, free netif).
  */
 esp_err_t ethernet_deinit(void);
