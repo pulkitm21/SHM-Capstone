@@ -41,6 +41,7 @@ from export_utils import find_sensor_files_for_serial
 from sensor_export_decoder import iter_decoded_records_for_export
 
 from server_management import (
+    clear_faults_db,
     get_server_network_payload,
     get_server_status_payload,
     prune_sensor_data,
@@ -64,7 +65,6 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://192.168.20.34:5173",
-        "http://192.168.0.211:5173"
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -665,6 +665,23 @@ def prune_data(payload: PruneStoredDataRequest, user=Depends(require_admin)):
         raise HTTPException(
             status_code=500,
             detail=f"Failed to prune stored data: {exc}",
+        ) from exc
+
+
+@app.delete("/api/faults/clear")
+def clear_faults(user=Depends(require_admin)):
+    """
+    Delete all stored fault log entries.
+    """
+    if not is_ssd_available():
+        raise HTTPException(status_code=503, detail="SSD is unavailable.")
+
+    try:
+        return clear_faults_db(FAULTS_DB)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to clear faults DB: {exc}",
         ) from exc
 
 

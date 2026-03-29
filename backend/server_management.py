@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import sqlite3
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -233,6 +234,57 @@ def renew_vpn_certificate() -> Dict[str, Any]:
         message="VPN certificate renewal command completed.",
     )
 
+
+
+def clear_faults_db(faults_db_path: str | Path) -> Dict[str, Any]:
+    """
+    Delete all fault rows from the SQLite fault log database.
+    """
+    db_path = Path(faults_db_path)
+
+    if not db_path.exists() or not db_path.is_file():
+        return build_action_response(
+            action="clear-faults",
+            status="skipped",
+            message="Fault database is not available.",
+            deleted_rows=0,
+            fault_db=str(db_path),
+        )
+
+    con: Optional[sqlite3.Connection] = None
+
+    try:
+        con = sqlite3.connect(str(db_path))
+        cur = con.cursor()
+
+        # Count existing rows before deleting them.
+        cur.execute("SELECT COUNT(*) FROM faults")
+        row = cur.fetchone()
+        deleted_rows = int(row[0] or 0) if row else 0
+
+        # Remove every stored fault row.
+        cur.execute("DELETE FROM faults")
+
+        # Reset autoincrement so new rows start cleanly.
+        try:
+            cur.execute("DELETE FROM sqlite_sequence WHERE name = ?", ("faults",))
+        except sqlite3.Error:
+            pass
+
+        con.commit()
+
+        print(f"[server] Cleared faults DB: removed {deleted_rows} row(s) from {db_path}")
+
+        return build_action_response(
+            action="clear-faults",
+            status="completed",
+            message=f"Cleared {deleted_rows} fault log entr{'y' if deleted_rows == 1 else 'ies' }.",
+            deleted_rows=deleted_rows,
+            fault_db=str(db_path),
+        )
+    finally:
+        if con is not None:
+            con.close()
 
 def prune_sensor_data(older_than_days: int) -> Dict[str, Any]:
     """
