@@ -1402,6 +1402,107 @@ def get_accel_data(
         "points": pts,
     }
 
+# TESTCODE: debug the accel plot path without relying on service logs.
+@app.get("/api/accel/debug")
+def debug_accel_data(
+    node: int = Query(1, ge=1),
+    minutes: int = Query(5, ge=1, le=60),
+    user=Depends(get_current_user),
+):
+    if not is_ssd_available():
+        return {
+            "node": node,
+            "minutes": minutes,
+            "ssd_available": False,
+            "serial": None,
+            "window": None,
+            "files": [],
+            "sample_preview": [],
+            "kept_preview": [],
+            "matched_file_count": 0,
+            "decoded_sample_count": 0,
+            "kept_sample_count": 0,
+        }
+
+    serial = _get_plot_node_serial(node)
+    start_ts, end_ts, start_iso, end_iso = _plot_time_window(minutes)
+
+    files = find_sensor_files_for_serial(
+        serial=serial,
+        start_iso=start_iso,
+        end_exclusive_iso=end_iso,
+    )
+
+    sample_preview = []
+    kept_preview = []
+    decoded_sample_count = 0
+    kept_sample_count = 0
+    min_spacing = _min_spacing_seconds(minutes, 1200)
+    last_kept_ts = None
+
+    for sensor_file in files:
+        for rec in iter_decoded_records_for_export(str(sensor_file)):
+            accel_samples = rec.get("accel_samples")
+            if not accel_samples:
+                continue
+
+            for ts, x, y, z in accel_samples:
+                decoded_sample_count += 1
+
+                if len(sample_preview) < 20:
+                    sample_preview.append(
+                        {
+                            "file": str(sensor_file),
+                            "ts_epoch": ts,
+                            "ts_iso_utc": _iso_from_epoch_seconds(ts),
+                            "in_window": start_ts <= ts < end_ts,
+                            "x": x,
+                            "y": y,
+                            "z": z,
+                        }
+                    )
+
+                if ts < start_ts or ts >= end_ts:
+                    continue
+
+                if last_kept_ts is not None and (ts - last_kept_ts) < min_spacing:
+                    continue
+
+                kept_sample_count += 1
+
+                if len(kept_preview) < 20:
+                    kept_preview.append(
+                        {
+                            "file": str(sensor_file),
+                            "ts_epoch": ts,
+                            "ts_iso_utc": _iso_from_epoch_seconds(ts),
+                            "x": x,
+                            "y": y,
+                            "z": z,
+                        }
+                    )
+
+                last_kept_ts = ts
+
+    return {
+        "node": node,
+        "minutes": minutes,
+        "ssd_available": True,
+        "serial": serial,
+        "window": {
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "start_iso": start_iso,
+            "end_iso": end_iso,
+        },
+        "files": [str(path) for path in files],
+        "matched_file_count": len(files),
+        "decoded_sample_count": decoded_sample_count,
+        "kept_sample_count": kept_sample_count,
+        "sample_preview": sample_preview,
+        "kept_preview": kept_preview,
+    }
+
 
 @app.get("/api/inclinometer")
 def api_inclinometer(
