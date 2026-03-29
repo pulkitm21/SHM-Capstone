@@ -1547,7 +1547,7 @@ def _get_plot_node_serial(node_id: int) -> str:
 
 
 def _plot_time_window(minutes: int) -> tuple[float, float, str, str]:
-    end_dt = datetime.now(timezone.utc)
+    end_dt = datetime.now().astimezone()
     start_dt = end_dt - timedelta(minutes=minutes)
 
     return (
