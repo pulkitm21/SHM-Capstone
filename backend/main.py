@@ -1482,6 +1482,12 @@ def read_accel_points(node_id: int, minutes: int, limit: int = 1200):
         end_exclusive_iso=end_iso,
     )
 
+    # TESTCODE: print which serial and files the accel plot is using.
+    print("PLOT SERIAL:", serial)
+    print("PLOT FILES:", files)
+    print("PLOT WINDOW:", start_iso, "->", end_iso)
+    print("PLOT EPOCH WINDOW:", start_ts, "->", end_ts)
+
     points = deque(maxlen=limit)
     min_spacing = _min_spacing_seconds(minutes, limit)
     last_kept_ts = None
@@ -1493,6 +1499,9 @@ def read_accel_points(node_id: int, minutes: int, limit: int = 1200):
                 continue
 
             for ts, x, y, z in accel_samples:
+                # TESTCODE: print decoded accel timestamps before filtering.
+                print("ACCEL SAMPLE TS:", ts, "START:", start_ts, "END:", end_ts)
+
                 if ts < start_ts or ts >= end_ts:
                     continue
 
@@ -1507,6 +1516,10 @@ def read_accel_points(node_id: int, minutes: int, limit: int = 1200):
                         "z": _plot_float_or_none(z),
                     }
                 )
+
+                # TESTCODE: print samples that passed all accel plot filters.
+                print("ACCEL KEPT:", ts, x, y, z)
+
                 last_kept_ts = ts
 
     return list(points)
