@@ -82,6 +82,7 @@ type DecodeState = {
 
 type AccelSample = {
   ts: number;
+  tsUs: number;
   x: number | null;
   y: number | null;
   z: number | null;
@@ -89,6 +90,7 @@ type AccelSample = {
 
 type InclinSample = {
   ts: number;
+  tsUs: number;
   roll: number | null;
   pitch: number | null;
   yaw: number | null;
@@ -96,6 +98,7 @@ type InclinSample = {
 
 type TempSample = {
   ts: number;
+  tsUs: number;
   tempC: number | null;
 };
 
@@ -260,6 +263,10 @@ function formatTimestampSeconds(tsSeconds: number) {
   return tsSeconds.toFixed(6);
 }
 
+function formatTimestampIso(tsUs: number) {
+  return new Date(tsUs / 1000).toISOString();
+}
+
 function formatOptionalValue(value: number | null, decimals: number) {
   return value == null ? "" : value.toFixed(decimals);
 }
@@ -305,6 +312,7 @@ function decodeAccelAbsolute(reader: BinaryReader, state: DecodeState) {
 
     samples.push({
       ts: tsUs / TS_SCALE,
+      tsUs,
       x: values[0],
       y: values[1],
       z: values[2],
@@ -333,6 +341,7 @@ function decodeAccelDeltaV1(reader: BinaryReader, state: DecodeState) {
 
     samples.push({
       ts: tsUs / TS_SCALE,
+      tsUs,
       x: prevX / ACCEL_SCALE,
       y: prevY / ACCEL_SCALE,
       z: prevZ / ACCEL_SCALE,
@@ -377,6 +386,7 @@ function decodeAccelDelta(reader: BinaryReader, state: DecodeState, formatVersio
 
     samples.push({
       ts: state.accel.tsUs / TS_SCALE,
+      tsUs: state.accel.tsUs,
       x: values[0],
       y: values[1],
       z: values[2],
@@ -416,6 +426,7 @@ function decodeInclinAbsolute(reader: BinaryReader, state: DecodeState, formatVe
 
     samples.push({
       ts: tsUs / TS_SCALE,
+      tsUs,
       roll: values[0],
       pitch: values[1],
       yaw: values[2],
@@ -439,6 +450,7 @@ function decodeInclinDeltaV1(reader: BinaryReader, state: DecodeState): InclinSa
 
   return [{
     ts: tsUs / TS_SCALE,
+    tsUs,
     roll: prevRoll / INCLIN_SCALE,
     pitch: prevPitch / INCLIN_SCALE,
     yaw: prevYaw / INCLIN_SCALE,
@@ -479,6 +491,7 @@ function decodeInclinDelta(reader: BinaryReader, state: DecodeState, formatVersi
 
     samples.push({
       ts: state.inclin.tsUs / TS_SCALE,
+      tsUs: state.inclin.tsUs,
       roll: values[0],
       pitch: values[1],
       yaw: values[2],
@@ -497,6 +510,7 @@ function decodeTempAbsolute(reader: BinaryReader, state: DecodeState): TempSampl
   if (tempRaw === INT32_NAN_SENTINEL) {
     return {
       ts: tsUs / TS_SCALE,
+      tsUs,
       tempC: null,
     };
   }
@@ -504,6 +518,7 @@ function decodeTempAbsolute(reader: BinaryReader, state: DecodeState): TempSampl
   state.temp.valPrev = tempRaw;
   return {
     ts: tsUs / TS_SCALE,
+    tsUs,
     tempC: tempRaw / TEMP_SCALE,
   };
 }
@@ -515,6 +530,7 @@ function decodeTempDeltaV1(reader: BinaryReader, state: DecodeState): TempSample
 
   return {
     ts: tsUs / TS_SCALE,
+    tsUs,
     tempC: state.temp.valPrev / TEMP_SCALE,
   };
 }
@@ -532,6 +548,7 @@ function decodeTempDelta(reader: BinaryReader, state: DecodeState, formatVersion
   if (isNan) {
     return {
       ts: state.temp.tsUs / TS_SCALE,
+      tsUs: state.temp.tsUs,
       tempC: null,
     };
   }
@@ -542,6 +559,7 @@ function decodeTempDelta(reader: BinaryReader, state: DecodeState, formatVersion
 
   return {
     ts: state.temp.tsUs / TS_SCALE,
+    tsUs: state.temp.tsUs,
     tempC: state.temp.valPrev / TEMP_SCALE,
   };
 }
@@ -647,11 +665,12 @@ function collectSensorSamples(records: RecordEntry[]): SensorCollections {
 
 // Build accelerometer CSV output with blank cells for NaN values.
 function buildAccelCsv(samples: AccelSample[]) {
-  const lines = ["timestamp_s,x_g,y_g,z_g"];
+  const lines = ["timestamp_iso,timestamp_us,x_g,y_g,z_g"];
   for (const sample of samples) {
     lines.push(
       [
-        formatTimestampSeconds(sample.ts),
+        formatTimestampIso(sample.tsUs),
+        sample.tsUs.toString(),
         formatOptionalValue(sample.x, 4),
         formatOptionalValue(sample.y, 4),
         formatOptionalValue(sample.z, 4),
@@ -663,11 +682,12 @@ function buildAccelCsv(samples: AccelSample[]) {
 
 // Build inclinometer CSV output with blank cells for NaN values.
 function buildInclinCsv(samples: InclinSample[]) {
-  const lines = ["timestamp_s,roll_deg,pitch_deg,yaw_deg"];
+  const lines = ["timestamp_iso,timestamp_us,roll_deg,pitch_deg,yaw_deg"];
   for (const sample of samples) {
     lines.push(
       [
-        formatTimestampSeconds(sample.ts),
+        formatTimestampIso(sample.tsUs),
+        sample.tsUs.toString(),
         formatOptionalValue(sample.roll, 4),
         formatOptionalValue(sample.pitch, 4),
         formatOptionalValue(sample.yaw, 4),
@@ -679,9 +699,9 @@ function buildInclinCsv(samples: InclinSample[]) {
 
 // Build temperature CSV output with blank cells for NaN values.
 function buildTempCsv(samples: TempSample[]) {
-  const lines = ["timestamp_s,temp_c"];
+  const lines = ["timestamp_iso,timestamp_us,temp_c"];
   for (const sample of samples) {
-    lines.push([formatTimestampSeconds(sample.ts), formatOptionalValue(sample.tempC, 2)].join(","));
+    lines.push([formatTimestampIso(sample.tsUs), sample.tsUs.toString(), formatOptionalValue(sample.tempC, 2)].join(","));
   }
   return `${lines.join("\n")}\n`;
 }
