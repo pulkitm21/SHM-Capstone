@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import useAuth from "../../Auth/useAuth";
 import {
+  clearFaults,
   getHealth,
   getServerNetwork,
   getServerStatus,
@@ -282,6 +283,23 @@ export default function ServerManagementPage() {
       "prune-data",
       "Delete old data",
       () => pruneStoredData({ older_than_days: retentionDays }),
+      undefined
+    );
+  }
+
+  // Delete every row from the fault log database.
+  async function handleClearFaults() {
+    if (!isAdmin) return;
+
+    const confirmed = window.confirm(
+      "Clear all fault log entries from the database? This action cannot be undone."
+    );
+    if (!confirmed) return;
+
+    await runServerAction(
+      "clear-faults",
+      "Clear faults",
+      () => clearFaults(),
       undefined
     );
   }
@@ -649,6 +667,27 @@ export default function ServerManagementPage() {
                   {runningAction === "prune-data"
                     ? "Deleting..."
                     : "Delete Old Data"}
+                </button>
+              </div>
+            </div>
+
+            <div className="server-maintenance-panel">
+              <h3 className="server-panel-title">Clear Faults</h3>
+              <p className="server-panel-text">
+                Delete every fault log entry from the faults database.
+              </p>
+
+              <div className="server-button-row">
+                <button
+                  type="button"
+                  className="server-action-btn server-action-btn-danger"
+                  onClick={() => void handleClearFaults()}
+                  disabled={!isAdmin || runningAction === "clear-faults"}
+                  title={!isAdmin ? "Admin only" : "Clear Faults"}
+                >
+                  {runningAction === "clear-faults"
+                    ? "Clearing..."
+                    : "Clear Faults"}
                 </button>
               </div>
             </div>
