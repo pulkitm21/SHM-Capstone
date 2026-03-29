@@ -3,7 +3,7 @@ import "./SensorConfig.css";
 
 export type AccelerometerOdrIndex = 0 | 1 | 2;
 export type AccelerometerRange = 1 | 2 | 3;
-export type ControlCommand = "start" | "stop";
+export type ControlCommand = "start" | "stop" | "reset";
 export type NodeState = "unknown" | "idle" | "configured" | "recording" | "reconfig" | "error";
 
 export type SensorConfig = {
@@ -20,7 +20,6 @@ export type SensorConfig = {
   applied_hpf_corner: number | null;
 
   current_state: NodeState;
-
 
   // These are kept optional for compatibility with any cached/settings payloads,
   // but the UI no longer depends on them.
@@ -77,7 +76,7 @@ function withDefaults(cfg?: Partial<SensorConfig> | null): SensorConfig {
     applied_hpf_corner: cfg?.applied_hpf_corner ?? DEFAULT_CONFIG.applied_hpf_corner,
     current_state: cfg?.current_state ?? DEFAULT_CONFIG.current_state,
 
-    //compatibility defaults only.
+    // compatibility defaults only.
     pending_seq: cfg?.pending_seq ?? DEFAULT_CONFIG.pending_seq,
     applied_seq: cfg?.applied_seq ?? DEFAULT_CONFIG.applied_seq,
     last_ack_at: cfg?.last_ack_at ?? DEFAULT_CONFIG.last_ack_at,
@@ -148,6 +147,7 @@ export default function SensorConfigCard({
   onApply,
   onStart,
   onStop,
+  onReset,
   disabled = false,
 }: {
   title?: string;
@@ -159,6 +159,7 @@ export default function SensorConfigCard({
   }) => void;
   onStart: () => void;
   onStop: () => void;
+  onReset: () => void;
   disabled?: boolean;
 }) {
   const safeConfig = useMemo(() => withDefaults(config), [config]);
@@ -187,7 +188,6 @@ export default function SensorConfigCard({
     draftRange !== safeConfig.desired_range ||
     draftHpf !== safeConfig.desired_hpf_corner;
 
-  
   // Always show desired/local config. We are not switching display state based on ACK.
   const displayConfig = {
     odr: safeConfig.desired_odr_index,
@@ -200,6 +200,8 @@ export default function SensorConfigCard({
 
   const stopDisabled =
     disabled || isEditing || safeConfig.current_state !== "recording";
+
+  const resetDisabled = disabled || isEditing;
 
   const applyDisabled = disabled || !isDirty;
 
@@ -345,6 +347,14 @@ export default function SensorConfigCard({
                 disabled={stopDisabled}
               >
                 Stop
+              </button>
+              <button
+                type="button"
+                className="sc-btn sc-btn-warning"
+                onClick={onReset}
+                disabled={resetDisabled}
+              >
+                Reset
               </button>
             </>
           )}

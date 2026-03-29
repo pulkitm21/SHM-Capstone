@@ -493,7 +493,7 @@ export type NodeState =
   | "reconfig"
   | "error";
 
-export type ControlCommand = "start" | "stop";
+export type ControlCommand = "start" | "stop" | "reset";
 
 export type ApplyAccelerometerConfigBody = {
   odr_index: AccelerometerOdrIndex;
@@ -802,6 +802,13 @@ export function pruneStoredData(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal,
+  });
+}
+
+export function clearFaults(signal?: AbortSignal) {
+  return request<ServerActionResponse>("/api/faults/clear", {
+    method: "DELETE",
     signal,
   });
 }

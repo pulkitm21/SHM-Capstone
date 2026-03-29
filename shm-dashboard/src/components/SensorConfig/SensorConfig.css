@@ -227,3 +227,14 @@
     justify-content: flex-start;
   }
 }
+
+/* warning action for reset button */
+.sc-btn-warning {
+  background: #fff4e5;
+  border-color: #ffd59e;
+  color: #a35c00;
+}
+
+.sc-btn-warning:hover:not(:disabled) {
+  background: #ffe8cc;
+}

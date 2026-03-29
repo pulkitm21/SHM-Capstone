@@ -573,8 +573,8 @@ export default function SensorManagement() {
     }
   }
 
-  // Send node start/stop control and update UI state optimistically.
-  async function handleNodeControl(cmd: "start" | "stop") {
+  // Handle node runtime control commands (start/stop/reset)
+  async function handleNodeControl(cmd: "start" | "stop" | "reset") {
     if (!nodeId || !selectedNode || !isAdmin) return;
 
     if (UI_PREVIEW_MODE) {
@@ -594,7 +594,13 @@ export default function SensorManagement() {
     }
 
     try {
-      setSettingsStatus(`${cmd === "start" ? "Starting" : "Stopping"} node…`);
+      setSettingsStatus(
+  cmd === "start"
+    ? "Starting node…"
+    : cmd === "stop"
+    ? "Stopping node…"
+    : "Resetting node…"
+);
       await sendNodeControl(nodeId, { cmd });
 
       setConfigByNode((prev) => ({
@@ -603,7 +609,12 @@ export default function SensorManagement() {
           ...(prev[nodeId] ?? FALLBACK_CONFIG),
           accelerometer: {
             ...(prev[nodeId]?.accelerometer ?? EMPTY_SENSOR_CONFIG),
-            current_state: cmd === "start" ? "recording" : "configured",
+            current_state:
+  cmd === "start"
+    ? "recording"
+    : cmd === "stop"
+    ? "configured"
+    : "unknown", // reset → unknown state until node reports back
           },
         },
       }));
@@ -921,17 +932,18 @@ export default function SensorManagement() {
             />
 
             <SensorConfigCard
-              title={`${selectedSensorDef.label} Configuration`}
-              config={config}
-              onApply={handleApplyAccelerometerConfig}
-              onStart={() => handleNodeControl("start")}
-              onStop={() => handleNodeControl("stop")}
-              disabled={
-                !selectedNode ||
-                sensor !== "accelerometer" ||
-                !isAdmin
-              }
-            />
+  title={`${selectedSensorDef.label} Configuration`}
+  config={config}
+  onApply={handleApplyAccelerometerConfig}
+  onStart={() => handleNodeControl("start")}
+  onStop={() => handleNodeControl("stop")}
+  onReset={() => handleNodeControl("reset")} // NEW
+  disabled={
+    !selectedNode ||
+    sensor !== "accelerometer" ||
+    !isAdmin
+  }
+/>
 
             <div className="sm-panel sm-full-width-panel">
               <div className="sm-plot-toolbar">
