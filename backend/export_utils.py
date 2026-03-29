@@ -358,8 +358,13 @@ def find_sensor_files_for_serial(
     """
     matched: list[Path] = []
 
-    for hour_dt in iter_hour_starts(start_iso, end_exclusive_iso):
-        hour_str = hour_dt.strftime("%Y%m%d_%H")
+    # Plot file lookup should follow the Pi's local time so it matches filename
+    start_dt = datetime.fromisoformat(start_iso).astimezone()
+    end_dt = datetime.fromisoformat(end_exclusive_iso).astimezone()
+    current = start_dt.replace(minute=0, second=0, microsecond=0)
+
+    while current < end_dt:
+        hour_str = current.strftime("%Y%m%d_%H")
         base = f"data_{serial}_{hour_str}"
         bin_path = SENSOR_DATA_DIR / f"{base}.bin"
         gz_path = SENSOR_DATA_DIR / f"{base}.bin.gz"
@@ -369,6 +374,7 @@ def find_sensor_files_for_serial(
         elif gz_path.exists():
             matched.append(gz_path)
 
+        current += timedelta(hours=1)
     return matched
 
 
