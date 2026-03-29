@@ -249,3 +249,27 @@
     grid-template-columns: 1fr;
   }
 }
+.sm-refresh-button {
+  padding: 6px 12px;
+  font-size: 13px;
+  font-weight: 500;
+  border-radius: 6px;
+  border: 1px solid #d1d5db;
+  background-color: #ffffff;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.sm-refresh-button:hover {
+  background-color: #f3f4f6;
+  border-color: #9ca3af;
+}
+
+.sm-refresh-button:active {
+  background-color: #e5e7eb;
+}
+
+.sm-refresh-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}

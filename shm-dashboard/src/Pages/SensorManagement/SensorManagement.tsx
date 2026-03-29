@@ -73,20 +73,19 @@ const TIMEFRAME_OPTIONS_BY_SENSOR: Record<
   ReadonlyArray<{ label: string; minutes: number }>
 > = {
   accelerometer: [
-    { label: "1 min", minutes: 1 },
-    { label: "2 min", minutes: 2 },
-    { label: "5 min", minutes: 5 },
+    { label: "Current hour", minutes: 60 },
+    { label: "Last 5 min", minutes: 5 },
+    { label: "Last 1 min", minutes: 1 },
   ],
   inclinometer: [
-    { label: "10 min", minutes: 10 },
-    { label: "30 min", minutes: 30 },
-    { label: "1 hour", minutes: 60 },
+    { label: "Current hour", minutes: 60 },
+    { label: "Last 5 min", minutes: 5 },
+    { label: "Last 1 min", minutes: 1 },
   ],
   temperature: [
-    { label: "1 hour", minutes: 60 },
-    { label: "6 hours", minutes: 360 },
-    { label: "12 hours", minutes: 720 },
-    { label: "1 day", minutes: 1440 },
+    { label: "Current hour", minutes: 60 },
+    { label: "Last 5 min", minutes: 5 },
+    { label: "Last 1 min", minutes: 1 },
   ],
 };
 
@@ -317,7 +316,7 @@ export default function SensorManagement() {
   const requestedSerial = searchParams.get("serial");
 
   const [sensor, setSensor] = useState<SensorValue>("accelerometer");
-  const [timeframeMin, setTimeframeMin] = useState<number>(60);
+  const [timeframeMin, setTimeframeMin] = useState<number>(1);
 
   const [nodes, setNodes] = useState<NodeRecord[]>([]);
   const [nodesStatus, setNodesStatus] = useState<string>("");
@@ -367,6 +366,7 @@ export default function SensorManagement() {
 
   const [apiData, setApiData] = useState<ApiResponse | null>(null);
   const [plotStatus, setPlotStatus] = useState("Loading…");
+  const [plotRefreshKey, setPlotRefreshKey] = useState(0);
 
   // Refresh settings from backend and merge them with fallback defaults.
   const refreshSettingsFromBackend = useCallback(async () => {
@@ -787,6 +787,11 @@ export default function SensorManagement() {
     return () => controller.abort();
   }, [selectedNode, nodeFaults]);
 
+  // Manually refresh the currently selected plot from the backend.
+  function handleRefreshPlot() {
+    setPlotRefreshKey((prev) => prev + 1);
+  }
+
   // Load plot data for the currently selected sensor and time window.
   useEffect(() => {
     if (UI_PREVIEW_MODE) {
@@ -818,8 +823,9 @@ export default function SensorManagement() {
 
       const cache = loadPlotCache();
       const cachedEntry = cache[cacheKey];
+      const isManualRefresh = plotRefreshKey > 0;
 
-      if (hasPlotPoints(cachedEntry?.data ?? null)) {
+      if (!isManualRefresh && hasPlotPoints(cachedEntry?.data ?? null)) {
         setApiData(cachedEntry!.data);
         setPlotStatus(
           `Using cached plot (last synced: ${new Date(
@@ -827,8 +833,10 @@ export default function SensorManagement() {
           ).toLocaleString()})`
         );
       } else {
-        setPlotStatus("Loading…");
-        setApiData(null);
+        setPlotStatus(isManualRefresh ? "Refreshing…" : "Loading…");
+        if (!hasPlotPoints(cachedEntry?.data ?? null)) {
+          setApiData(null);
+        }
       }
 
       try {
@@ -857,7 +865,7 @@ export default function SensorManagement() {
     }
 
     void loadPlot();
-  }, [nodeId, nodeKey, sensor, timeframeMin]);
+  }, [nodeId, nodeKey, sensor, timeframeMin, plotRefreshKey]);
 
   const metaForNode = nodeId
     ? metaByNode[nodeId] ?? FALLBACK_META
@@ -971,6 +979,14 @@ export default function SensorManagement() {
                       ))}
                     </select>
                   </div>
+
+                  <button
+                    type="button"
+                    className="sm-refresh-button"
+                    onClick={handleRefreshPlot}
+                  >
+                    Refresh
+                  </button>
                 </div>
               </div>
 

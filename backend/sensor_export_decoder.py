@@ -20,6 +20,8 @@ FORMAT_V1 = 1
 FORMAT_V2 = 2
 FORMAT_V3 = 3
 
+INT32_NAN_SENTINEL = -2147483648
+
 
 def read_bytes(f, n, label=""):
     d = f.read(n)
@@ -56,6 +58,12 @@ def _reconstruct_abs_ts(f, ss: dict) -> int:
     return ts_us
 
 
+def _decode_abs_value(raw: int, scale: int):
+    if raw == INT32_NAN_SENTINEL:
+        return None
+    return raw / scale
+
+
 def _v1_reconstruct_ts(f, ss: dict) -> int:
     (dod,) = read_fmt(f, "<i", "v1 dod_ts")
     delta_us = ss.get("ts_delta_prev", 0) + dod
@@ -68,21 +76,33 @@ def _v1_reconstruct_ts(f, ss: dict) -> int:
 def _decode_accel_abs(f, state):
     (n,) = read_fmt(f, "<B", "accel n")
     out = []
+    prev = list(state["accel"]["xyz_prev"])
 
     for _ in range(n):
         ts_us = _reconstruct_abs_ts(f, state["accel"])
         x, y, z = read_fmt(f, "<iii", "accel abs xyz")
-        state["accel"]["xyz_prev"] = [x, y, z]
+
+        x_value = _decode_abs_value(x, ACCEL_SCALE)
+        y_value = _decode_abs_value(y, ACCEL_SCALE)
+        z_value = _decode_abs_value(z, ACCEL_SCALE)
+
+        if x_value is not None:
+            prev[0] = x
+        if y_value is not None:
+            prev[1] = y
+        if z_value is not None:
+            prev[2] = z
 
         out.append(
             (
                 ts_us / TS_SCALE,
-                x / ACCEL_SCALE,
-                y / ACCEL_SCALE,
-                z / ACCEL_SCALE,
+                x_value,
+                y_value,
+                z_value,
             )
         )
 
+    state["accel"]["xyz_prev"] = prev
     return out or None
 
 
@@ -216,6 +236,39 @@ def _decode_inclin_abs(f, state):
     )
 
 
+def _decode_inclin_abs_v3(f, state):
+    (n,) = read_fmt(f, "<B", "inclin n")
+    out = []
+    prev = list(state["inclin"]["xyz_prev"])
+
+    for _ in range(n):
+        ts_us = _reconstruct_abs_ts(f, state["inclin"])
+        roll, pitch, yaw = read_fmt(f, "<iii", "inclin abs")
+
+        roll_value = _decode_abs_value(roll, INCLIN_SCALE)
+        pitch_value = _decode_abs_value(pitch, INCLIN_SCALE)
+        yaw_value = _decode_abs_value(yaw, INCLIN_SCALE)
+
+        if roll_value is not None:
+            prev[0] = roll
+        if pitch_value is not None:
+            prev[1] = pitch
+        if yaw_value is not None:
+            prev[2] = yaw
+
+        out.append(
+            (
+                ts_us / TS_SCALE,
+                roll_value,
+                pitch_value,
+                yaw_value,
+            )
+        )
+
+    state["inclin"]["xyz_prev"] = prev
+    return out or None
+
+
 def _decode_inclin_delta_v1(f, state):
     ss = state["inclin"]
     ts_us = _v1_reconstruct_ts(f, ss)
@@ -316,11 +369,14 @@ def _decode_inclin_delta_v3(f, state):
 def _decode_temp_abs(f, state):
     ts_us = _reconstruct_abs_ts(f, state["temp"])
     (val,) = read_fmt(f, "<i", "temp abs")
-    state["temp"]["val_prev"] = val
+
+    value = _decode_abs_value(val, TEMP_SCALE)
+    if value is not None:
+        state["temp"]["val_prev"] = val
 
     return (
         ts_us / TS_SCALE,
-        val / TEMP_SCALE,
+        value,
     )
 
 
@@ -459,7 +515,10 @@ def iter_decoded_records_for_export(
                     if header & FLAG_ACCEL:
                         rec["accel_samples"] = _decode_accel_abs(f, state)
                     if header & FLAG_INCLIN:
-                        rec["inclin"] = _decode_inclin_abs(f, state)
+                        if fv == FORMAT_V3:
+                            rec["inclin"] = _decode_inclin_abs_v3(f, state)
+                        else:
+                            rec["inclin"] = _decode_inclin_abs(f, state)
                     if header & FLAG_TEMP:
                         rec["temp"] = _decode_temp_abs(f, state)
                 else:

@@ -37,7 +37,6 @@ from node_registry import list_nodes, get_node_by_id, update_node_position
 from mqtt_commands import publish_accelerometer_config, publish_node_control
 
 from export_routes import router as export_router
-from export_utils import find_sensor_files_for_serial
 from sensor_export_decoder import iter_decoded_records_for_export
 
 from server_management import (
@@ -1391,7 +1390,7 @@ async def fault_events(
 @app.get("/api/accel")
 def get_accel_data(
     node: int = Query(1, ge=1),
-    minutes: int = Query(1, ge=1, le=5),
+    minutes: int = Query(1, ge=1, le=60),
     user=Depends(get_current_user),
 ):
     pts = read_accel_points(node_id=node, minutes=minutes)
@@ -1400,107 +1399,6 @@ def get_accel_data(
         "unit": "g",
         "node": node,
         "points": pts,
-    }
-
-# TESTCODE: debug the accel plot path without relying on service logs.
-@app.get("/api/accel/debug")
-def debug_accel_data(
-    node: int = Query(1, ge=1),
-    minutes: int = Query(5, ge=1, le=60),
-    user=Depends(get_current_user),
-):
-    if not is_ssd_available():
-        return {
-            "node": node,
-            "minutes": minutes,
-            "ssd_available": False,
-            "serial": None,
-            "window": None,
-            "files": [],
-            "sample_preview": [],
-            "kept_preview": [],
-            "matched_file_count": 0,
-            "decoded_sample_count": 0,
-            "kept_sample_count": 0,
-        }
-
-    serial = _get_plot_node_serial(node)
-    start_ts, end_ts, start_iso, end_iso = _plot_time_window(minutes)
-
-    files = find_sensor_files_for_serial(
-        serial=serial,
-        start_iso=start_iso,
-        end_exclusive_iso=end_iso,
-    )
-
-    sample_preview = []
-    kept_preview = []
-    decoded_sample_count = 0
-    kept_sample_count = 0
-    min_spacing = _min_spacing_seconds(minutes, 1200)
-    last_kept_ts = None
-
-    for sensor_file in files:
-        for rec in iter_decoded_records_for_export(str(sensor_file)):
-            accel_samples = rec.get("accel_samples")
-            if not accel_samples:
-                continue
-
-            for ts, x, y, z in accel_samples:
-                decoded_sample_count += 1
-
-                if len(sample_preview) < 20:
-                    sample_preview.append(
-                        {
-                            "file": str(sensor_file),
-                            "ts_epoch": ts,
-                            "ts_iso_utc": _iso_from_epoch_seconds(ts),
-                            "in_window": start_ts <= ts < end_ts,
-                            "x": x,
-                            "y": y,
-                            "z": z,
-                        }
-                    )
-
-                if ts < start_ts or ts >= end_ts:
-                    continue
-
-                if last_kept_ts is not None and (ts - last_kept_ts) < min_spacing:
-                    continue
-
-                kept_sample_count += 1
-
-                if len(kept_preview) < 20:
-                    kept_preview.append(
-                        {
-                            "file": str(sensor_file),
-                            "ts_epoch": ts,
-                            "ts_iso_utc": _iso_from_epoch_seconds(ts),
-                            "x": x,
-                            "y": y,
-                            "z": z,
-                        }
-                    )
-
-                last_kept_ts = ts
-
-    return {
-        "node": node,
-        "minutes": minutes,
-        "ssd_available": True,
-        "serial": serial,
-        "window": {
-            "start_ts": start_ts,
-            "end_ts": end_ts,
-            "start_iso": start_iso,
-            "end_iso": end_iso,
-        },
-        "files": [str(path) for path in files],
-        "matched_file_count": len(files),
-        "decoded_sample_count": decoded_sample_count,
-        "kept_sample_count": kept_sample_count,
-        "sample_preview": sample_preview,
-        "kept_preview": kept_preview,
     }
 
 
@@ -1575,53 +1473,40 @@ def read_accel_points(node_id: int, minutes: int, limit: int = 1200):
         return []
 
     serial = _get_plot_node_serial(node_id)
-    start_ts, end_ts, start_iso, end_iso = _plot_time_window(minutes)
+    start_ts, end_ts, _, _ = _plot_time_window(minutes)
 
-    files = find_sensor_files_for_serial(
-        serial=serial,
-        start_iso=start_iso,
-        end_exclusive_iso=end_iso,
-    )
+    hour_str = datetime.now().strftime("%Y%m%d_%H")
+    file_path = DATA_DIR / "data" / f"data_{serial}_{hour_str}.bin"
 
-    # TESTCODE: print which serial and files the accel plot is using.
-    print("PLOT SERIAL:", serial)
-    print("PLOT FILES:", files)
-    print("PLOT WINDOW:", start_iso, "->", end_iso)
-    print("PLOT EPOCH WINDOW:", start_ts, "->", end_ts)
+    if not file_path.exists():
+        return []
 
     points = deque(maxlen=limit)
     min_spacing = _min_spacing_seconds(minutes, limit)
     last_kept_ts = None
 
-    for sensor_file in files:
-        for rec in iter_decoded_records_for_export(str(sensor_file)):
-            accel_samples = rec.get("accel_samples")
-            if not accel_samples:
+    for rec in iter_decoded_records_for_export(str(file_path)):
+        accel_samples = rec.get("accel_samples")
+        if not accel_samples:
+            continue
+
+        for ts, x, y, z in accel_samples:
+            if ts < start_ts or ts >= end_ts:
                 continue
 
-            for ts, x, y, z in accel_samples:
-                # TESTCODE: print decoded accel timestamps before filtering.
-                print("ACCEL SAMPLE TS:", ts, "START:", start_ts, "END:", end_ts)
+            if last_kept_ts is not None and (ts - last_kept_ts) < min_spacing:
+                continue
 
-                if ts < start_ts or ts >= end_ts:
-                    continue
+            points.append(
+                {
+                    "ts": _iso_from_epoch_seconds(ts),
+                    "x": _plot_float_or_none(x),
+                    "y": _plot_float_or_none(y),
+                    "z": _plot_float_or_none(z),
+                }
+            )
 
-                if last_kept_ts is not None and (ts - last_kept_ts) < min_spacing:
-                    continue
-
-                points.append(
-                    {
-                        "ts": _iso_from_epoch_seconds(ts),
-                        "x": _plot_float_or_none(x),
-                        "y": _plot_float_or_none(y),
-                        "z": _plot_float_or_none(z),
-                    }
-                )
-
-                # TESTCODE: print samples that passed all accel plot filters.
-                print("ACCEL KEPT:", ts, x, y, z)
-
-                last_kept_ts = ts
+            last_kept_ts = ts
 
     return list(points)
 
@@ -1631,42 +1516,41 @@ def read_inclinometer_points(node_id: int, minutes: int, limit: int = 1200):
         return []
 
     serial = _get_plot_node_serial(node_id)
-    start_ts, end_ts, start_iso, end_iso = _plot_time_window(minutes)
+    start_ts, end_ts, _, _ = _plot_time_window(minutes)
 
-    files = find_sensor_files_for_serial(
-        serial=serial,
-        start_iso=start_iso,
-        end_exclusive_iso=end_iso,
-    )
+    hour_str = datetime.now().strftime("%Y%m%d_%H")
+    file_path = DATA_DIR / "data" / f"data_{serial}_{hour_str}.bin"
+
+    if not file_path.exists():
+        return []
 
     points = deque(maxlen=limit)
     min_spacing = _min_spacing_seconds(minutes, limit)
     last_kept_ts = None
 
-    for sensor_file in files:
-        for rec in iter_decoded_records_for_export(str(sensor_file)):
-            inclin = rec.get("inclin")
-            if not inclin:
+    for rec in iter_decoded_records_for_export(str(file_path)):
+        inclin = rec.get("inclin")
+        if not inclin:
+            continue
+
+        inclin_samples = inclin if isinstance(inclin, list) else [inclin]
+
+        for ts, roll, pitch, yaw in inclin_samples:
+            if ts < start_ts or ts >= end_ts:
                 continue
 
-            inclin_samples = inclin if isinstance(inclin, list) else [inclin]
+            if last_kept_ts is not None and (ts - last_kept_ts) < min_spacing:
+                continue
 
-            for ts, roll, pitch, yaw in inclin_samples:
-                if ts < start_ts or ts >= end_ts:
-                    continue
-
-                if last_kept_ts is not None and (ts - last_kept_ts) < min_spacing:
-                    continue
-
-                points.append(
-                    {
-                        "ts": _iso_from_epoch_seconds(ts),
-                        "roll": _plot_float_or_none(roll),
-                        "pitch": _plot_float_or_none(pitch),
-                        "yaw": _plot_float_or_none(yaw),
-                    }
-                )
-                last_kept_ts = ts
+            points.append(
+                {
+                    "ts": _iso_from_epoch_seconds(ts),
+                    "roll": _plot_float_or_none(roll),
+                    "pitch": _plot_float_or_none(pitch),
+                    "yaw": _plot_float_or_none(yaw),
+                }
+            )
+            last_kept_ts = ts
 
     return list(points)
 
@@ -1676,31 +1560,30 @@ def read_temperature_points(node_id: int, minutes: int, limit: int = 2000):
         return []
 
     serial = _get_plot_node_serial(node_id)
-    start_ts, end_ts, start_iso, end_iso = _plot_time_window(minutes)
+    start_ts, end_ts, _, _ = _plot_time_window(minutes)
 
-    files = find_sensor_files_for_serial(
-        serial=serial,
-        start_iso=start_iso,
-        end_exclusive_iso=end_iso,
-    )
+    hour_str = datetime.now().strftime("%Y%m%d_%H")
+    file_path = DATA_DIR / "data" / f"data_{serial}_{hour_str}.bin"
+
+    if not file_path.exists():
+        return []
 
     points = deque(maxlen=limit)
 
-    for sensor_file in files:
-        for rec in iter_decoded_records_for_export(str(sensor_file)):
-            temp = rec.get("temp")
-            if not temp:
-                continue
+    for rec in iter_decoded_records_for_export(str(file_path)):
+        temp = rec.get("temp")
+        if not temp:
+            continue
 
-            ts, value = temp
-            if ts < start_ts or ts >= end_ts:
-                continue
+        ts, value = temp
+        if ts < start_ts or ts >= end_ts:
+            continue
 
-            points.append(
-                {
-                    "ts": _iso_from_epoch_seconds(ts),
-                    "value": _plot_float_or_none(value),
-                }
-            )
+        points.append(
+            {
+                "ts": _iso_from_epoch_seconds(ts),
+                "value": _plot_float_or_none(value),
+            }
+        )
 
     return list(points)
