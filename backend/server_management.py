@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-import backend.mqtt_listener_control as mqtt_listener_control
+import mqtt_listener_control as mqtt_listener_control
 from export_utils import SENSOR_DATA_DIR
 
 
