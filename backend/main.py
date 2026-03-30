@@ -17,7 +17,7 @@ import math
 import mqtt_listener_control as mqtt_listener_control
 from mqtt_listener_control import start_listener
 
-from sensor_health_cache import get_sensor_health_snapshot
+from node_registry import get_sensor_runtime
 
 from settings_schema import SettingsModel, to_dict, copy_deep
 
@@ -324,8 +324,8 @@ def _recent_sensor_data_presence(
             "last_ts": None,
         },
     }
-
-    live_health = get_sensor_health_snapshot(serial)
+    
+    runtime = get_sensor_runtime(serial)  
 
     def _parse_iso(ts: Any) -> Optional[datetime]:
         if not ts:
@@ -342,7 +342,7 @@ def _recent_sensor_data_presence(
         return (now_dt - dt).total_seconds() <= window_seconds
 
     for sensor_name in SENSOR_KEYS:
-        sensor_health = live_health.get(sensor_name, {})
+        sensor_health = runtime.get(sensor_name, {})
         last_packet_ts = sensor_health.get("last_packet_ts")
         last_valid_ts = sensor_health.get("last_valid_data_ts")
         last_nan_ts = sensor_health.get("last_nan_ts")

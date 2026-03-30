@@ -1,11 +1,10 @@
 import json
 
 import paho.mqtt.client as mqtt
-
+from node_registry import update_sensor_runtime
 from fault_logger import log_fault_events
 from node_registry import register_serial, serial_from_topic, get_node_by_serial
 from raw_backup import write_raw, close_all as raw_backup_close_all
-from sensor_health_cache import update_sensor_health_from_packet
 from settings_store import (
     apply_accelerometer_config_ack,
     update_accelerometer_runtime_state,
@@ -137,10 +136,11 @@ def on_message(client, userdata, msg):
         write_raw(node_id, msg.payload)
 
         data = json.loads(msg.payload.decode())
-        update_sensor_health_from_packet(node_id, data)
 
         if not normalise_sensor_timestamps(data, node_id):
             return
+        
+        update_sensor_runtime(node_id, data)
 
         enqueue_packet(node_id, data)
     except Exception as e:
@@ -165,6 +165,7 @@ def main():
     finally:
         raw_backup_close_all()
 
-
 if __name__ == "__main__":
     main()
+
+

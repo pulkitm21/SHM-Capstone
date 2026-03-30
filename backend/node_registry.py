@@ -1,6 +1,8 @@
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Optional
 
 from settings_store import ensure_node_defaults
@@ -23,10 +25,32 @@ MAX_Y = 0.94
 TOP_SECTION_MAX_Y = 0.33
 MIDDLE_SECTION_MAX_Y = 0.66
 
+_SENSOR_RUNTIME_CACHE = {}
+_SENSOR_RUNTIME_LOCK = Lock()
+_LAST_FLUSH_TIME = 0.0
+_FLUSH_INTERVAL = 5.0  # seconds
+
 
 # Return the current UTC time in ISO format.
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _fresh_sensor_runtime():
+    return {
+        "last_packet_ts": None,
+        "last_valid_data_ts": None,
+        "last_nan_ts": None,
+        "updated_at": None,
+    }
+
+
+def _fresh_node_sensor_runtime():
+    return {
+        "accelerometer": _fresh_sensor_runtime(),
+        "inclinometer": _fresh_sensor_runtime(),
+        "temperature": _fresh_sensor_runtime(),
+    }
 
 
 # Clamp the normalized X position to the valid node map range.
@@ -108,6 +132,10 @@ def _load_registry_raw() -> dict:
                     x = _clamp_x(x)
                     y = _clamp_y(y)
 
+                sensor_runtime = item.get("sensor_runtime")
+                if not isinstance(sensor_runtime, dict):
+                    sensor_runtime = _fresh_node_sensor_runtime()
+
                 cleaned.append(
                     {
                         "node_id": node_id,
@@ -116,6 +144,7 @@ def _load_registry_raw() -> dict:
                         "last_seen": last_seen,
                         "x": x,
                         "y": y,
+                        "sensor_runtime": sensor_runtime,
                     }
                 )
             except Exception:
@@ -228,6 +257,7 @@ def register_serial(serial: str, seen_at: Optional[str] = None):
         "last_seen": now_iso,
         "x": default_x,
         "y": default_y,
+        "sensor_runtime": _fresh_node_sensor_runtime(),
     }
 
     nodes.append(new_item)
@@ -250,6 +280,67 @@ def update_node_position(node_id: int, x: float, y: float):
             return _build_node_response(item, 60)
 
     return None
+
+
+def update_sensor_runtime(serial: str, packet: dict):
+    now_iso = _now_iso()
+
+    with _SENSOR_RUNTIME_LOCK:
+        if serial not in _SENSOR_RUNTIME_CACHE:
+            _SENSOR_RUNTIME_CACHE[serial] = _fresh_node_sensor_runtime()
+
+        runtime = _SENSOR_RUNTIME_CACHE[serial]
+
+        accel = packet.get("a")
+        if accel:
+            runtime["accelerometer"]["last_packet_ts"] = now_iso
+            runtime["accelerometer"]["last_valid_data_ts"] = now_iso
+
+        inclin = packet.get("i")
+        if inclin:
+            runtime["inclinometer"]["last_packet_ts"] = now_iso
+            runtime["inclinometer"]["last_valid_data_ts"] = now_iso
+
+        temp = packet.get("T")
+        if temp is not None:
+            runtime["temperature"]["last_packet_ts"] = now_iso
+            runtime["temperature"]["last_valid_data_ts"] = now_iso
+
+        for sensor in runtime.values():
+            sensor["updated_at"] = now_iso
+
+    _flush_runtime_to_disk()
+
+
+def _flush_runtime_to_disk():
+    global _LAST_FLUSH_TIME
+
+    now = time.time()
+    if now - _LAST_FLUSH_TIME < _FLUSH_INTERVAL:
+        return
+
+    raw = _load_registry_raw()
+
+    for node in raw["nodes"]:
+        serial = node["serial"]
+        if serial in _SENSOR_RUNTIME_CACHE:
+            node["sensor_runtime"] = _SENSOR_RUNTIME_CACHE[serial]
+
+    _save_registry_raw(raw)
+    _LAST_FLUSH_TIME = now
+
+
+def get_sensor_runtime(serial: str):
+    raw = _load_registry_raw()
+
+    for node in raw["nodes"]:
+        if node["serial"] == serial:
+            runtime = node.get("sensor_runtime", {})
+            if isinstance(runtime, dict):
+                return runtime
+            return {}
+
+    return {}
 
 
 # Extract the node serial number from the MQTT topic.
