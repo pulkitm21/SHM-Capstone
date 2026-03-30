@@ -43,6 +43,7 @@ function Login() {
     setIsSubmitting(true);
 
     try {
+
       /*
         Auth is handled through the shared auth context so the login page
         does not manage session state directly.

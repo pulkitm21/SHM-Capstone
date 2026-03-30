@@ -13,7 +13,7 @@ def get_connection():
 
 
 def init_db():
-    """Create the users table and apply lightweight schema migrations."""
+    """Create auth tables and apply lightweight schema migrations."""
     conn = get_connection()
 
     conn.execute(
@@ -24,6 +24,25 @@ def init_db():
             role TEXT NOT NULL
         )
         """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )
+        """
+    )
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_username ON sessions(username)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)"
     )
 
     columns = {

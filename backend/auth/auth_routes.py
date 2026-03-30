@@ -1,9 +1,9 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import re
 import sqlite3
 from urllib.parse import unquote
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Response
 
 from auth.auth_dependencies import get_current_user, require_admin
 from auth.auth_models import (
@@ -22,7 +22,11 @@ from auth.auth_models import (
 )
 from auth.auth_repository import (
     HIDDEN_SYSTEM_USERS,
+    create_session,
     create_user,
+    delete_expired_sessions,
+    delete_session,
+    delete_sessions_for_user,
     delete_user,
     get_user,
     list_users,
@@ -30,7 +34,14 @@ from auth.auth_repository import (
     update_user_password,
     update_user_role,
 )
-from auth.auth_security import verify_password
+from auth.auth_security import (
+    SESSION_COOKIE_NAME,
+    SESSION_COOKIE_SAMESITE,
+    SESSION_COOKIE_SECURE,
+    SESSION_IDLE_MINUTES,
+    generate_session_id,
+    verify_password,
+)
 
 router = APIRouter()
 
@@ -39,6 +50,10 @@ PASSWORD_RULE_MESSAGE = (
     "Password must be at least 8 characters and include uppercase, lowercase, "
     "number, and special character."
 )
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _validate_username(username: str) -> str:
@@ -81,24 +96,20 @@ def _user_payload_from_record(record):
     }
 
 
-def _set_auth_cookies(response: Response, username: str, role: str):
-    # Cookies are httpOnly so frontend JS cannot read or tamper with them.
+def _set_session_cookie(response: Response, session_id: str):
     response.set_cookie(
-        key="user",
-        value=username,
+        key=SESSION_COOKIE_NAME,
+        value=session_id,
         httponly=True,
-        samesite="lax",
-        secure=False,
+        samesite=SESSION_COOKIE_SAMESITE,
+        secure=SESSION_COOKIE_SECURE,
         path="/",
+        max_age=SESSION_IDLE_MINUTES * 60,
     )
-    response.set_cookie(
-        key="role",
-        value=role,
-        httponly=True,
-        samesite="lax",
-        secure=False,
-        path="/",
-    )
+
+
+def _clear_session_cookie(response: Response):
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
 
 
 @router.post("/api/auth/login", response_model=LoginResponse)
@@ -111,12 +122,25 @@ def login(payload: LoginRequest, response: Response):
     if not user or not verify_password(password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
+    now_dt = _utc_now()
+    now_iso = now_dt.isoformat()
+    session_id = generate_session_id()
+    expires_at = (now_dt + timedelta(minutes=SESSION_IDLE_MINUTES)).isoformat()
+
     updated_user = update_last_login(
         username=username,
-        iso_ts=datetime.now(timezone.utc).isoformat(),
+        iso_ts=now_iso,
     )
 
-    _set_auth_cookies(response, username=username, role=user["role"])
+    delete_expired_sessions(now_iso)
+    create_session(
+        session_id=session_id,
+        username=username,
+        created_at=now_iso,
+        last_seen_at=now_iso,
+        expires_at=expires_at,
+    )
+    _set_session_cookie(response, session_id)
 
     return {
         "ok": True,
@@ -125,25 +149,25 @@ def login(payload: LoginRequest, response: Response):
 
 
 @router.post("/api/auth/logout", response_model=LogoutResponse)
-def logout(response: Response):
-    response.delete_cookie("user", path="/")
-    response.delete_cookie("role", path="/")
+def logout(
+    response: Response,
+    session_id: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
+):
+    if session_id:
+        delete_session(session_id)
+
+    _clear_session_cookie(response)
     return {"ok": True}
 
 
 @router.get("/api/auth/me", response_model=CurrentUserResponse)
 def get_me(user=Depends(get_current_user)):
-    db_user = get_user(user["username"])
-
-    if not db_user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
     return {
         "authenticated": True,
         "user": {
-            "username": db_user["username"],
-            "role": db_user["role"],
-            "last_login_at": db_user["last_login_at"],
+            "username": user["username"],
+            "role": user["role"],
+            "last_login_at": user["last_login_at"],
         },
     }
 
@@ -194,6 +218,7 @@ def update_user_role_route(
         raise HTTPException(status_code=404, detail="User not found")
 
     updated_user = update_user_role(decoded_username, payload.role)
+    delete_sessions_for_user(decoded_username)
 
     return {
         "ok": True,
@@ -218,6 +243,7 @@ def reset_user_password_route(
 
     password = _validate_password(payload.password)
     update_user_password(decoded_username, password)
+    delete_sessions_for_user(decoded_username)
 
     return {"ok": True}
 
@@ -236,6 +262,7 @@ def delete_user_route(username: str, admin=Depends(require_admin)):
     if not existing:
         raise HTTPException(status_code=404, detail="User not found")
 
+    delete_sessions_for_user(decoded_username)
     delete_user(decoded_username)
 
     return {"ok": True}

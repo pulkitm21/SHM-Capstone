@@ -54,8 +54,9 @@ from fault_logger import ensure_fault_db_schema
 
 from auth.auth_routes import router as auth_router
 from auth.auth_db import init_db
-from auth.auth_repository import create_user, get_user
+from auth.auth_repository import any_admin_exists, create_user, delete_expired_sessions, get_user
 from auth.auth_dependencies import get_current_user, require_admin
+from auth.auth_security import AUTH_BOOTSTRAP_ADMIN_PASSWORD, AUTH_BOOTSTRAP_ADMIN_USERNAME
 
 app = FastAPI()
 
@@ -63,6 +64,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
+        "http://127.0.0.1:5173",
         "http://192.168.20.34:5173",
     ],
     allow_credentials=True,
@@ -727,11 +729,24 @@ def startup_event():
 
     # Initialize auth DB on backend startup.
     init_db()
+    delete_expired_sessions(datetime.now(timezone.utc).isoformat())
 
-    # Create the default local admin once.
-    if not get_user("devadmin"):
-        create_user("devadmin", "devadmin", "admin")
-        print("[auth] Created default devadmin user")
+    # Optionally create one bootstrap admin from environment variables.
+    if AUTH_BOOTSTRAP_ADMIN_USERNAME or AUTH_BOOTSTRAP_ADMIN_PASSWORD:
+        if not AUTH_BOOTSTRAP_ADMIN_USERNAME or not AUTH_BOOTSTRAP_ADMIN_PASSWORD:
+            print("[auth] Bootstrap admin config ignored because username or password is missing")
+        elif not any_admin_exists():
+            try:
+                create_user(
+                    AUTH_BOOTSTRAP_ADMIN_USERNAME,
+                    AUTH_BOOTSTRAP_ADMIN_PASSWORD,
+                    "admin",
+                )
+                print(f"[auth] Created bootstrap admin user '{AUTH_BOOTSTRAP_ADMIN_USERNAME}'")
+            except Exception as e:
+                print(f"[auth] Failed to create bootstrap admin user: {e}")
+        elif get_user(AUTH_BOOTSTRAP_ADMIN_USERNAME) is None:
+            print("[auth] Bootstrap admin config skipped because an admin user already exists")
 
     try:
         ensure_fault_db_schema()
@@ -929,20 +944,6 @@ def _normalize_fault_text(value: Optional[str]) -> str:
     return str(value or "").strip()
 
 
-def _validate_fault_filter_date(value: Optional[str], field_name: str) -> Optional[str]:
-    normalized_value = _normalize_fault_text(value)
-    if not normalized_value:
-        return None
-
-    try:
-        return datetime.strptime(normalized_value, "%Y-%m-%d").date().isoformat()
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid {field_name}. Use YYYY-MM-DD.",
-        ) from exc
-
-
 def _build_fault_where_clauses(
     serial_number: Optional[str] = None,
     sensor_type: Optional[str] = None,
@@ -950,8 +951,6 @@ def _build_fault_where_clauses(
     severity: Optional[int] = None,
     fault_status: Optional[str] = None,
     description: Optional[str] = None,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
 ) -> tuple[list[str], list[Any]]:
     where_clauses: list[str] = []
     params: list[Any] = []
@@ -985,14 +984,6 @@ def _build_fault_where_clauses(
     if description_value:
         where_clauses.append("description LIKE ?")
         params.append(f"%{description_value}%")
-
-    if start_date:
-        where_clauses.append("SUBSTR(ts, 1, 10) >= ?")
-        params.append(start_date)
-
-    if end_date:
-        where_clauses.append("SUBSTR(ts, 1, 10) <= ?")
-        params.append(end_date)
 
     return where_clauses, params
 
@@ -1080,8 +1071,6 @@ def read_fault_rows(
     severity: Optional[int] = None,
     fault_status: Optional[str] = None,
     description: Optional[str] = None,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
 ) -> Dict[str, Any]:
     effective_page_size = page_size if page_size is not None else limit
 
@@ -1109,8 +1098,6 @@ def read_fault_rows(
             severity=severity,
             fault_status=fault_status,
             description=description,
-            start_date=start_date,
-            end_date=end_date,
         )
         where_sql = _build_fault_where_sql(where_clauses)
 
@@ -1334,26 +1321,11 @@ def get_faults(
     severity: Optional[int] = Query(default=None),
     fault_status: Optional[str] = Query(default=None),
     description: Optional[str] = Query(default=None),
-    start_date: Optional[str] = Query(default=None),
-    end_date: Optional[str] = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=15, ge=1, le=200),
     limit: int = Query(default=200, ge=1, le=5000),
     user=Depends(get_current_user),
 ):
-    validated_start_date = _validate_fault_filter_date(start_date, "start_date")
-    validated_end_date = _validate_fault_filter_date(end_date, "end_date")
-
-    if (
-        validated_start_date is not None
-        and validated_end_date is not None
-        and validated_start_date > validated_end_date
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="start_date must be on or before end_date.",
-        )
-
     return read_fault_rows(
         serial_number=serial_number,
         sensor_type=sensor_type,
@@ -1361,8 +1333,6 @@ def get_faults(
         severity=severity,
         fault_status=fault_status,
         description=description,
-        start_date=validated_start_date,
-        end_date=validated_end_date,
         page=page,
         page_size=page_size,
         limit=limit,

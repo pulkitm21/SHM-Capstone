@@ -1,8 +1,9 @@
-const API_BASE = import.meta.env.VITE_API_BASE_URL;
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
 
 /*
-  All API requests include credentials so browser-managed auth cookies
-  will be sent automatically once backend session auth is wired in.
+  All API requests include credentials so the browser will send the
+  httpOnly session cookie automatically. Leave VITE_API_BASE_URL unset in
+  local development to use the Vite proxy.
 */
 async function request<T>(
   path: string,
@@ -30,7 +31,7 @@ async function request<T>(
 export type AuthRole = "admin" | "viewer";
 
 export type AuthUser = {
-  id: number;
+  id?: number;
   username: string;
   role: AuthRole;
   created_at?: string;
@@ -56,6 +57,7 @@ export type CurrentUserResponse = {
 export type LogoutResponse = {
   ok: boolean;
 };
+
 
 export type CreateUserRequest = {
   username: string;
@@ -116,6 +118,7 @@ export function logout(signal?: AbortSignal) {
 export function getCurrentUser(signal?: AbortSignal) {
   return request<CurrentUserResponse>("/api/auth/me", { signal });
 }
+
 
 export function getUsers(signal?: AbortSignal) {
   return request<UsersListResponse>("/api/users", { signal });
