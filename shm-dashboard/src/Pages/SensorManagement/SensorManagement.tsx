@@ -241,9 +241,9 @@ function normalizeSensorConfig(raw: any): SensorConfig {
     desired_odr_index: raw?.desired_odr_index ?? raw?.odr_index ?? 2,
     desired_range: raw?.desired_range ?? raw?.range ?? 1,
     desired_hpf_corner: raw?.desired_hpf_corner ?? raw?.hpf_corner ?? 0,
-    applied_odr_index: null,
-    applied_range: null,
-    applied_hpf_corner: null,
+    applied_odr_index: raw?.applied_odr_index ?? null,
+    applied_range: raw?.applied_range ?? null,
+    applied_hpf_corner: raw?.applied_hpf_corner ?? null,
     current_state: raw?.current_state ?? "unknown",
     pending_seq: null,
     applied_seq: null,
@@ -367,6 +367,7 @@ export default function SensorManagement() {
   const [apiData, setApiData] = useState<ApiResponse | null>(null);
   const [plotStatus, setPlotStatus] = useState("Loading…");
   const [plotRefreshKey, setPlotRefreshKey] = useState(0);
+  const [plotLastUpdated, setPlotLastUpdated] = useState<Date | null>(null);
 
   // Refresh settings from backend and merge them with fallback defaults.
   const refreshSettingsFromBackend = useCallback(async () => {
@@ -774,8 +775,8 @@ export default function SensorManagement() {
             lastDataTs: res.sensors.temperature.last_data_ts ?? null,
           },
         });
-      } catch {
-        // Fall back to fault-based summary if the backend endpoint is unavailable.
+            } catch (e) {
+        console.error("Sensor status load failed:", e);
         setSensorStatusMap(
           buildFallbackSensorStatus(currentNode.online, nodeFaults)
         );
@@ -802,6 +803,7 @@ export default function SensorManagement() {
       }
 
       setApiData(buildPreviewPlotData(sensor));
+      setPlotLastUpdated(new Date());
       setPlotStatus(
         "UI preview mode: showing mock trend data while backend plot loading is disabled."
       );
@@ -827,6 +829,7 @@ export default function SensorManagement() {
 
       if (!isManualRefresh && hasPlotPoints(cachedEntry?.data ?? null)) {
         setApiData(cachedEntry!.data);
+        setPlotLastUpdated(new Date(cachedEntry!.savedAt));
         setPlotStatus(
           `Using cached plot (last synced: ${new Date(
             cachedEntry!.savedAt
@@ -847,10 +850,12 @@ export default function SensorManagement() {
         });
 
         setApiData(json);
+        setPlotLastUpdated(new Date());
         setPlotStatus("Loaded");
         savePlotCacheEntry(cacheKey, json);
       } catch (err: any) {
         if (hasPlotPoints(cachedEntry?.data ?? null)) {
+          setPlotLastUpdated(new Date(cachedEntry!.savedAt));
           setPlotStatus(
             `Backend unreachable — showing cached plot (last synced: ${new Date(
               cachedEntry!.savedAt
@@ -980,13 +985,21 @@ export default function SensorManagement() {
                     </select>
                   </div>
 
-                  <button
-                    type="button"
-                    className="sm-refresh-button"
-                    onClick={handleRefreshPlot}
-                  >
-                    Refresh
-                  </button>
+                  <div className="sm-plot-actions">
+                    <span className="sm-last-updated">
+                      {plotLastUpdated
+                        ? `Updated ${plotLastUpdated.toLocaleTimeString()}`
+                        : "Not updated yet"}
+                    </span>
+
+                    <button
+                      type="button"
+                      className="sm-refresh-button"
+                      onClick={handleRefreshPlot}
+                    >
+                      Refresh
+                    </button>
+                  </div>
                 </div>
               </div>
 

@@ -47,7 +47,9 @@ export default function SensorCardGrid({
                     ? "Online"
                     : item.status === "offline"
                       ? "Offline"
-                      : "Warning"}
+                      : item.status === "idle"
+                        ? "Idle"
+                        : "Warning"}
                 </span>
               </div>
             </button>

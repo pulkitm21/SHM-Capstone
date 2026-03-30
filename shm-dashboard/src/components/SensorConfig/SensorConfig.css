@@ -238,3 +238,9 @@
 .sc-btn-warning:hover:not(:disabled) {
   background: #ffe8cc;
 }
+.sc-field-help {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #6f7c8d;
+}

@@ -1,0 +1,47 @@
+.sp-chart-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.sp-channel-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.sp-channel-label {
+  font-size: 12px;
+  font-weight: 800;
+  color: #6f7c8d;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.sp-channel-list {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.sp-channel-option {
+  min-height: 34px;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: 1px solid #d6dde6;
+  background: #ffffff;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 700;
+  color: #223042;
+  cursor: pointer;
+}
+
+.sp-channel-option input {
+  margin: 0;
+}

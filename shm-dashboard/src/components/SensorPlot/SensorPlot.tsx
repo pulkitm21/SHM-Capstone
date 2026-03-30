@@ -8,7 +8,10 @@ import {
   type ChartData,
   type ChartOptions,
 } from "chart.js";
+import { useEffect, useMemo, useState } from "react";
 import { Scatter } from "react-chartjs-2";
+
+import "./SensorPlot.css";
 
 import type {
   AccelerometerPlotPoint,
@@ -147,12 +150,46 @@ export default function SensorLineChart({
   data,
   height = 420,
 }: Props) {
-  const datasets =
+  const channelOptions = useMemo(() => {
+    if (data.sensor === "accelerometer") {
+      return [
+        { key: "X", label: "X" },
+        { key: "Y", label: "Y" },
+        { key: "Z", label: "Z" },
+      ];
+    }
+
+    if (data.sensor === "inclinometer") {
+      return [
+        { key: "Roll", label: "Roll" },
+        { key: "Pitch", label: "Pitch" },
+        { key: "Yaw", label: "Yaw" },
+      ];
+    }
+
+    return [];
+  }, [data.sensor]);
+
+  const [selectedChannels, setSelectedChannels] = useState<string[]>(
+    channelOptions.map((option) => option.key)
+  );
+
+  // Reset channel selection when the plotted sensor type changes.
+  useEffect(() => {
+    setSelectedChannels(channelOptions.map((option) => option.key));
+  }, [channelOptions]);
+
+  const allDatasets =
     data.sensor === "accelerometer"
       ? buildAccelerometerDatasets(data.points)
       : data.sensor === "inclinometer"
       ? buildInclinometerDatasets(data.points)
       : buildTemperatureDatasets(data.points, data.unit ?? "");
+
+  const datasets = allDatasets.filter((dataset) => {
+    if (!channelOptions.length) return true;
+    return selectedChannels.includes(String(dataset.label));
+  });
 
   const chartData: ChartData<"scatter"> = {
     datasets,
@@ -211,9 +248,42 @@ export default function SensorLineChart({
     },
   };
 
+  function handleChannelToggle(channel: string) {
+    setSelectedChannels((current) => {
+      if (current.includes(channel)) {
+        // Keep at least one channel selected so the plot never goes blank by accident.
+        if (current.length === 1) return current;
+        return current.filter((value) => value !== channel);
+      }
+
+      return [...current, channel];
+    });
+  }
+
   return (
-    <div style={{ width: "100%", height }}>
-      <Scatter data={chartData} options={options} />
+    <div className="sp-chart-shell">
+      {channelOptions.length > 0 && (
+        <div className="sp-channel-toolbar">
+          <span className="sp-channel-label">Channels</span>
+
+          <div className="sp-channel-list">
+            {channelOptions.map((option) => (
+              <label key={option.key} className="sp-channel-option">
+                <input
+                  type="checkbox"
+                  checked={selectedChannels.includes(option.key)}
+                  onChange={() => handleChannelToggle(option.key)}
+                />
+                <span>{option.label}</span>
+              </label>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div style={{ width: "100%", height }}>
+        <Scatter data={chartData} options={options} />
+      </div>
     </div>
   );
 }

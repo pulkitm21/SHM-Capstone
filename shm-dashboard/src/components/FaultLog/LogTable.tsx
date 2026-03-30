@@ -23,6 +23,8 @@ type FaultFilters = {
   fault_type: string;
   severity: string;
   fault_status: string;
+  start_date: string;
+  end_date: string;
   description: string;
 };
 
@@ -36,6 +38,8 @@ const DEFAULT_FILTERS: FaultFilters = {
   fault_type: "",
   severity: "",
   fault_status: "",
+  start_date: "",
+  end_date: "",
   description: "",
 };
 
@@ -97,6 +101,8 @@ export default function LogTable({ serial_number }: Props) {
             severity: filters.severity ? Number(filters.severity) : undefined,
             fault_status: filters.fault_status || undefined,
             description: filters.description || undefined,
+            start_date: filters.start_date || undefined,
+            end_date: filters.end_date || undefined,
             page,
             page_size: PAGE_SIZE,
           },
@@ -261,6 +267,26 @@ export default function LogTable({ serial_number }: Props) {
                 </option>
               ))}
             </select>
+          </div>
+
+          <div className="faultlog-filter-field">
+            <label htmlFor="fault-filter-start-date">From Date</label>
+            <input
+              id="fault-filter-start-date"
+              type="date"
+              value={filters.start_date}
+              onChange={(e) => updateFilter("start_date", e.target.value)}
+            />
+          </div>
+
+          <div className="faultlog-filter-field">
+            <label htmlFor="fault-filter-end-date">To Date</label>
+            <input
+              id="fault-filter-end-date"
+              type="date"
+              value={filters.end_date}
+              onChange={(e) => updateFilter("end_date", e.target.value)}
+            />
           </div>
 
           <div className="faultlog-filter-field faultlog-filter-field-wide">

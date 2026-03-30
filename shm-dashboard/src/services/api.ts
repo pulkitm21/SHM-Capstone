@@ -456,6 +456,8 @@ export type FaultsQueryParams = {
   severity?: number;
   fault_status?: string;
   description?: string;
+  start_date?: string;
+  end_date?: string;
   page?: number;
   page_size?: number;
   limit?: number;
@@ -470,6 +472,8 @@ export function getFaults(params?: FaultsQueryParams, signal?: AbortSignal) {
   if (params?.severity !== undefined) qs.set("severity", String(params.severity));
   if (params?.fault_status) qs.set("fault_status", params.fault_status);
   if (params?.description) qs.set("description", params.description);
+  if (params?.start_date) qs.set("start_date", params.start_date);
+  if (params?.end_date) qs.set("end_date", params.end_date);
   if (params?.page !== undefined) qs.set("page", String(params.page));
   if (params?.page_size !== undefined) qs.set("page_size", String(params.page_size));
   if (params?.limit !== undefined) qs.set("limit", String(params.limit));

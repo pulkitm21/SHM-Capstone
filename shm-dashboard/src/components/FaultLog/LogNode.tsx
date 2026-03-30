@@ -16,6 +16,7 @@ export default function LogNode({faults, loading, error }: Props) {
   return (
     <div className="faultlog-panel">
       <div className="faultlog-header">
+        <h2 className="faultlog-title">Node Faults</h2>
         <span className="faultlog-count">{faults.length}</span>
       </div>
 
@@ -24,7 +25,7 @@ export default function LogNode({faults, loading, error }: Props) {
       ) : error ? (
         <div className="faultlog-empty">Unable to load faults: {error}</div>
       ) : faults.length === 0 ? (
-        <div className="faultlog-empty">No active node-specific faults found.</div>
+        <div className="faultlog-empty">No node faults found.</div>
       ) : (
         <div className="faultlog-node-list">
           {faults.map((fault) => (

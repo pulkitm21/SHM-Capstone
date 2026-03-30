@@ -130,6 +130,11 @@
   color: #a05c00;
 }
 
+.sm-health-pill.idle {
+  background: #eef2f7;
+  color: #5f6b7a;
+}
+
 .sm-detail-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -271,5 +276,44 @@
 
 .sm-refresh-button:disabled {
   opacity: 0.6;
+  cursor: not-allowed;
+}
+.sm-plot-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.sm-last-updated {
+  min-height: 30px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: #eef2f7;
+  font-size: 12px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  color: #223042;
+}
+
+.sm-refresh-button {
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid #d6dde6;
+  background: #ffffff;
+  font-size: 12px;
+  font-weight: 700;
+  color: #223042;
+  cursor: pointer;
+  transition: 0.2s ease;
+}
+
+.sm-refresh-button:hover:not(:disabled) {
+  background: #f3f7fa;
+}
+
+.sm-refresh-button:disabled {
+  opacity: 0.5;
   cursor: not-allowed;
 }

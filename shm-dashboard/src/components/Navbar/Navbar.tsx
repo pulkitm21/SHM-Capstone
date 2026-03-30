@@ -15,15 +15,15 @@ interface NavItem {
 const navItems: NavItem[] = [
   { id: "home", label: "Home", icon: "🏠", to: "/" },
   { id: "sensor-management", label: "Sensor Management", icon: "🛠️", to: "/sensor-management" },
-  { id: "server-management", label: "Server Management", icon: "SV", to: "/server-management" },
+  { id: "server-management", label: "Server Management", icon: "🖥️", to: "/server-management" },
   { id: "fault-log", label: "Fault Log", icon: "⚠️", to: "/fault-log" },
   { id: "export", label: "Export", icon: "💾", to: "/export" },
-  { id: "decoder", label: "Decoder", icon: "D", to: "/decoder" },
+  { id: "decoder", label: "Decoder", icon: "🧩", to: "/decoder" },
   /*
     The Users page will be added later. The nav item is defined now so the
     navbar structure is ready once the route and page are created.
   */
-  { id: "users", label: "Users", icon: "U", to: "/users", adminOnly: true },
+  { id: "users", label: "Users", icon: "👥", to: "/users", adminOnly: true },
 ];
 
 const DEFAULT_DASHBOARD_TITLE = "Cape Scott, BC";
