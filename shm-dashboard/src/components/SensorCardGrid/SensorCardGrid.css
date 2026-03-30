@@ -45,3 +45,34 @@
   font-size: 13px;
   color: #6f7c8d;
 }
+
+.sm-sensor-meta {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid #eef2f7;
+}
+
+.sm-sensor-meta-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.sm-sensor-meta-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: #6f7c8d;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.sm-sensor-meta-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: #223042;
+  text-align: right;
+  overflow-wrap: anywhere;
+}

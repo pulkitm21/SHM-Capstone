@@ -85,6 +85,9 @@ FAULTS_DB = FAULT_DIR / "faults.db"
 SENSOR_STATUS_WINDOW_SECONDS = 120
 SENSOR_KEYS = ("accelerometer", "inclinometer", "temperature")
 
+# Keep raw preview plots limited to short windows so the backend stays lightweight.
+PLOT_MAX_WINDOW_MINUTES = 60
+
 # Stateful fault types that should be reduced to current state.
 STATEFUL_FAULT_TYPES = (
     "ethernet_link",
@@ -1414,7 +1417,7 @@ async def fault_events(
 @app.get("/api/accel")
 def get_accel_data(
     node: int = Query(1, ge=1),
-    minutes: int = Query(1, ge=1, le=60),
+    minutes: int = Query(1, ge=1, le=PLOT_MAX_WINDOW_MINUTES),
     user=Depends(get_current_user),
 ):
     pts = read_accel_points(node_id=node, minutes=minutes)
@@ -1429,7 +1432,7 @@ def get_accel_data(
 @app.get("/api/inclinometer")
 def api_inclinometer(
     node: int = Query(1, ge=1),
-    minutes: int = Query(10, ge=1, le=60),
+    minutes: int = Query(10, ge=1, le=PLOT_MAX_WINDOW_MINUTES),
     user=Depends(get_current_user),
 ):
     pts = read_inclinometer_points(node_id=node, minutes=minutes)
@@ -1444,7 +1447,7 @@ def api_inclinometer(
 @app.get("/api/temperature")
 def api_temperature(
     node: int = Query(1, ge=1),
-    minutes: int = Query(60, ge=1, le=1440),
+    minutes: int = Query(60, ge=1, le=PLOT_MAX_WINDOW_MINUTES),
     user=Depends(get_current_user),
 ):
     pts = read_temperature_points(node_id=node, minutes=minutes)

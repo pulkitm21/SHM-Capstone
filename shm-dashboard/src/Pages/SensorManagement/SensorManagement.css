@@ -190,6 +190,12 @@
   color: #5f6b7a;
 }
 
+.sm-plot-note {
+  margin-bottom: 12px;
+  font-size: 12px;
+  color: #6f7c8d;
+}
+
 .sm-plot-wrap {
   min-height: 420px;
   width: 100%;
@@ -296,24 +302,6 @@
   color: #223042;
 }
 
-.sm-refresh-button {
-  height: 30px;
-  padding: 0 10px;
-  border-radius: 999px;
-  border: 1px solid #d6dde6;
-  background: #ffffff;
-  font-size: 12px;
-  font-weight: 700;
-  color: #223042;
-  cursor: pointer;
-  transition: 0.2s ease;
-}
-
 .sm-refresh-button:hover:not(:disabled) {
   background: #f3f7fa;
-}
-
-.sm-refresh-button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
 }

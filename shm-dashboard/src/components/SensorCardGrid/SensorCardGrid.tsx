@@ -6,6 +6,9 @@ export type SensorCardItem = {
   value: SensorValue;
   model: string;
   status: "online" | "offline" | "warning" | "idle";
+  lastDataAgeText: string;
+  activeFaultCount: number;
+  latestFaultText: string | null;
 };
 
 type Props = {
@@ -51,6 +54,26 @@ export default function SensorCardGrid({
                         ? "Idle"
                         : "Warning"}
                 </span>
+              </div>
+
+              {/* Show a quick operational summary for each sensor card. */}
+              <div className="sm-sensor-meta">
+                <div className="sm-sensor-meta-row">
+                  <span className="sm-sensor-meta-label">Last data</span>
+                  <span className="sm-sensor-meta-value">{item.lastDataAgeText}</span>
+                </div>
+
+                <div className="sm-sensor-meta-row">
+                  <span className="sm-sensor-meta-label">Active faults</span>
+                  <span className="sm-sensor-meta-value">{item.activeFaultCount}</span>
+                </div>
+
+                <div className="sm-sensor-meta-row">
+                  <span className="sm-sensor-meta-label">Latest fault</span>
+                  <span className="sm-sensor-meta-value">
+                    {item.latestFaultText || "—"}
+                  </span>
+                </div>
               </div>
             </button>
           );

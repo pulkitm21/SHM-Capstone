@@ -41,6 +41,7 @@ import "./SensorManagement.css";
 
 const SETTINGS_CACHE_KEY = "shm_settings_cache";
 const PLOT_CACHE_KEY = "shm_plot_cache";
+const SENSOR_STATUS_POLL_MS = 5000;
 
 type PlotCacheRecord = {
   savedAt: string;
@@ -56,6 +57,7 @@ type SensorStatusMap = Record<
     count: number;
     hasData: boolean;
     lastDataTs: string | null;
+    lastFaultDescription: string | null;
   }
 >;
 
@@ -273,25 +275,29 @@ function buildFallbackSensorStatus(
   faults: FaultRow[]
 ): SensorStatusMap {
   const buildOne = (sensor: SensorValue) => {
-    const relevant = faults.filter(
-      (f) => String(f.sensor_type || "").toLowerCase() === sensor
+    const relevantActive = faults.filter(
+      (f) =>
+        String(f.sensor_type || "").toLowerCase() === sensor &&
+        String(f.fault_status || "").toLowerCase() === "active"
     );
 
     if (!nodeOnline) {
       return {
         status: "offline" as const,
-        count: relevant.length,
+        count: relevantActive.length,
         hasData: false,
         lastDataTs: null,
+        lastFaultDescription: relevantActive[0]?.description ?? null,
       };
     }
 
-    if (relevant.length > 0) {
+    if (relevantActive.length > 0) {
       return {
         status: "warning" as const,
-        count: relevant.length,
+        count: relevantActive.length,
         hasData: true,
         lastDataTs: null,
+        lastFaultDescription: relevantActive[0]?.description ?? null,
       };
     }
 
@@ -300,6 +306,7 @@ function buildFallbackSensorStatus(
       count: 0,
       hasData: false,
       lastDataTs: null,
+      lastFaultDescription: null,
     };
   };
 
@@ -308,6 +315,30 @@ function buildFallbackSensorStatus(
     inclinometer: buildOne("inclinometer"),
     temperature: buildOne("temperature"),
   };
+}
+
+// Format a recent ISO timestamp into a short age label for sensor cards.
+function formatSensorAgeLabel(ts: string | null): string {
+  if (!ts) return "—";
+
+  const parsed = new Date(ts);
+  if (Number.isNaN(parsed.getTime())) return "—";
+
+  const diffSeconds = Math.max(
+    0,
+    Math.floor((Date.now() - parsed.getTime()) / 1000)
+  );
+
+  if (diffSeconds < 60) return `${diffSeconds}s ago`;
+
+  const diffMinutes = Math.floor(diffSeconds / 60);
+  if (diffMinutes < 60) return `${diffMinutes}m ago`;
+
+  const diffHours = Math.floor(diffMinutes / 60);
+  if (diffHours < 24) return `${diffHours}h ago`;
+
+  const diffDays = Math.floor(diffHours / 24);
+  return `${diffDays}d ago`;
 }
 
 export default function SensorManagement() {
@@ -349,18 +380,21 @@ export default function SensorManagement() {
       count: 0,
       hasData: false,
       lastDataTs: null,
+      lastFaultDescription: null,
     },
     inclinometer: {
       status: "offline",
       count: 0,
       hasData: false,
       lastDataTs: null,
+      lastFaultDescription: null,
     },
     temperature: {
       status: "offline",
       count: 0,
       hasData: false,
       lastDataTs: null,
+      lastFaultDescription: null,
     },
   });
 
@@ -596,12 +630,12 @@ export default function SensorManagement() {
 
     try {
       setSettingsStatus(
-  cmd === "start"
-    ? "Starting node…"
-    : cmd === "stop"
-    ? "Stopping node…"
-    : "Resetting node…"
-);
+        cmd === "start"
+          ? "Starting node…"
+          : cmd === "stop"
+            ? "Stopping node…"
+            : "Resetting node…"
+      );
       await sendNodeControl(nodeId, { cmd });
 
       setConfigByNode((prev) => ({
@@ -611,11 +645,11 @@ export default function SensorManagement() {
           accelerometer: {
             ...(prev[nodeId]?.accelerometer ?? EMPTY_SENSOR_CONFIG),
             current_state:
-  cmd === "start"
-    ? "recording"
-    : cmd === "stop"
-    ? "configured"
-    : "unknown", // reset → unknown state until node reports back
+              cmd === "start"
+                ? "recording"
+                : cmd === "stop"
+                  ? "configured"
+                  : "unknown", // reset → unknown state until node reports back
           },
         },
       }));
@@ -746,8 +780,13 @@ export default function SensorManagement() {
 
     const controller = new AbortController();
     const currentNode = selectedNode;
+    let cancelled = false;
+    let loading = false;
 
     async function loadSensorStatuses() {
+      if (loading) return;
+      loading = true;
+
       try {
         const res: NodeSensorStatusResponse = await getNodeSensorStatus(
           currentNode.node_id,
@@ -755,37 +794,56 @@ export default function SensorManagement() {
           controller.signal
         );
 
+        if (cancelled) return;
+
         setSensorStatusMap({
           accelerometer: {
             status: res.sensors.accelerometer.status,
             count: res.sensors.accelerometer.active_fault_count,
             hasData: res.sensors.accelerometer.has_data,
             lastDataTs: res.sensors.accelerometer.last_data_ts ?? null,
+            lastFaultDescription:
+              res.sensors.accelerometer.active_faults?.[0]?.description ?? null,
           },
           inclinometer: {
             status: res.sensors.inclinometer.status,
             count: res.sensors.inclinometer.active_fault_count,
             hasData: res.sensors.inclinometer.has_data,
             lastDataTs: res.sensors.inclinometer.last_data_ts ?? null,
+            lastFaultDescription:
+              res.sensors.inclinometer.active_faults?.[0]?.description ?? null,
           },
           temperature: {
             status: res.sensors.temperature.status,
             count: res.sensors.temperature.active_fault_count,
             hasData: res.sensors.temperature.has_data,
             lastDataTs: res.sensors.temperature.last_data_ts ?? null,
+            lastFaultDescription:
+              res.sensors.temperature.active_faults?.[0]?.description ?? null,
           },
         });
-            } catch (e) {
+      } catch (e) {
+        if (cancelled) return;
         console.error("Sensor status load failed:", e);
         setSensorStatusMap(
           buildFallbackSensorStatus(currentNode.online, nodeFaults)
         );
+      } finally {
+        loading = false;
       }
     }
 
     void loadSensorStatuses();
 
-    return () => controller.abort();
+    const intervalId = window.setInterval(() => {
+      void loadSensorStatuses();
+    }, SENSOR_STATUS_POLL_MS);
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+      window.clearInterval(intervalId);
+    };
   }, [selectedNode, nodeFaults]);
 
   // Manually refresh the currently selected plot from the backend.
@@ -892,6 +950,9 @@ export default function SensorManagement() {
         value: sensorDef.value,
         model: sensorMeta.model,
         status: summary.status,
+        lastDataAgeText: formatSensorAgeLabel(summary.lastDataTs),
+        activeFaultCount: summary.count,
+        latestFaultText: summary.lastFaultDescription,
       };
     });
   }, [metaForNode, sensorStatusMap]);
@@ -901,6 +962,29 @@ export default function SensorManagement() {
     SENSOR_DEFINITIONS[0];
 
   const timeframeOptions = TIMEFRAME_OPTIONS_BY_SENSOR[sensor];
+  const selectedSensorStatus = sensorStatusMap[sensor];
+
+  const plotEmptyMessage = useMemo(() => {
+    if (!selectedNode) {
+      return "Select a node to view raw preview data.";
+    }
+
+    if (plotStatus.startsWith("Error:")) {
+      return `Raw preview unavailable: ${plotStatus.replace(/^Error:\s*/, "")}`;
+    }
+
+    if (selectedSensorStatus.status === "offline") {
+      return selectedSensorStatus.hasData
+        ? "This sensor is reporting invalid data in the current-hour raw preview window."
+        : "This sensor is offline, so no raw preview data is available.";
+    }
+
+    if (selectedSensorStatus.status === "idle" || !selectedSensorStatus.hasData) {
+      return "No recent raw samples were found in the current-hour preview window. Use Export for long-range analysis.";
+    }
+
+    return "No raw preview data points matched the selected window. Use Export for long-range analysis.";
+  }, [selectedNode, selectedSensorStatus, plotStatus]);
 
   return (
     <div className="sm-page">
@@ -945,27 +1029,27 @@ export default function SensorManagement() {
             />
 
             <SensorConfigCard
-  title={`${selectedSensorDef.label} Configuration`}
-  config={config}
-  onApply={handleApplyAccelerometerConfig}
-  onStart={() => handleNodeControl("start")}
-  onStop={() => handleNodeControl("stop")}
-  onReset={() => handleNodeControl("reset")} // NEW
-  disabled={
-    !selectedNode ||
-    sensor !== "accelerometer" ||
-    !isAdmin
-  }
-/>
+              title={`${selectedSensorDef.label} Configuration`}
+              config={config}
+              onApply={handleApplyAccelerometerConfig}
+              onStart={() => handleNodeControl("start")}
+              onStop={() => handleNodeControl("stop")}
+              onReset={() => handleNodeControl("reset")}
+              disabled={
+                !selectedNode ||
+                sensor !== "accelerometer" ||
+                !isAdmin
+              }
+            />
 
             <div className="sm-panel sm-full-width-panel">
               <div className="sm-plot-toolbar">
                 <div>
                   <h2 className="sm-panel-title">
-                    {selectedSensorDef.label} Trend
+                    {selectedSensorDef.label} Raw Live Preview
                   </h2>
                   <p className="sm-panel-subtitle">
-                    Recent data for {selectedNode.serial}
+                    Current-hour raw preview for {selectedNode.serial}. Use Export for long-range analysis.
                   </p>
                 </div>
 
@@ -1004,6 +1088,9 @@ export default function SensorManagement() {
               </div>
 
               <div className="sm-plot-status">{plotStatus}</div>
+              <div className="sm-plot-note">
+                Raw live preview is limited to short windows from the current hour file.
+              </div>
 
               <div className="sm-plot-wrap">
                 {apiData && selectedNode && hasPlotPoints(apiData) ? (
@@ -1014,7 +1101,7 @@ export default function SensorManagement() {
                   />
                 ) : (
                   <div className="sm-plot-empty">
-                    No plot data available for the selected view.
+                    {plotEmptyMessage}
                   </div>
                 )}
               </div>
