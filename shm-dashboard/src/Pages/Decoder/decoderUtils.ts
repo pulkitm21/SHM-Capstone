@@ -36,6 +36,8 @@ export type ProgressSnapshot = {
   currentLabel: string;
 };
 
+export type DecodeOutputMode = "sensor" | "node";
+
 export const EMPTY_PROGRESS: ProgressSnapshot = {
   phase: "idle",
   completed: 0,
@@ -44,8 +46,7 @@ export const EMPTY_PROGRESS: ProgressSnapshot = {
   currentLabel: "",
 };
 
-const RAW_FILE_PATTERN = /\.bin(?:\.gz|\.gzip)?$/i;
-const ZIP_FILE_PATTERN = /\.zip$/i;
+const RAW_FILE_PATTERN = /\.bin(?:\.gz)?$/i;
 
 const TEMP_SCALE = 100;
 const ACCEL_SCALE = 10000;
@@ -57,8 +58,6 @@ const FLAG_INCLIN = 0x02;
 const FLAG_TEMP = 0x04;
 const SENTINEL = 0xff;
 
-const FORMAT_V1 = 1;
-const FORMAT_V2 = 2;
 const FORMAT_V3 = 3;
 
 const INT32_NAN_SENTINEL = -2147483648;
@@ -69,7 +68,6 @@ const CHANGED_NAN_TEMP = 0x10;
 
 type SensorState = {
   tsUs: number;
-  tsDeltaPrev: number;
   xyzPrev: [number, number, number];
   valPrev: number;
 };
@@ -116,6 +114,18 @@ type SensorCollections = {
   temp: TempSample[];
 };
 
+type NodeCsvRow = {
+  tsUs: number;
+  sensorType: "accelerometer" | "inclinometer" | "temperature";
+  x: number | null;
+  y: number | null;
+  z: number | null;
+  roll: number | null;
+  pitch: number | null;
+  yaw: number | null;
+  tempC: number | null;
+};
+
 class BinaryReader {
   private view: DataView;
   private offset = 0;
@@ -124,24 +134,8 @@ class BinaryReader {
     this.view = new DataView(buffer);
   }
 
-  get position() {
-    return this.offset;
-  }
-
-  get length() {
-    return this.view.byteLength;
-  }
-
   hasRemaining() {
     return this.offset < this.view.byteLength;
-  }
-
-  seekRelative(delta: number) {
-    const next = this.offset + delta;
-    if (next < 0 || next > this.view.byteLength) {
-      throw new Error(`Seek out of range at byte ${this.offset}.`);
-    }
-    this.offset = next;
   }
 
   private ensure(bytes: number, label: string) {
@@ -179,37 +173,38 @@ class BinaryReader {
   }
 }
 
-function isZipFileName(name: string) {
-  return ZIP_FILE_PATTERN.test(name);
-}
-
 function isRawSensorFileName(name: string) {
   return RAW_FILE_PATTERN.test(name);
 }
 
 function normalizeRawOutputBaseName(name: string) {
-  return name.replace(/\.gzip$/i, ".gz").replace(/\.bin\.gz$/i, "").replace(/\.bin$/i, "");
+  return name.replace(/\.bin\.gz$/i, "").replace(/\.bin$/i, "");
 }
 
-async function readTextFromBlob(blob: Blob) {
-  return await blob.text();
-}
-
-function arrayBufferToBlob(buffer: ArrayBuffer, type = "application/octet-stream") {
+function arrayBufferToBlob(
+  buffer: ArrayBuffer,
+  type = "application/octet-stream"
+) {
   return new Blob([buffer], { type });
 }
 
+// Decompress .bin.gz files in the browser.
 async function gunzipArrayBuffer(input: ArrayBuffer): Promise<ArrayBuffer> {
   if (typeof DecompressionStream === "undefined") {
-    throw new Error("This browser does not support gzip decompression in the decoder page.");
+    throw new Error(
+      "This browser does not support gzip decompression in the decoder page."
+    );
   }
 
   const sourceBlob = arrayBufferToBlob(input);
-  const decompressedStream = sourceBlob.stream().pipeThrough(new DecompressionStream("gzip"));
+  const decompressedStream = sourceBlob
+    .stream()
+    .pipeThrough(new DecompressionStream("gzip"));
   const response = new Response(decompressedStream);
   return await response.arrayBuffer();
 }
 
+// Trigger the browser download for the generated artifact.
 function triggerBlobDownload(blob: Blob, fileName: string) {
   const objectUrl = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
@@ -221,7 +216,11 @@ function triggerBlobDownload(blob: Blob, fileName: string) {
   URL.revokeObjectURL(objectUrl);
 }
 
-async function buildDownloadArtifact(outputFiles: DecodedOutputFile[]) {
+// Return a single CSV or a ZIP depending on how many files were generated.
+async function buildDownloadArtifact(
+  outputFiles: DecodedOutputFile[],
+  outputMode: DecodeOutputMode
+) {
   if (outputFiles.length === 1) {
     const onlyFile = outputFiles[0];
     return {
@@ -237,7 +236,9 @@ async function buildDownloadArtifact(outputFiles: DecodedOutputFile[]) {
 
   const blob = await zip.generateAsync({ type: "blob" });
   return {
-    fileName: `decoded_sensor_csv_${new Date().toISOString().slice(0, 10)}.zip`,
+    fileName: `decoded_${outputMode}_csv_${new Date()
+      .toISOString()
+      .slice(0, 10)}.zip`,
     blob,
   };
 }
@@ -245,7 +246,6 @@ async function buildDownloadArtifact(outputFiles: DecodedOutputFile[]) {
 function freshSensorState(): SensorState {
   return {
     tsUs: 0,
-    tsDeltaPrev: 0,
     xyzPrev: [0, 0, 0],
     valPrev: 0,
   };
@@ -257,10 +257,6 @@ function freshDecodeState(): DecodeState {
     inclin: freshSensorState(),
     temp: freshSensorState(),
   };
-}
-
-function formatTimestampSeconds(tsSeconds: number) {
-  return tsSeconds.toFixed(6);
 }
 
 function formatTimestampIso(tsUs: number) {
@@ -277,16 +273,7 @@ function reconstructAbsTs(reader: BinaryReader, sensorState: SensorState) {
   return tsUs;
 }
 
-function reconstructV1Ts(reader: BinaryReader, sensorState: SensorState) {
-  const dod = reader.readInt32("v1 dod_ts");
-  const deltaUs = sensorState.tsDeltaPrev + dod;
-  const tsUs = sensorState.tsUs + deltaUs;
-  sensorState.tsUs = tsUs;
-  sensorState.tsDeltaPrev = deltaUs;
-  return tsUs;
-}
-
-// Decode absolute accelerometer bursts and preserve previous non-NaN axis values.
+// Decode absolute accelerometer bursts.
 function decodeAccelAbsolute(reader: BinaryReader, state: DecodeState) {
   const count = reader.readUint8("accel count");
   const samples: AccelSample[] = [];
@@ -300,7 +287,11 @@ function decodeAccelAbsolute(reader: BinaryReader, state: DecodeState) {
       reader.readInt32("accel z"),
     ];
 
-    const values: [number | null, number | null, number | null] = [null, null, null];
+    const values: [number | null, number | null, number | null] = [
+      null,
+      null,
+      null,
+    ];
 
     for (let axis = 0; axis < 3; axis += 1) {
       const raw = rawValues[axis];
@@ -323,37 +314,8 @@ function decodeAccelAbsolute(reader: BinaryReader, state: DecodeState) {
   return samples;
 }
 
-// Decode legacy v1 accelerometer delta samples.
-function decodeAccelDeltaV1(reader: BinaryReader, state: DecodeState) {
-  const count = reader.readUint8("accel count");
-  const samples: AccelSample[] = [];
-  let [prevX, prevY, prevZ] = state.accel.xyzPrev;
-
-  for (let index = 0; index < count; index += 1) {
-    const tsUs = reconstructV1Ts(reader, state.accel);
-    const dx = reader.readInt16("accel dx");
-    const dy = reader.readInt16("accel dy");
-    const dz = reader.readInt16("accel dz");
-
-    prevX += dx;
-    prevY += dy;
-    prevZ += dz;
-
-    samples.push({
-      ts: tsUs / TS_SCALE,
-      tsUs,
-      x: prevX / ACCEL_SCALE,
-      y: prevY / ACCEL_SCALE,
-      z: prevZ / ACCEL_SCALE,
-    });
-  }
-
-  state.accel.xyzPrev = [prevX, prevY, prevZ];
-  return samples;
-}
-
-// Decode v2 and v3 accelerometer deltas including optional NaN flags.
-function decodeAccelDelta(reader: BinaryReader, state: DecodeState, formatVersion: number) {
+// Decode V3 accelerometer deltas with NaN flags.
+function decodeAccelDelta(reader: BinaryReader, state: DecodeState) {
   const count = reader.readUint8("accel count");
   const samples: AccelSample[] = [];
   const prev = [...state.accel.xyzPrev] as [number, number, number];
@@ -361,13 +323,17 @@ function decodeAccelDelta(reader: BinaryReader, state: DecodeState, formatVersio
   for (let index = 0; index < count; index += 1) {
     const changed = reader.readUint8("accel changed");
     const lowMask = changed & 0x0f;
-    const nanMask = formatVersion >= FORMAT_V3 ? changed & 0x70 : 0;
+    const nanMask = changed & 0x70;
 
     if (lowMask & 0x01) {
       state.accel.tsUs += reader.readInt32("accel delta_ts");
     }
 
-    const values: [number | null, number | null, number | null] = [null, null, null];
+    const values: [number | null, number | null, number | null] = [
+      null,
+      null,
+      null,
+    ];
     const bits = [0x02, 0x04, 0x08] as const;
     const nanBits = [CHANGED_NAN_X, CHANGED_NAN_Y, CHANGED_NAN_Z] as const;
 
@@ -397,12 +363,11 @@ function decodeAccelDelta(reader: BinaryReader, state: DecodeState, formatVersio
   return samples;
 }
 
-// Decode absolute inclination records for v1/v2 single samples and v3 bursts.
-function decodeInclinAbsolute(reader: BinaryReader, state: DecodeState, formatVersion: number) {
+// Decode absolute inclinometer bursts.
+function decodeInclinAbsolute(reader: BinaryReader, state: DecodeState) {
   const samples: InclinSample[] = [];
   const prev = [...state.inclin.xyzPrev] as [number, number, number];
-
-  const count = formatVersion >= FORMAT_V3 ? reader.readUint8("inclin count") : 1;
+  const count = reader.readUint8("inclin count");
 
   for (let index = 0; index < count; index += 1) {
     const tsUs = reconstructAbsTs(reader, state.inclin);
@@ -412,14 +377,19 @@ function decodeInclinAbsolute(reader: BinaryReader, state: DecodeState, formatVe
       reader.readInt32("inclin yaw"),
     ];
 
-    const values: [number | null, number | null, number | null] = [null, null, null];
+    const values: [number | null, number | null, number | null] = [
+      null,
+      null,
+      null,
+    ];
 
     for (let axis = 0; axis < 3; axis += 1) {
       const raw = rawValues[axis];
-      if (formatVersion >= FORMAT_V3 && raw === INT32_NAN_SENTINEL) {
+      if (raw === INT32_NAN_SENTINEL) {
         values[axis] = null;
         continue;
       }
+
       prev[axis] = raw;
       values[axis] = raw / INCLIN_SCALE;
     }
@@ -437,42 +407,26 @@ function decodeInclinAbsolute(reader: BinaryReader, state: DecodeState, formatVe
   return samples;
 }
 
-// Decode legacy v1 inclination delta samples.
-function decodeInclinDeltaV1(reader: BinaryReader, state: DecodeState): InclinSample[] {
-  const tsUs = reconstructV1Ts(reader, state.inclin);
-  let [prevRoll, prevPitch, prevYaw] = state.inclin.xyzPrev;
-
-  prevRoll += reader.readInt16("inclin dr");
-  prevPitch += reader.readInt16("inclin dp");
-  prevYaw += reader.readInt16("inclin dyaw");
-
-  state.inclin.xyzPrev = [prevRoll, prevPitch, prevYaw];
-
-  return [{
-    ts: tsUs / TS_SCALE,
-    tsUs,
-    roll: prevRoll / INCLIN_SCALE,
-    pitch: prevPitch / INCLIN_SCALE,
-    yaw: prevYaw / INCLIN_SCALE,
-  }];
-}
-
-// Decode v2 and v3 inclination deltas including v3 bursts and NaN flags.
-function decodeInclinDelta(reader: BinaryReader, state: DecodeState, formatVersion: number): InclinSample[] {
+// Decode V3 inclinometer deltas with NaN flags.
+function decodeInclinDelta(reader: BinaryReader, state: DecodeState): InclinSample[] {
   const samples: InclinSample[] = [];
   const prev = [...state.inclin.xyzPrev] as [number, number, number];
-  const count = formatVersion >= FORMAT_V3 ? reader.readUint8("inclin count") : 1;
+  const count = reader.readUint8("inclin count");
 
   for (let index = 0; index < count; index += 1) {
     const changed = reader.readUint8("inclin changed");
     const lowMask = changed & 0x0f;
-    const nanMask = formatVersion >= FORMAT_V3 ? changed & 0x70 : 0;
+    const nanMask = changed & 0x70;
 
     if (lowMask & 0x01) {
       state.inclin.tsUs += reader.readInt32("inclin delta_ts");
     }
 
-    const values: [number | null, number | null, number | null] = [null, null, null];
+    const values: [number | null, number | null, number | null] = [
+      null,
+      null,
+      null,
+    ];
     const bits = [0x02, 0x04, 0x08] as const;
     const nanBits = [CHANGED_NAN_X, CHANGED_NAN_Y, CHANGED_NAN_Z] as const;
 
@@ -502,7 +456,7 @@ function decodeInclinDelta(reader: BinaryReader, state: DecodeState, formatVersi
   return samples;
 }
 
-// Decode absolute temperature samples and preserve previous non-NaN values.
+// Decode absolute temperature samples.
 function decodeTempAbsolute(reader: BinaryReader, state: DecodeState): TempSample {
   const tsUs = reconstructAbsTs(reader, state.temp);
   const tempRaw = reader.readInt32("temp value");
@@ -523,20 +477,8 @@ function decodeTempAbsolute(reader: BinaryReader, state: DecodeState): TempSampl
   };
 }
 
-// Decode legacy v1 temperature delta samples.
-function decodeTempDeltaV1(reader: BinaryReader, state: DecodeState): TempSample {
-  const tsUs = reconstructV1Ts(reader, state.temp);
-  state.temp.valPrev += reader.readInt16("temp delta");
-
-  return {
-    ts: tsUs / TS_SCALE,
-    tsUs,
-    tempC: state.temp.valPrev / TEMP_SCALE,
-  };
-}
-
-// Decode v2 and v3 temperature deltas including explicit NaN flags in v3.
-function decodeTempDelta(reader: BinaryReader, state: DecodeState, formatVersion: number): TempSample {
+// Decode V3 temperature deltas with NaN flags.
+function decodeTempDelta(reader: BinaryReader, state: DecodeState): TempSample {
   const changed = reader.readUint8("temp changed");
   const lowMask = changed & 0x0f;
 
@@ -544,7 +486,7 @@ function decodeTempDelta(reader: BinaryReader, state: DecodeState, formatVersion
     state.temp.tsUs += reader.readInt32("temp delta_ts");
   }
 
-  const isNan = formatVersion >= FORMAT_V3 && Boolean(changed & CHANGED_NAN_TEMP);
+  const isNan = Boolean(changed & CHANGED_NAN_TEMP);
   if (isNan) {
     return {
       ts: state.temp.tsUs / TS_SCALE,
@@ -568,7 +510,7 @@ function isTruncatedTailError(error: unknown) {
   return error instanceof Error && error.message.startsWith("EOF reading ");
 }
 
-// Decode one binary file into the same record model as the Python decoder.
+// Decode one V3 binary file into record entries.
 function decodeBinaryRecords(bytes: ArrayBuffer) {
   const reader = new BinaryReader(bytes);
   const state = freshDecodeState();
@@ -588,9 +530,10 @@ function decodeBinaryRecords(bytes: ArrayBuffer) {
     throw error;
   }
 
-  if (formatVersion !== FORMAT_V1 && formatVersion !== FORMAT_V2 && formatVersion !== FORMAT_V3) {
-    reader.seekRelative(-1);
-    formatVersion = FORMAT_V1;
+  if (formatVersion !== FORMAT_V3) {
+    throw new Error(
+      `Unsupported decoder format version ${formatVersion}. Expected V3.`
+    );
   }
 
   let recordIndex = 0;
@@ -599,7 +542,9 @@ function decodeBinaryRecords(bytes: ArrayBuffer) {
     try {
       const headerOrSentinel = reader.readUint8("record header");
       const isAbsolute = headerOrSentinel === SENTINEL;
-      const header = isAbsolute ? reader.readUint8("absolute header") : headerOrSentinel;
+      const header = isAbsolute
+        ? reader.readUint8("absolute header")
+        : headerOrSentinel;
 
       const record: RecordEntry = {
         recordIndex,
@@ -610,17 +555,25 @@ function decodeBinaryRecords(bytes: ArrayBuffer) {
       };
 
       if (isAbsolute) {
-        if (header & FLAG_ACCEL) record.accelSamples = decodeAccelAbsolute(reader, state);
-        if (header & FLAG_INCLIN) record.inclin = decodeInclinAbsolute(reader, state, formatVersion);
-        if (header & FLAG_TEMP) record.temp = decodeTempAbsolute(reader, state);
-      } else if (formatVersion === FORMAT_V1) {
-        if (header & FLAG_ACCEL) record.accelSamples = decodeAccelDeltaV1(reader, state);
-        if (header & FLAG_INCLIN) record.inclin = decodeInclinDeltaV1(reader, state);
-        if (header & FLAG_TEMP) record.temp = decodeTempDeltaV1(reader, state);
+        if (header & FLAG_ACCEL) {
+          record.accelSamples = decodeAccelAbsolute(reader, state);
+        }
+        if (header & FLAG_INCLIN) {
+          record.inclin = decodeInclinAbsolute(reader, state);
+        }
+        if (header & FLAG_TEMP) {
+          record.temp = decodeTempAbsolute(reader, state);
+        }
       } else {
-        if (header & FLAG_ACCEL) record.accelSamples = decodeAccelDelta(reader, state, formatVersion);
-        if (header & FLAG_INCLIN) record.inclin = decodeInclinDelta(reader, state, formatVersion);
-        if (header & FLAG_TEMP) record.temp = decodeTempDelta(reader, state, formatVersion);
+        if (header & FLAG_ACCEL) {
+          record.accelSamples = decodeAccelDelta(reader, state);
+        }
+        if (header & FLAG_INCLIN) {
+          record.inclin = decodeInclinDelta(reader, state);
+        }
+        if (header & FLAG_TEMP) {
+          record.temp = decodeTempDelta(reader, state);
+        }
       }
 
       records.push(record);
@@ -628,7 +581,9 @@ function decodeBinaryRecords(bytes: ArrayBuffer) {
     } catch (error) {
       if (isTruncatedTailError(error)) {
         const message = error instanceof Error ? error.message : String(error);
-        console.warn(`Decoder stopped at truncated record #${recordIndex}: ${message}`);
+        console.warn(
+          `Decoder stopped at truncated record #${recordIndex}: ${message}`
+        );
         break;
       }
       throw error;
@@ -638,7 +593,7 @@ function decodeBinaryRecords(bytes: ArrayBuffer) {
   return records;
 }
 
-// Flatten decoded records into per-sensor collections for CSV export.
+// Flatten decoded records into per-sensor collections.
 function collectSensorSamples(records: RecordEntry[]): SensorCollections {
   const sensors: SensorCollections = {
     accel: [],
@@ -663,7 +618,59 @@ function collectSensorSamples(records: RecordEntry[]): SensorCollections {
   return sensors;
 }
 
-// Build accelerometer CSV output with blank cells for NaN values.
+// Build one combined node CSV row list.
+function collectNodeCsvRows(records: RecordEntry[]): NodeCsvRow[] {
+  const rows: NodeCsvRow[] = [];
+
+  for (const record of records) {
+    for (const sample of record.accelSamples) {
+      rows.push({
+        tsUs: sample.tsUs,
+        sensorType: "accelerometer",
+        x: sample.x,
+        y: sample.y,
+        z: sample.z,
+        roll: null,
+        pitch: null,
+        yaw: null,
+        tempC: null,
+      });
+    }
+
+    for (const sample of record.inclin) {
+      rows.push({
+        tsUs: sample.tsUs,
+        sensorType: "inclinometer",
+        x: null,
+        y: null,
+        z: null,
+        roll: sample.roll,
+        pitch: sample.pitch,
+        yaw: sample.yaw,
+        tempC: null,
+      });
+    }
+
+    if (record.temp) {
+      rows.push({
+        tsUs: record.temp.tsUs,
+        sensorType: "temperature",
+        x: null,
+        y: null,
+        z: null,
+        roll: null,
+        pitch: null,
+        yaw: null,
+        tempC: record.temp.tempC,
+      });
+    }
+  }
+
+  rows.sort((a, b) => a.tsUs - b.tsUs);
+  return rows;
+}
+
+// Build accelerometer CSV output.
 function buildAccelCsv(samples: AccelSample[]) {
   const lines = ["timestamp_iso,timestamp_us,x_g,y_g,z_g"];
   for (const sample of samples) {
@@ -680,7 +687,7 @@ function buildAccelCsv(samples: AccelSample[]) {
   return `${lines.join("\n")}\n`;
 }
 
-// Build inclinometer CSV output with blank cells for NaN values.
+// Build inclinometer CSV output.
 function buildInclinCsv(samples: InclinSample[]) {
   const lines = ["timestamp_iso,timestamp_us,roll_deg,pitch_deg,yaw_deg"];
   for (const sample of samples) {
@@ -697,23 +704,70 @@ function buildInclinCsv(samples: InclinSample[]) {
   return `${lines.join("\n")}\n`;
 }
 
-// Build temperature CSV output with blank cells for NaN values.
+// Build temperature CSV output.
 function buildTempCsv(samples: TempSample[]) {
   const lines = ["timestamp_iso,timestamp_us,temp_c"];
   for (const sample of samples) {
-    lines.push([formatTimestampIso(sample.tsUs), sample.tsUs.toString(), formatOptionalValue(sample.tempC, 2)].join(","));
+    lines.push(
+      [
+        formatTimestampIso(sample.tsUs),
+        sample.tsUs.toString(),
+        formatOptionalValue(sample.tempC, 2),
+      ].join(",")
+    );
   }
   return `${lines.join("\n")}\n`;
 }
 
-// Decode raw binary bytes into per-sensor CSV files.
-async function decodeThresholdEncodedBinaryToSensorCsvFiles(
+// Build one combined node CSV.
+function buildNodeCsv(records: RecordEntry[]) {
+  const rows = collectNodeCsvRows(records);
+  const lines = [
+    "timestamp_iso,timestamp_us,sensor_type,x_g,y_g,z_g,roll_deg,pitch_deg,yaw_deg,temp_c",
+  ];
+
+  for (const row of rows) {
+    lines.push(
+      [
+        formatTimestampIso(row.tsUs),
+        row.tsUs.toString(),
+        row.sensorType,
+        formatOptionalValue(row.x, 4),
+        formatOptionalValue(row.y, 4),
+        formatOptionalValue(row.z, 4),
+        formatOptionalValue(row.roll, 4),
+        formatOptionalValue(row.pitch, 4),
+        formatOptionalValue(row.yaw, 4),
+        formatOptionalValue(row.tempC, 2),
+      ].join(",")
+    );
+  }
+
+  return `${lines.join("\n")}\n`;
+}
+
+// Decode raw bytes into either sensor CSVs or one node CSV.
+async function decodeThresholdEncodedBinaryToCsvFiles(
   bytes: ArrayBuffer,
-  baseName: string
+  baseName: string,
+  outputMode: DecodeOutputMode
 ): Promise<DecodedOutputFile[]> {
   const records = decodeBinaryRecords(bytes);
-  const sensors = collectSensorSamples(records);
   const outputFiles: DecodedOutputFile[] = [];
+
+  if (outputMode === "node") {
+    if (records.length === 0) {
+      return outputFiles;
+    }
+
+    outputFiles.push({
+      fileName: `${baseName}.csv`,
+      content: buildNodeCsv(records),
+    });
+    return outputFiles;
+  }
+
+  const sensors = collectSensorSamples(records);
 
   if (sensors.accel.length > 0) {
     outputFiles.push({
@@ -739,31 +793,12 @@ async function decodeThresholdEncodedBinaryToSensorCsvFiles(
   return outputFiles;
 }
 
-// Collect standalone raw files and raw files nested inside ZIP archives.
+// Collect standalone raw files only.
 export async function collectRawInputEntries(files: File[]) {
   const entries: RawInputEntry[] = [];
   const rejectedNames: string[] = [];
 
   for (const file of files) {
-    if (isZipFileName(file.name)) {
-      const archive = await JSZip.loadAsync(file);
-      archive.forEach((relativePath, entry) => {
-        if (entry.dir) return;
-        if (!isRawSensorFileName(relativePath)) return;
-
-        entries.push({
-          sourceName: file.name,
-          entryName: relativePath,
-          displayName: `${file.name} -> ${relativePath}`,
-          loadBytes: async () => {
-            const uint8 = await entry.async("uint8array");
-            return uint8.slice().buffer;
-          },
-        });
-      });
-      continue;
-    }
-
     if (isRawSensorFileName(file.name)) {
       entries.push({
         sourceName: file.name,
@@ -783,9 +818,10 @@ export async function collectRawInputEntries(files: File[]) {
   return { entries, rejectedNames };
 }
 
-// Decode all queued files and trigger a CSV or ZIP download in the browser.
+// Decode all queued files and trigger the browser download.
 export async function decodeRawEntriesToCsv(
   entries: RawInputEntry[],
+  outputMode: DecodeOutputMode,
   onProgress?: (progress: ProgressSnapshot) => void
 ): Promise<DecodeBatchResult> {
   const successes: DecodeSuccess[] = [];
@@ -805,7 +841,11 @@ export async function decodeRawEntriesToCsv(
     });
   };
 
-  emitProgress({ phase: "reading", completed: 0, currentLabel: total > 0 ? entries[0].displayName : "" });
+  emitProgress({
+    phase: "reading",
+    completed: 0,
+    currentLabel: total > 0 ? entries[0].displayName : "",
+  });
 
   for (let index = 0; index < entries.length; index += 1) {
     const entry = entries[index];
@@ -825,10 +865,16 @@ export async function decodeRawEntriesToCsv(
         currentLabel: entry.displayName,
       });
 
-      const normalizedName = entry.entryName.replace(/\.gzip$/i, ".gz");
-      const binaryBytes = normalizedName.endsWith(".gz") ? await gunzipArrayBuffer(inputBytes) : inputBytes;
-      const baseName = normalizeRawOutputBaseName(normalizedName);
-      const outputFiles = await decodeThresholdEncodedBinaryToSensorCsvFiles(binaryBytes, baseName);
+      const binaryBytes = entry.entryName.toLowerCase().endsWith(".bin.gz")
+        ? await gunzipArrayBuffer(inputBytes)
+        : inputBytes;
+
+      const baseName = normalizeRawOutputBaseName(entry.entryName);
+      const outputFiles = await decodeThresholdEncodedBinaryToCsvFiles(
+        binaryBytes,
+        baseName,
+        outputMode
+      );
 
       if (outputFiles.length === 0) {
         failures.push({
@@ -842,7 +888,8 @@ export async function decodeRawEntriesToCsv(
     } catch (error) {
       failures.push({
         entryName: entry.entryName,
-        reason: error instanceof Error ? error.message : "Unknown decode error.",
+        reason:
+          error instanceof Error ? error.message : "Unknown decode error.",
       });
     }
   }
@@ -856,7 +903,7 @@ export async function decodeRawEntriesToCsv(
       currentLabel: "Preparing CSV download",
     });
 
-    const artifact = await buildDownloadArtifact(allOutputFiles);
+    const artifact = await buildDownloadArtifact(allOutputFiles, outputMode);
     triggerBlobDownload(artifact.blob, artifact.fileName);
     downloadedFileName = artifact.fileName;
   }
@@ -864,7 +911,9 @@ export async function decodeRawEntriesToCsv(
   emitProgress({
     phase: "done",
     completed: total,
-    currentLabel: downloadedFileName ? `Downloaded ${downloadedFileName}` : "No decoded files were generated",
+    currentLabel: downloadedFileName
+      ? `Downloaded ${downloadedFileName}`
+      : "No decoded files were generated",
   });
 
   return {
@@ -872,12 +921,4 @@ export async function decodeRawEntriesToCsv(
     failures,
     downloadedFileName,
   };
-}
-
-// Read optional export metadata from a selected ZIP file for preview in the UI.
-export async function readMetadataPreviewFromZip(file: File) {
-  const archive = await JSZip.loadAsync(file);
-  const metadataEntry = archive.file(/export_metadata\.txt$/i)[0];
-  if (!metadataEntry) return "";
-  return await readTextFromBlob(await metadataEntry.async("blob"));
 }

@@ -3,8 +3,8 @@ import {
   collectRawInputEntries,
   decodeRawEntriesToCsv,
   EMPTY_PROGRESS,
-  readMetadataPreviewFromZip,
   type DecodeBatchResult,
+  type DecodeOutputMode,
   type ProgressSnapshot,
   type RawInputEntry,
 } from "./decoderUtils";
@@ -14,10 +14,9 @@ type QueueSummary = {
   sourceFileCount: number;
   rawEntryCount: number;
   rejectedNames: string[];
-  metadataPreview: string;
 };
 
-const ACCEPTED_FILE_TYPES = ".bin,.gz,.gzip,.zip";
+const ACCEPTED_FILE_TYPES = ".bin,.bin.gz";
 
 function formatProgressLabel(progress: ProgressSnapshot) {
   if (progress.phase === "idle") return "Waiting for files";
@@ -35,12 +34,12 @@ export default function DecoderPage() {
     sourceFileCount: 0,
     rawEntryCount: 0,
     rejectedNames: [],
-    metadataPreview: "",
   });
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState<ProgressSnapshot>(EMPTY_PROGRESS);
   const [result, setResult] = useState<DecodeBatchResult | null>(null);
   const [error, setError] = useState("");
+  const [outputMode, setOutputMode] = useState<DecodeOutputMode>("sensor");
 
   const hasQueue = queueEntries.length > 0;
   const progressLabel = useMemo(() => formatProgressLabel(progress), [progress]);
@@ -55,19 +54,16 @@ export default function DecoderPage() {
 
     try {
       const { entries, rejectedNames } = await collectRawInputEntries(files);
-      const zipFile = files.find((file) => /\.zip$/i.test(file.name));
-      const metadataPreview = zipFile ? await readMetadataPreviewFromZip(zipFile) : "";
 
       setQueueEntries(entries);
       setSummary({
         sourceFileCount: files.length,
         rawEntryCount: entries.length,
         rejectedNames,
-        metadataPreview,
       });
 
       if (entries.length === 0) {
-        setError("No supported .bin, .bin.gz, .gzip, or .zip files were found in the selected input.");
+        setError("No supported .bin or .bin.gz files were found in the selected input.");
       }
     } catch (err) {
       setQueueEntries([]);
@@ -75,7 +71,6 @@ export default function DecoderPage() {
         sourceFileCount: 0,
         rawEntryCount: 0,
         rejectedNames: [],
-        metadataPreview: "",
       });
       setError(err instanceof Error ? err.message : "Failed to read selected files.");
     } finally {
@@ -96,7 +91,7 @@ export default function DecoderPage() {
     setResult(null);
 
     try {
-      const nextResult = await decodeRawEntriesToCsv(queueEntries, setProgress);
+      const nextResult = await decodeRawEntriesToCsv(queueEntries, outputMode, setProgress);
       setResult(nextResult);
 
       if (!nextResult.downloadedFileName && nextResult.failures.length > 0) {
@@ -115,7 +110,6 @@ export default function DecoderPage() {
       sourceFileCount: 0,
       rawEntryCount: 0,
       rejectedNames: [],
-      metadataPreview: "",
     });
     setResult(null);
     setProgress(EMPTY_PROGRESS);
@@ -153,11 +147,35 @@ export default function DecoderPage() {
           />
 
           <label htmlFor="decoder-file-input" className="decoder-dropzone">
-            <span className="decoder-dropzone-title">Choose raw files or an export ZIP</span>
+            <span className="decoder-dropzone-title">Choose raw .bin or .bin.gz files</span>
             <span className="decoder-dropzone-copy">
-              Supported input types: .bin, .bin.gz, .gzip, and .zip
+              Supported input types: .bin and .bin.gz only
             </span>
           </label>
+        </div>
+
+        <div className="decoder-output-mode-panel">
+          <span className="decoder-output-mode-label">Decoded output</span>
+
+          {/* Toggle whether decoded node files stay combined or split by sensor. */}
+          <label className="decoder-output-mode-toggle">
+            <input
+              type="checkbox"
+              checked={outputMode === "sensor"}
+              onChange={(event) =>
+                setOutputMode(event.target.checked ? "sensor" : "node")
+              }
+              disabled={processing}
+            />
+            <span className="decoder-output-mode-copy">
+              Split decoded node files into separate sensor CSVs
+            </span>
+          </label>
+
+          <p className="decoder-output-mode-help">
+            Checked: create separate accelerometer, inclinometer, and temperature CSV files.
+            Unchecked: keep each decoded node file as one combined CSV.
+          </p>
         </div>
 
         <div className="decoder-summary-grid">
@@ -178,13 +196,6 @@ export default function DecoderPage() {
         {summary.rejectedNames.length > 0 && (
           <div className="decoder-alert warning">
             Ignored unsupported files: {summary.rejectedNames.join(", ")}
-          </div>
-        )}
-
-        {summary.metadataPreview && (
-          <div className="decoder-metadata-panel">
-            <h3>Export Metadata Preview</h3>
-            <pre>{summary.metadataPreview}</pre>
           </div>
         )}
 

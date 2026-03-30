@@ -125,6 +125,53 @@
   color: #5c6f7f;
 }
 
+.decoder-output-mode-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid #d9e1e8;
+  border-radius: 16px;
+  background: #fbfcfd;
+  padding: 16px;
+}
+
+.decoder-output-mode-label {
+  font-size: 13px;
+  font-weight: 700;
+  color: #5c6f7f;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.decoder-output-mode-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  width: fit-content;
+  color: #11212d;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.decoder-output-mode-toggle input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: #11212d;
+}
+
+.decoder-output-mode-copy {
+  line-height: 1.4;
+}
+
+.decoder-output-mode-help {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #5c6f7f;
+}
+
 .decoder-summary-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(160px, 1fr));
