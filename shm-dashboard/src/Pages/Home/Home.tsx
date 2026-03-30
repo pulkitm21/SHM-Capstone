@@ -17,14 +17,18 @@ import {
 
 import "./Home.css";
 
-type BackendHealthBadgeState = "ONLINE" | "OFFLINE";
+type BackendHealthBadgeState = "ONLINE" | "DEGRADED" | "OFFLINE";
 
 function getBackendPillClass(state: BackendHealthBadgeState) {
-  return state === "ONLINE" ? "info" : "high";
+  if (state === "ONLINE") return "info";
+  if (state === "DEGRADED") return "warn";
+  return "high";
 }
 
 function getBackendBadgeLabel(state: BackendHealthBadgeState) {
-  return state === "ONLINE" ? "Online" : "Offline";
+  if (state === "ONLINE") return "Online";
+  if (state === "DEGRADED") return "Degraded";
+  return "Offline";
 }
 
 function formatSubsystemHealth(value: boolean) {
@@ -34,6 +38,10 @@ function formatSubsystemHealth(value: boolean) {
 function getBackendWarningMessage(state: BackendHealthBadgeState) {
   if (state === "OFFLINE") {
     return "Backend unavailable. Live status, node updates, and storage data may be stale.";
+  }
+
+  if (state === "DEGRADED") {
+    return "Backend reachable, but one or more backend subsystems are unavailable.";
   }
 
   return "";
@@ -99,9 +107,8 @@ export default function Home() {
       clearReconnectTimeout();
       eventSource?.close();
 
-      eventSource = new EventSource(
-        `${import.meta.env.VITE_API_BASE_URL}/api/events/health`
-      );
+      // Use a same-origin path so local dev works through the Vite proxy.
+      eventSource = new EventSource("/api/events/health");
 
       eventSource.onmessage = (event) => {
         if (!mounted) return;
@@ -110,7 +117,10 @@ export default function Home() {
           const data: HealthResponse = JSON.parse(event.data);
           const receivedAt = new Date().toLocaleString();
 
-          setBackendHealthState("ONLINE");
+          // Distinguish between backend reachable but degraded vs truly offline.
+          setBackendHealthState(
+            data.status === "DEGRADED" ? "DEGRADED" : "ONLINE"
+          );
           setMqttHealthy(Boolean(data.mqtt));
           setFaultDbHealthy(Boolean(data.fault_db));
           setLastUpdate(receivedAt);
@@ -118,7 +128,7 @@ export default function Home() {
         } catch {
           const receivedAt = new Date().toLocaleString();
 
-          setBackendHealthState("ONLINE");
+          setBackendHealthState("DEGRADED");
           setMqttHealthy(false);
           setFaultDbHealthy(false);
           setLastUpdate(receivedAt);
@@ -233,7 +243,7 @@ export default function Home() {
   );
 
   const backendWarningMessage = getBackendWarningMessage(backendHealthState);
-  const showBackendWarning = backendHealthState === "OFFLINE";
+  const showBackendWarning = backendHealthState !== "ONLINE";
 
   return (
     <div className="home-page">
