@@ -29,7 +29,7 @@ const navItems: NavItem[] = [
 const DEFAULT_DASHBOARD_TITLE = "Cape Scott, BC";
 
 const Navbar = () => {
-  const { user, isAdmin, logout } = useAuth();
+  const { isAdmin, logout } = useAuth();
 
   // Stores the shared dashboard title loaded from the backend.
   const [dashboardTitle, setDashboardTitle] = useState(DEFAULT_DASHBOARD_TITLE);

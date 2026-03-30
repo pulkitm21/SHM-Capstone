@@ -1,4 +1,5 @@
 import json
+import math
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,6 +52,25 @@ def _fresh_node_sensor_runtime():
         "inclinometer": _fresh_sensor_runtime(),
         "temperature": _fresh_sensor_runtime(),
     }
+
+
+# Return True when a value can be parsed as NaN.
+def _is_nan_value(value) -> bool:
+    try:
+        return math.isnan(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+# Normalize inclinometer payloads so both flat and nested packet shapes work.
+def _as_sample_list(value):
+    if not isinstance(value, list) or not value:
+        return []
+
+    if isinstance(value[0], list):
+        return value
+
+    return [value]
 
 
 # Clamp the normalized X position to the valid node map range.
@@ -282,6 +302,7 @@ def update_node_position(node_id: int, x: float, y: float):
     return None
 
 
+# Update the live per-sensor runtime cache using one decoded MQTT packet.
 def update_sensor_runtime(serial: str, packet: dict):
     now_iso = _now_iso()
 
@@ -292,19 +313,41 @@ def update_sensor_runtime(serial: str, packet: dict):
         runtime = _SENSOR_RUNTIME_CACHE[serial]
 
         accel = packet.get("a")
-        if accel:
+        if isinstance(accel, list) and accel:
             runtime["accelerometer"]["last_packet_ts"] = now_iso
-            runtime["accelerometer"]["last_valid_data_ts"] = now_iso
 
-        inclin = packet.get("i")
+            accel_has_nan = any(
+                isinstance(sample, list) and any(_is_nan_value(v) for v in sample[1:4])
+                for sample in accel
+            )
+
+            if accel_has_nan:
+                runtime["accelerometer"]["last_nan_ts"] = now_iso
+            else:
+                runtime["accelerometer"]["last_valid_data_ts"] = now_iso
+
+        inclin = _as_sample_list(packet.get("i"))
         if inclin:
             runtime["inclinometer"]["last_packet_ts"] = now_iso
-            runtime["inclinometer"]["last_valid_data_ts"] = now_iso
+
+            inclin_has_nan = any(
+                isinstance(sample, list) and any(_is_nan_value(v) for v in sample[1:])
+                for sample in inclin
+            )
+
+            if inclin_has_nan:
+                runtime["inclinometer"]["last_nan_ts"] = now_iso
+            else:
+                runtime["inclinometer"]["last_valid_data_ts"] = now_iso
 
         temp = packet.get("T")
-        if temp is not None:
+        if isinstance(temp, list) and len(temp) > 1:
             runtime["temperature"]["last_packet_ts"] = now_iso
-            runtime["temperature"]["last_valid_data_ts"] = now_iso
+
+            if _is_nan_value(temp[1]):
+                runtime["temperature"]["last_nan_ts"] = now_iso
+            else:
+                runtime["temperature"]["last_valid_data_ts"] = now_iso
 
         for sensor in runtime.values():
             sensor["updated_at"] = now_iso
@@ -312,6 +355,7 @@ def update_sensor_runtime(serial: str, packet: dict):
     _flush_runtime_to_disk()
 
 
+# Flush the in-memory runtime cache to disk periodically.
 def _flush_runtime_to_disk():
     global _LAST_FLUSH_TIME
 
@@ -330,7 +374,13 @@ def _flush_runtime_to_disk():
     _LAST_FLUSH_TIME = now
 
 
+# Return one node's sensor runtime, preferring the in-memory cache.
 def get_sensor_runtime(serial: str):
+    with _SENSOR_RUNTIME_LOCK:
+        cached = _SENSOR_RUNTIME_CACHE.get(serial)
+        if isinstance(cached, dict):
+            return json.loads(json.dumps(cached))
+
     raw = _load_registry_raw()
 
     for node in raw["nodes"]:
