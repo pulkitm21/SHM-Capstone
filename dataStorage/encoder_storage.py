@@ -58,6 +58,10 @@ _last_clock_warn: dict[str, float] = {}
 node_state: dict = {}
 data_buffer: queue.Queue = queue.Queue(maxsize=QUEUE_MAX_SIZE)
 consumer_thread: threading.Thread | None = None
+consumer_threads: list[threading.Thread] = []
+_CONSUMER_WORKER_COUNT = 4
+_node_locks: dict[str, threading.Lock] = {}
+_node_locks_guard = threading.Lock()
 
 
 def _check_ssd() -> bool:
@@ -174,6 +178,18 @@ def _fresh_state() -> dict:
         "header_written": False,
         "last_absolute_record_ts_us": 0,
     }
+
+
+def _get_node_lock(node_id: str) -> threading.Lock:
+    """Return a per-node write lock so different nodes can write concurrently
+    while writes for the same node remain serialized.
+    """
+    with _node_locks_guard:
+        lock = _node_locks.get(node_id)
+        if lock is None:
+            lock = threading.Lock()
+            _node_locks[node_id] = lock
+        return lock
 
 
 def get_hourly_filepath(node_id: str) -> tuple[str, str]:
@@ -633,66 +649,67 @@ def compress_and_replace(node_id: str, bin_path: str):
 
 
 def write_record(node_id: str, data: dict):
-    if not _check_ssd():
-        return
+    with _get_node_lock(node_id):
+        if not _check_ssd():
+            return
 
-    hour_str, filepath = get_hourly_filepath(node_id)
+        hour_str, filepath = get_hourly_filepath(node_id)
 
-    if node_id not in node_state:
-        node_state[node_id] = _fresh_state()
-    state = node_state[node_id]
+        if node_id not in node_state:
+            node_state[node_id] = _fresh_state()
+        state = node_state[node_id]
 
-    if state["file_hour"] != hour_str:
-        if state["file_hour"] is not None:
-            old_bin = os.path.join(DATA_DIR, f"data_{node_id}_{state['file_hour']}.bin")
-            if os.path.exists(old_bin):
-                compress_and_replace(node_id, old_bin)
+        if state["file_hour"] != hour_str:
+            if state["file_hour"] is not None:
+                old_bin = os.path.join(DATA_DIR, f"data_{node_id}_{state['file_hour']}.bin")
+                if os.path.exists(old_bin):
+                    compress_and_replace(node_id, old_bin)
 
-        state["file_hour"] = hour_str
-        state["is_first"] = True
-        state["header_written"] = False
-        state["last_absolute_record_ts_us"] = 0
-
-        if os.path.exists(filepath):
-            state["header_written"] = _recover_active_hourly_file(node_id, filepath)
-            print(f"[{node_id}] Resuming hourly file: {filepath} (next record forced ABSOLUTE)")
-        else:
-            print(f"[{node_id}] New hourly file: {filepath}")
-
-    if not state["is_first"]:
-        force_abs, reason = needs_absolute_record(data, state)
-        if not force_abs:
-            packet_max_ts_us = _packet_max_ts_us(data)
-            last_abs_ts_us = state.get("last_absolute_record_ts_us", 0)
-            if (
-                packet_max_ts_us
-                and last_abs_ts_us
-                and (packet_max_ts_us - last_abs_ts_us) >= int(ABSOLUTE_RECORD_INTERVAL_S * TS_SCALE)
-            ):
-                force_abs = True
-                reason = f"absolute refresh interval {ABSOLUTE_RECORD_INTERVAL_S:.0f} s reached"
-        if force_abs:
-            print(f"[{node_id}] Forcing ABSOLUTE record: {reason}")
+            state["file_hour"] = hour_str
             state["is_first"] = True
+            state["header_written"] = False
+            state["last_absolute_record_ts_us"] = 0
 
-    if state["is_first"]:
-        record = encode_first_record(data, state)
-        state["is_first"] = False
-        state["last_absolute_record_ts_us"] = _packet_max_ts_us(data)
-    else:
-        record = encode_delta_record(data, state)
+            if os.path.exists(filepath):
+                state["header_written"] = _recover_active_hourly_file(node_id, filepath)
+                print(f"[{node_id}] Resuming hourly file: {filepath} (next record forced ABSOLUTE)")
+            else:
+                print(f"[{node_id}] New hourly file: {filepath}")
 
-    try:
-        with open(filepath, "ab") as f:
-            if not state["header_written"]:
-                f.write(struct.pack("<B", FILE_FORMAT_VERSION))
-                state["header_written"] = True
-            f.write(record)
-    except OSError as e:
-        state["header_written"] = False
-        state["is_first"] = True
-        _ssd_ok_reset()
-        _warn_ssd(f"write failed for {node_id}: {e}")
+        if not state["is_first"]:
+            force_abs, reason = needs_absolute_record(data, state)
+            if not force_abs:
+                packet_max_ts_us = _packet_max_ts_us(data)
+                last_abs_ts_us = state.get("last_absolute_record_ts_us", 0)
+                if (
+                    packet_max_ts_us
+                    and last_abs_ts_us
+                    and (packet_max_ts_us - last_abs_ts_us) >= int(ABSOLUTE_RECORD_INTERVAL_S * TS_SCALE)
+                ):
+                    force_abs = True
+                    reason = f"absolute refresh interval {ABSOLUTE_RECORD_INTERVAL_S:.0f} s reached"
+            if force_abs:
+                print(f"[{node_id}] Forcing ABSOLUTE record: {reason}")
+                state["is_first"] = True
+
+        if state["is_first"]:
+            record = encode_first_record(data, state)
+            state["is_first"] = False
+            state["last_absolute_record_ts_us"] = _packet_max_ts_us(data)
+        else:
+            record = encode_delta_record(data, state)
+
+        try:
+            with open(filepath, "ab") as f:
+                if not state["header_written"]:
+                    f.write(struct.pack("<B", FILE_FORMAT_VERSION))
+                    state["header_written"] = True
+                f.write(record)
+        except OSError as e:
+            state["header_written"] = False
+            state["is_first"] = True
+            _ssd_ok_reset()
+            _warn_ssd(f"write failed for {node_id}: {e}")
 
 
 def consumer_worker():
@@ -722,11 +739,22 @@ def consumer_worker():
 
 
 def start_consumer_thread() -> threading.Thread:
-    """Start the background consumer once and return the thread."""
-    global consumer_thread
-    if consumer_thread is None or not consumer_thread.is_alive():
-        consumer_thread = threading.Thread(target=consumer_worker, daemon=True)
-        consumer_thread.start()
+    """Start background consumers once and return the first worker thread."""
+    global consumer_thread, consumer_threads
+
+    alive = [t for t in consumer_threads if t.is_alive()]
+    if alive:
+        consumer_threads = alive
+        consumer_thread = consumer_threads[0]
+        return consumer_thread
+
+    consumer_threads = []
+    for idx in range(_CONSUMER_WORKER_COUNT):
+        t = threading.Thread(target=consumer_worker, daemon=True, name=f"encoder-consumer-{idx}")
+        t.start()
+        consumer_threads.append(t)
+
+    consumer_thread = consumer_threads[0]
     return consumer_thread
 
 
