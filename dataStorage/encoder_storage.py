@@ -7,6 +7,8 @@ import threading
 import gzip
 import math
 
+from fault_logger import log_fault_events
+
 DATA_DIR = "/mnt/ssd/data"
 SSD_MOUNT = "/mnt/ssd"
 
@@ -28,8 +30,19 @@ CHANGED_NAN_Y = 0x20
 CHANGED_NAN_Z = 0x40
 CHANGED_NAN_TEMP = CHANGED_NAN_X
 
+# Backend data-management fault codes.
+FAULT_STORAGE_UNAVAILABLE = 100
+FAULT_STORAGE_RESTORED = 101
+FAULT_STORAGE_LOW_SPACE = 102
+FAULT_STORAGE_SPACE_RECOVERED = 103
+FAULT_BINARY_WRITE_FAILED = 104
+FAULT_ARCHIVE_COMPRESSION_FAILED = 105
+FAULT_ACTIVE_FILE_RECOVERY = 106
+FAULT_STORAGE_QUEUE_OVERFLOW = 107
+FAULT_INVALID_TIMESTAMP = 108
+
 # Queue setting used by the listener/consumer boundary.
-QUEUE_MAX_SIZE = 1000
+# QUEUE_MAX_SIZE = 1000
 
 # -------------------------------------------------------------------
 # Gzip compression settings
@@ -56,11 +69,51 @@ _clock_warn_interval = 10.0
 _last_clock_warn: dict[str, float] = {}
 
 node_state: dict = {}
-data_buffer: queue.Queue = queue.Queue(maxsize=QUEUE_MAX_SIZE)
+data_buffer: queue.Queue = queue.Queue()
 consumer_thread: threading.Thread | None = None
+consumer_threads: list[threading.Thread] = []
+_CONSUMER_WORKER_COUNT = 4
+_node_locks: dict[str, threading.Lock] = {}
+_node_locks_guard = threading.Lock()
+
+_storage_fault_state: dict[str, dict[str, bool]] = {}
+_storage_fault_state_guard = threading.Lock()
 
 
-def _check_ssd() -> bool:
+def _storage_fault_flags(node_id: str) -> dict[str, bool]:
+    with _storage_fault_state_guard:
+        return _storage_fault_state.setdefault(
+            node_id,
+            {
+                "storage_unavailable": False,
+                "storage_low_space": False,
+            },
+        )
+
+
+def _log_storage_fault(node_id: str, code: int, ts: str | None = None) -> None:
+    try:
+        log_fault_events(node_id, [(code, ts or now_iso())])
+    except Exception as e:
+        print(f"[fault_logger] Failed to log storage fault for {node_id}: {e}")
+
+
+def _set_stateful_storage_fault(
+    node_id: str,
+    flag_key: str,
+    active_code: int,
+    resolved_code: int,
+    is_active: bool,
+) -> None:
+    flags = _storage_fault_flags(node_id)
+    prev = flags.get(flag_key, False)
+    if prev == is_active:
+        return
+    flags[flag_key] = is_active
+    _log_storage_fault(node_id, active_code if is_active else resolved_code)
+
+
+def _check_ssd(node_id: str | None = None) -> bool:
     """Return True if the SSD is mounted and the data directory is writable."""
     global _ssd_ok, _ssd_last_warn
     mounted = os.path.isdir(SSD_MOUNT) and os.path.ismount(SSD_MOUNT)
@@ -72,17 +125,65 @@ def _check_ssd() -> bool:
             if free_mb < 10:
                 _warn_ssd(f"SSD critically low on space: {free_mb:.1f} MB free")
                 _ssd_ok = False
+                if node_id:
+                    _set_stateful_storage_fault(
+                        node_id,
+                        "storage_low_space",
+                        FAULT_STORAGE_LOW_SPACE,
+                        FAULT_STORAGE_SPACE_RECOVERED,
+                        True,
+                    )
+                    _set_stateful_storage_fault(
+                        node_id,
+                        "storage_unavailable",
+                        FAULT_STORAGE_UNAVAILABLE,
+                        FAULT_STORAGE_RESTORED,
+                        True,
+                    )
                 return False
+
             if not _ssd_ok:
                 print("[SSD] Storage available — resuming writes.")
             _ssd_ok = True
+            if node_id:
+                _set_stateful_storage_fault(
+                    node_id,
+                    "storage_unavailable",
+                    FAULT_STORAGE_UNAVAILABLE,
+                    FAULT_STORAGE_RESTORED,
+                    False,
+                )
+                _set_stateful_storage_fault(
+                    node_id,
+                    "storage_low_space",
+                    FAULT_STORAGE_LOW_SPACE,
+                    FAULT_STORAGE_SPACE_RECOVERED,
+                    False,
+                )
             return True
         except OSError as e:
             _warn_ssd(f"SSD mounted but not writable: {e}")
             _ssd_ok = False
+            if node_id:
+                _set_stateful_storage_fault(
+                    node_id,
+                    "storage_unavailable",
+                    FAULT_STORAGE_UNAVAILABLE,
+                    FAULT_STORAGE_RESTORED,
+                    True,
+                )
             return False
+
     _warn_ssd("SSD not mounted at /mnt/ssd — sensor data will not be saved.")
     _ssd_ok = False
+    if node_id:
+        _set_stateful_storage_fault(
+            node_id,
+            "storage_unavailable",
+            FAULT_STORAGE_UNAVAILABLE,
+            FAULT_STORAGE_RESTORED,
+            True,
+        )
     return False
 
 
@@ -115,6 +216,7 @@ def parse_iso_timestamp(raw_t: str, node_id: str) -> float | None:
         if now - last >= _clock_warn_interval:
             _last_clock_warn[node_id] = now
             print(f"[{node_id}] WARNING: cannot parse timestamp {raw_t!r} — packet dropped.")
+            _log_storage_fault(node_id, FAULT_INVALID_TIMESTAMP)
         return None
 
     if not (TS_MIN <= ts <= TS_MAX):
@@ -130,6 +232,7 @@ def parse_iso_timestamp(raw_t: str, node_id: str) -> float | None:
                 f"[{node_id}] WARNING: implausible timestamp {raw_t!r} "
                 f"({date_str}) — clock not synced, packet dropped."
             )
+            _log_storage_fault(node_id, FAULT_INVALID_TIMESTAMP)
         return None
 
     return ts
@@ -176,6 +279,18 @@ def _fresh_state() -> dict:
     }
 
 
+def _get_node_lock(node_id: str) -> threading.Lock:
+    """Return a per-node write lock so different nodes can write concurrently
+    while writes for the same node remain serialized.
+    """
+    with _node_locks_guard:
+        lock = _node_locks.get(node_id)
+        if lock is None:
+            lock = threading.Lock()
+            _node_locks[node_id] = lock
+        return lock
+
+
 def get_hourly_filepath(node_id: str) -> tuple[str, str]:
     hour_str = datetime.now().strftime("%Y%m%d_%H")
     return hour_str, os.path.join(DATA_DIR, f"data_{node_id}_{hour_str}.bin")
@@ -208,7 +323,9 @@ def needs_absolute_record(data: dict, state: dict) -> tuple[bool, str]:
 
         prev = list(state["accel"]["xyz_prev"])
         for s in data["a"]:
-            for idx, (raw, scale, name) in enumerate(((s[1], ACCEL_SCALE, "x"), (s[2], ACCEL_SCALE, "y"), (s[3], ACCEL_SCALE, "z"))):
+            for idx, (raw, scale, name) in enumerate(
+                ((s[1], ACCEL_SCALE, "x"), (s[2], ACCEL_SCALE, "y"), (s[3], ACCEL_SCALE, "z"))
+            ):
                 if _is_nan_value(raw):
                     continue
                 cur = int(float(raw) * scale)
@@ -224,7 +341,9 @@ def needs_absolute_record(data: dict, state: dict) -> tuple[bool, str]:
             return True, f"inclin timestamp gap {gap:.1f} s"
         prev = list(state["inclin"]["xyz_prev"])
         for s in data["i"]:
-            for idx, (raw, scale, name) in enumerate(((s[1], INCLIN_SCALE, "roll"), (s[2], INCLIN_SCALE, "pitch"), (s[3], INCLIN_SCALE, "yaw"))):
+            for idx, (raw, scale, name) in enumerate(
+                ((s[1], INCLIN_SCALE, "roll"), (s[2], INCLIN_SCALE, "pitch"), (s[3], INCLIN_SCALE, "yaw"))
+            ):
                 if _is_nan_value(raw):
                     continue
                 cur = int(float(raw) * scale)
@@ -292,6 +411,7 @@ def _recover_active_hourly_file(node_id: str, filepath: str) -> bool:
         size = os.path.getsize(filepath)
     except OSError as e:
         print(f"[{node_id}] WARNING: cannot inspect existing file {filepath}: {e}")
+        _log_storage_fault(node_id, FAULT_ACTIVE_FILE_RECOVERY)
         return False
 
     if size == 0:
@@ -350,6 +470,7 @@ def _recover_active_hourly_file(node_id: str, filepath: str) -> bool:
                         f"[{node_id}] Recovered active file {os.path.basename(filepath)}: "
                         f"truncated incomplete tail from {size} to {record_start} bytes."
                     )
+                    _log_storage_fault(node_id, FAULT_ACTIVE_FILE_RECOVERY)
                     return True
 
                 last_good_offset = f.tell()
@@ -360,9 +481,11 @@ def _recover_active_hourly_file(node_id: str, filepath: str) -> bool:
                     f"[{node_id}] Recovered active file {os.path.basename(filepath)}: "
                     f"trimmed trailing bytes from {size} to {last_good_offset}."
                 )
+                _log_storage_fault(node_id, FAULT_ACTIVE_FILE_RECOVERY)
 
     except OSError as e:
         print(f"[{node_id}] WARNING: failed to recover existing file {filepath}: {e}")
+        _log_storage_fault(node_id, FAULT_ACTIVE_FILE_RECOVERY)
 
     return True
 
@@ -606,7 +729,7 @@ def _packet_max_ts_us(data: dict) -> int:
 
 
 def compress_and_replace(node_id: str, bin_path: str):
-    if not _check_ssd():
+    if not _check_ssd(node_id):
         print(f"[{node_id}] Skipping compression of {os.path.basename(bin_path)} — SSD unavailable")
         return
     gz_path = bin_path + ".gz"
@@ -630,69 +753,80 @@ def compress_and_replace(node_id: str, bin_path: str):
         )
     except Exception as e:
         print(f"[{node_id}] WARNING: compression failed for {bin_path}: {e}")
+        _log_storage_fault(node_id, FAULT_ARCHIVE_COMPRESSION_FAILED)
 
 
 def write_record(node_id: str, data: dict):
-    if not _check_ssd():
-        return
+    with _get_node_lock(node_id):
+        if not _check_ssd(node_id):
+            return
 
-    hour_str, filepath = get_hourly_filepath(node_id)
+        hour_str, filepath = get_hourly_filepath(node_id)
 
-    if node_id not in node_state:
-        node_state[node_id] = _fresh_state()
-    state = node_state[node_id]
+        if node_id not in node_state:
+            node_state[node_id] = _fresh_state()
+        state = node_state[node_id]
 
-    if state["file_hour"] != hour_str:
-        if state["file_hour"] is not None:
-            old_bin = os.path.join(DATA_DIR, f"data_{node_id}_{state['file_hour']}.bin")
-            if os.path.exists(old_bin):
-                compress_and_replace(node_id, old_bin)
+        if state["file_hour"] != hour_str:
+            if state["file_hour"] is not None:
+                old_bin = os.path.join(DATA_DIR, f"data_{node_id}_{state['file_hour']}.bin")
+                if os.path.exists(old_bin):
+                    compress_and_replace(node_id, old_bin)
 
-        state["file_hour"] = hour_str
-        state["is_first"] = True
-        state["header_written"] = False
-        state["last_absolute_record_ts_us"] = 0
-
-        if os.path.exists(filepath):
-            state["header_written"] = _recover_active_hourly_file(node_id, filepath)
-            print(f"[{node_id}] Resuming hourly file: {filepath} (next record forced ABSOLUTE)")
-        else:
-            print(f"[{node_id}] New hourly file: {filepath}")
-
-    if not state["is_first"]:
-        force_abs, reason = needs_absolute_record(data, state)
-        if not force_abs:
-            packet_max_ts_us = _packet_max_ts_us(data)
-            last_abs_ts_us = state.get("last_absolute_record_ts_us", 0)
-            if (
-                packet_max_ts_us
-                and last_abs_ts_us
-                and (packet_max_ts_us - last_abs_ts_us) >= int(ABSOLUTE_RECORD_INTERVAL_S * TS_SCALE)
-            ):
-                force_abs = True
-                reason = f"absolute refresh interval {ABSOLUTE_RECORD_INTERVAL_S:.0f} s reached"
-        if force_abs:
-            print(f"[{node_id}] Forcing ABSOLUTE record: {reason}")
+            state["file_hour"] = hour_str
             state["is_first"] = True
+            state["header_written"] = False
+            state["last_absolute_record_ts_us"] = 0
 
-    if state["is_first"]:
-        record = encode_first_record(data, state)
-        state["is_first"] = False
-        state["last_absolute_record_ts_us"] = _packet_max_ts_us(data)
-    else:
-        record = encode_delta_record(data, state)
+            if os.path.exists(filepath):
+                state["header_written"] = _recover_active_hourly_file(node_id, filepath)
+                _log_storage_fault(node_id, FAULT_ACTIVE_FILE_RECOVERY)
+                print(f"[{node_id}] Resuming hourly file: {filepath} (next record forced ABSOLUTE)")
+            else:
+                print(f"[{node_id}] New hourly file: {filepath}")
 
-    try:
-        with open(filepath, "ab") as f:
-            if not state["header_written"]:
-                f.write(struct.pack("<B", FILE_FORMAT_VERSION))
-                state["header_written"] = True
-            f.write(record)
-    except OSError as e:
-        state["header_written"] = False
-        state["is_first"] = True
-        _ssd_ok_reset()
-        _warn_ssd(f"write failed for {node_id}: {e}")
+        if not state["is_first"]:
+            force_abs, reason = needs_absolute_record(data, state)
+            if not force_abs:
+                packet_max_ts_us = _packet_max_ts_us(data)
+                last_abs_ts_us = state.get("last_absolute_record_ts_us", 0)
+                if (
+                    packet_max_ts_us
+                    and last_abs_ts_us
+                    and (packet_max_ts_us - last_abs_ts_us) >= int(ABSOLUTE_RECORD_INTERVAL_S * TS_SCALE)
+                ):
+                    force_abs = True
+                    reason = f"absolute refresh interval {ABSOLUTE_RECORD_INTERVAL_S:.0f} s reached"
+            if force_abs:
+                print(f"[{node_id}] Forcing ABSOLUTE record: {reason}")
+                state["is_first"] = True
+
+        if state["is_first"]:
+            record = encode_first_record(data, state)
+            state["is_first"] = False
+            state["last_absolute_record_ts_us"] = _packet_max_ts_us(data)
+        else:
+            record = encode_delta_record(data, state)
+
+        try:
+            with open(filepath, "ab") as f:
+                if not state["header_written"]:
+                    f.write(struct.pack("<B", FILE_FORMAT_VERSION))
+                    state["header_written"] = True
+                f.write(record)
+        except OSError as e:
+            state["header_written"] = False
+            state["is_first"] = True
+            _ssd_ok_reset()
+            _warn_ssd(f"write failed for {node_id}: {e}")
+            _log_storage_fault(node_id, FAULT_BINARY_WRITE_FAILED)
+            _set_stateful_storage_fault(
+                node_id,
+                "storage_unavailable",
+                FAULT_STORAGE_UNAVAILABLE,
+                FAULT_STORAGE_RESTORED,
+                True,
+            )
 
 
 def consumer_worker():
@@ -722,11 +856,22 @@ def consumer_worker():
 
 
 def start_consumer_thread() -> threading.Thread:
-    """Start the background consumer once and return the thread."""
-    global consumer_thread
-    if consumer_thread is None or not consumer_thread.is_alive():
-        consumer_thread = threading.Thread(target=consumer_worker, daemon=True)
-        consumer_thread.start()
+    """Start background consumers once and return the first worker thread."""
+    global consumer_thread, consumer_threads
+
+    alive = [t for t in consumer_threads if t.is_alive()]
+    if alive:
+        consumer_threads = alive
+        consumer_thread = consumer_threads[0]
+        return consumer_thread
+
+    consumer_threads = []
+    for idx in range(_CONSUMER_WORKER_COUNT):
+        t = threading.Thread(target=consumer_worker, daemon=True, name=f"encoder-consumer-{idx}")
+        t.start()
+        consumer_threads.append(t)
+
+    consumer_thread = consumer_threads[0]
     return consumer_thread
 
 
@@ -737,7 +882,8 @@ def enqueue_packet(node_id: str, data: dict) -> bool:
         return True
     except queue.Full:
         print(
-            f"[{node_id}] WARNING: queue full ({QUEUE_MAX_SIZE} items) — "
+            f"[{node_id}] WARNING: queue full — "
             f"packet dropped. Check if consumer is stalled (disk full/unmounted?)."
         )
+        _log_storage_fault(node_id, FAULT_STORAGE_QUEUE_OVERFLOW)
         return False

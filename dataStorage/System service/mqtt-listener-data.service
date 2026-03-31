@@ -7,8 +7,8 @@ Wants=network-online.target
 Type=simple
 User=pi
 Group=pi
-WorkingDirectory=/home/pi/windturbine
-ExecStart=/usr/bin/python3 /home/pi/windturbine/mqtt_listener_data.py
+WorkingDirectory=/home/pi/shm-backend
+ExecStart=/usr/bin/python3 /home/pi/shm-backend/mqtt_listener_data.py
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1

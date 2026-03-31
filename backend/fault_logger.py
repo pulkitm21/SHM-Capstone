@@ -13,6 +13,8 @@ STATEFUL_FAULT_TYPES = {
     "ethernet_link",
     "mqtt_connection",
     "power_loss",
+    "backend_storage_availability",
+    "backend_storage_low_space",
 }
 
 
