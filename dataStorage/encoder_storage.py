@@ -122,7 +122,7 @@ def _check_ssd(node_id: str | None = None) -> bool:
             os.makedirs(DATA_DIR, exist_ok=True)
             stat = os.statvfs(SSD_MOUNT)
             free_mb = stat.f_bavail * stat.f_frsize / (1024 * 1024)
-            if free_mb < 10:
+            if free_mb < 1000:
                 _warn_ssd(f"SSD critically low on space: {free_mb:.1f} MB free")
                 _ssd_ok = False
                 if node_id:

@@ -29,8 +29,8 @@ Usage (called from delta_encoder.py):
 import os
 import struct
 import threading
-from datetime import datetime
-from time import time_ns
+from datetime import datetime, timedelta
+from time import time_ns, monotonic
 
 # -------------------------------------------------------------------
 # Configuration — must match delta_encoder.py directory layout
@@ -38,6 +38,13 @@ from time import time_ns
 RAW_DIR = "/mnt/ssd/raw"
 
 os.makedirs(RAW_DIR, exist_ok=True)
+
+# Retain raw backup files for roughly 2 years.
+RAW_RETENTION_DAYS = 730
+
+# Run cleanup periodically rather than on every packet.
+_CLEANUP_INTERVAL_S = 24 * 3600  # every 24 hours
+_last_cleanup_monotonic = 0.0
 
 # -------------------------------------------------------------------
 # Internal state
@@ -78,7 +85,6 @@ def _close_handle(node_id: str, handle: dict):
         print(f"[raw_backup_binary] [{node_id}] Warning: error closing file: {e}")
 
 
-
 def _get_file(node_id: str, hour_str: str):
     """
     Return the active file handle for this node+hour.
@@ -98,6 +104,99 @@ def _get_file(node_id: str, hour_str: str):
         handle = _open_file(node_id, hour_str)
         _handles[node_id] = handle
         return handle["file"]
+
+
+def _parse_rawbin_hour_from_name(filename: str) -> datetime | None:
+    """
+    Parse <node_id>_YYYYMMDD_HH.rawbin and return the file hour as datetime.
+    Returns None if the filename does not match the expected pattern.
+    """
+    if not filename.endswith(".rawbin"):
+        return None
+
+    stem = filename[:-7]  # remove ".rawbin"
+    try:
+        # Split from the right so node_id may contain underscores safely.
+        _, hour_str = stem.rsplit("_", 1)
+        # hour_str currently only has HH if we split once; need last 2 parts
+        parts = stem.rsplit("_", 2)
+        if len(parts) < 3:
+            return None
+        dt_str = f"{parts[-2]}_{parts[-1]}"
+        return datetime.strptime(dt_str, "%Y%m%d_%H")
+    except Exception:
+        return None
+
+
+def _cleanup_old_raw_files(force: bool = False) -> None:
+    """
+    Delete raw backup files older than the retention window.
+    Skips files that are currently open.
+    """
+    global _last_cleanup_monotonic
+
+    now_mono = monotonic()
+    if not force and (now_mono - _last_cleanup_monotonic) < _CLEANUP_INTERVAL_S:
+        return
+
+    cutoff = datetime.now() - timedelta(days=RAW_RETENTION_DAYS)
+
+    with _lock:
+        open_paths = {
+            os.path.abspath(handle["file"].name)
+            for handle in _handles.values()
+            if "file" in handle and not handle["file"].closed
+        }
+
+        try:
+            node_dirs = list(os.scandir(RAW_DIR))
+        except FileNotFoundError:
+            _last_cleanup_monotonic = now_mono
+            return
+        except Exception as e:
+            print(f"[raw_backup_binary] Warning: cleanup scan failed: {e}")
+            _last_cleanup_monotonic = now_mono
+            return
+
+        deleted = 0
+
+        for node_entry in node_dirs:
+            if not node_entry.is_dir():
+                continue
+
+            try:
+                file_entries = list(os.scandir(node_entry.path))
+            except Exception as e:
+                print(f"[raw_backup_binary] Warning: cleanup scan failed for {node_entry.path}: {e}")
+                continue
+
+            for file_entry in file_entries:
+                if not file_entry.is_file():
+                    continue
+
+                file_dt = _parse_rawbin_hour_from_name(file_entry.name)
+                if file_dt is None:
+                    continue
+                if file_dt >= cutoff:
+                    continue
+
+                abs_path = os.path.abspath(file_entry.path)
+                if abs_path in open_paths:
+                    continue
+
+                try:
+                    os.remove(file_entry.path)
+                    deleted += 1
+                except Exception as e:
+                    print(f"[raw_backup_binary] Warning: failed to delete old raw backup {file_entry.path}: {e}")
+
+        if deleted:
+            print(
+                f"[raw_backup_binary] Cleanup removed {deleted} raw backup file(s) "
+                f"older than {RAW_RETENTION_DAYS} days."
+            )
+
+    _last_cleanup_monotonic = now_mono
 
 
 # -------------------------------------------------------------------
@@ -133,6 +232,8 @@ def write_raw(node_id: str, payload: bytes) -> None:
     except Exception as e:
         print(f"[raw_backup_binary] [{node_id}] Warning: write failed: {e}")
 
+    # Periodic retention cleanup.
+    _cleanup_old_raw_files()
 
 
 def close_all() -> None:
