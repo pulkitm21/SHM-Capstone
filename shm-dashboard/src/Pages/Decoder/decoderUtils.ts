@@ -46,7 +46,8 @@ export const EMPTY_PROGRESS: ProgressSnapshot = {
   currentLabel: "",
 };
 
-const RAW_FILE_PATTERN = /\.bin(?:\.gz)?$/i;
+// Accept processed storage files and raw capture files.
+const SUPPORTED_FILE_PATTERN = /\.(?:bin(?:\.gz)?|rawbin)$/i;
 
 const TEMP_SCALE = 100;
 const ACCEL_SCALE = 10000;
@@ -151,6 +152,13 @@ class BinaryReader {
     return value;
   }
 
+  readUint32(label: string) {
+    this.ensure(4, label);
+    const value = this.view.getUint32(this.offset, true);
+    this.offset += 4;
+    return value;
+  }
+
   readInt16(label: string) {
     this.ensure(2, label);
     const value = this.view.getInt16(this.offset, true);
@@ -171,14 +179,38 @@ class BinaryReader {
     this.offset += 8;
     return value;
   }
+
+  readUint64(label: string) {
+    this.ensure(8, label);
+    const value = Number(this.view.getBigUint64(this.offset, true));
+    this.offset += 8;
+    return value;
+  }
+
+  readBytes(length: number, label: string) {
+    this.ensure(length, label);
+    const start = this.offset;
+    const end = this.offset + length;
+    this.offset = end;
+    return new Uint8Array(this.view.buffer.slice(start, end));
+  }
 }
 
-function isRawSensorFileName(name: string) {
-  return RAW_FILE_PATTERN.test(name);
+function isSupportedDecoderFileName(name: string) {
+  return SUPPORTED_FILE_PATTERN.test(name);
 }
 
+// Infer the decoder path from the uploaded file extension.
+function inferDecoderInputKind(name: string): "processed" | "raw" {
+  return name.toLowerCase().endsWith(".rawbin") ? "raw" : "processed";
+}
+
+// Strip only the known decoder file suffixes from output names.
 function normalizeRawOutputBaseName(name: string) {
-  return name.replace(/\.bin\.gz$/i, "").replace(/\.bin$/i, "");
+  return name
+    .replace(/\.bin\.gz$/i, "")
+    .replace(/\.rawbin$/i, "")
+    .replace(/\.bin$/i, "");
 }
 
 function arrayBufferToBlob(
@@ -265,6 +297,266 @@ function formatTimestampIso(tsUs: number) {
 
 function formatOptionalValue(value: number | null, decimals: number) {
   return value == null ? "" : value.toFixed(decimals);
+}
+
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function normalizeNumericValue(value: unknown): number | null {
+  if (value == null) {
+    return null;
+  }
+
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
+}
+
+function isTimestampLike(value: unknown) {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return false;
+    }
+
+    if (!Number.isNaN(Date.parse(trimmed))) {
+      return true;
+    }
+
+    return Number.isFinite(Number(trimmed));
+  }
+
+  return isFiniteNumber(value);
+}
+
+function parseTimestampValueToUs(value: unknown, fallbackUs: number) {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return fallbackUs;
+    }
+
+    const parsedDate = Date.parse(trimmed);
+    if (!Number.isNaN(parsedDate)) {
+      return Math.trunc(parsedDate * 1000);
+    }
+
+    const numeric = Number(trimmed);
+    if (!Number.isFinite(numeric)) {
+      return fallbackUs;
+    }
+
+    return parseTimestampValueToUs(numeric, fallbackUs);
+  }
+
+  if (!isFiniteNumber(value)) {
+    return fallbackUs;
+  }
+
+  if (value >= 1e14) {
+    return Math.trunc(value);
+  }
+
+  if (value >= 1e11) {
+    return Math.trunc(value * 1000);
+  }
+
+  if (value >= 1e9) {
+    return Math.trunc(value * TS_SCALE);
+  }
+
+  return fallbackUs;
+}
+
+function parseRawPacketTimestampUs(packet: Record<string, unknown>, fallbackUs: number) {
+  const packetTs = packet.t ?? packet.ts ?? packet.timestamp;
+  return parseTimestampValueToUs(packetTs, fallbackUs);
+}
+
+function buildRawAccelSample(sample: unknown[], fallbackUs: number): AccelSample | null {
+  if (sample.length >= 4 && isTimestampLike(sample[0])) {
+    return {
+      ts: parseTimestampValueToUs(sample[0], fallbackUs) / TS_SCALE,
+      tsUs: parseTimestampValueToUs(sample[0], fallbackUs),
+      x: normalizeNumericValue(sample[1]),
+      y: normalizeNumericValue(sample[2]),
+      z: normalizeNumericValue(sample[3]),
+    };
+  }
+
+  if (sample.length >= 3) {
+    return {
+      ts: fallbackUs / TS_SCALE,
+      tsUs: fallbackUs,
+      x: normalizeNumericValue(sample[0]),
+      y: normalizeNumericValue(sample[1]),
+      z: normalizeNumericValue(sample[2]),
+    };
+  }
+
+  return null;
+}
+
+function buildRawInclinSample(sample: unknown[], fallbackUs: number): InclinSample | null {
+  if (sample.length >= 4 && isTimestampLike(sample[0])) {
+    return {
+      ts: parseTimestampValueToUs(sample[0], fallbackUs) / TS_SCALE,
+      tsUs: parseTimestampValueToUs(sample[0], fallbackUs),
+      roll: normalizeNumericValue(sample[1]),
+      pitch: normalizeNumericValue(sample[2]),
+      yaw: normalizeNumericValue(sample[3]),
+    };
+  }
+
+  if (sample.length >= 3) {
+    return {
+      ts: fallbackUs / TS_SCALE,
+      tsUs: fallbackUs,
+      roll: normalizeNumericValue(sample[0]),
+      pitch: normalizeNumericValue(sample[1]),
+      yaw: normalizeNumericValue(sample[2]),
+    };
+  }
+
+  return null;
+}
+
+function buildRawTempSample(value: unknown, fallbackUs: number): TempSample | null {
+  if (value == null) {
+    return null;
+  }
+
+  if (Array.isArray(value)) {
+    if (value.length >= 2 && isTimestampLike(value[0])) {
+      const tsUs = parseTimestampValueToUs(value[0], fallbackUs);
+      return {
+        ts: tsUs / TS_SCALE,
+        tsUs,
+        tempC: normalizeNumericValue(value[1]),
+      };
+    }
+
+    if (value.length >= 1) {
+      return {
+        ts: fallbackUs / TS_SCALE,
+        tsUs: fallbackUs,
+        tempC: normalizeNumericValue(value[value.length - 1]),
+      };
+    }
+
+    return null;
+  }
+
+  return {
+    ts: fallbackUs / TS_SCALE,
+    tsUs: fallbackUs,
+    tempC: normalizeNumericValue(value),
+  };
+}
+
+function normalizeRawInclinEntries(value: unknown): unknown[][] {
+  if (!Array.isArray(value) || value.length === 0) {
+    return [];
+  }
+
+  if (Array.isArray(value[0])) {
+    return value.filter((entry): entry is unknown[] => Array.isArray(entry));
+  }
+
+  return [value];
+}
+
+function normalizeRawAccelEntries(value: unknown): unknown[][] {
+  if (!Array.isArray(value) || value.length === 0) {
+    return [];
+  }
+
+  if (Array.isArray(value[0])) {
+    return value.filter((entry): entry is unknown[] => Array.isArray(entry));
+  }
+
+  return [value];
+}
+
+function decodeRawArchiveRecords(bytes: ArrayBuffer) {
+  const reader = new BinaryReader(bytes);
+  const textDecoder = new TextDecoder();
+  const records: RecordEntry[] = [];
+  let recordIndex = 0;
+
+  while (reader.hasRemaining()) {
+    try {
+      const recvNs = reader.readUint64("raw receive timestamp");
+      const payloadLength = reader.readUint32("raw payload length");
+      const payloadBytes = reader.readBytes(payloadLength, "raw payload");
+      const fallbackUs = Math.trunc(recvNs / 1000);
+      const payloadText = textDecoder.decode(payloadBytes);
+      const packet = JSON.parse(payloadText) as Record<string, unknown>;
+      const packetTsUs = parseRawPacketTimestampUs(packet, fallbackUs);
+
+      const record: RecordEntry = {
+        recordIndex,
+        recordType: "ABSOLUTE",
+        accelSamples: [],
+        inclin: [],
+        temp: null,
+      };
+
+      for (const sample of normalizeRawAccelEntries(packet.a)) {
+        const accelSample = buildRawAccelSample(sample, packetTsUs);
+        if (accelSample) {
+          record.accelSamples.push(accelSample);
+        }
+      }
+
+      for (const sample of normalizeRawInclinEntries(packet.i)) {
+        const inclinSample = buildRawInclinSample(sample, packetTsUs);
+        if (inclinSample) {
+          record.inclin.push(inclinSample);
+        }
+      }
+
+      record.temp = buildRawTempSample(packet.T, packetTsUs);
+
+      if (
+        record.accelSamples.length > 0 ||
+        record.inclin.length > 0 ||
+        record.temp
+      ) {
+        records.push(record);
+        recordIndex += 1;
+      }
+    } catch (error) {
+      if (isTruncatedTailError(error)) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`Raw decoder stopped at truncated record #${recordIndex}: ${message}`);
+        break;
+      }
+
+      console.warn(
+        `Raw decoder skipped record #${recordIndex}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+      recordIndex += 1;
+    }
+  }
+
+  return records;
 }
 
 function reconstructAbsTs(reader: BinaryReader, sensorState: SensorState) {
@@ -793,13 +1085,60 @@ async function decodeThresholdEncodedBinaryToCsvFiles(
   return outputFiles;
 }
 
-// Collect standalone raw files only.
-export async function collectRawInputEntries(files: File[]) {
+
+async function decodeRawArchiveBinaryToCsvFiles(
+  bytes: ArrayBuffer,
+  baseName: string,
+  outputMode: DecodeOutputMode
+): Promise<DecodedOutputFile[]> {
+  const records = decodeRawArchiveRecords(bytes);
+  const outputFiles: DecodedOutputFile[] = [];
+
+  if (outputMode === "node") {
+    if (records.length === 0) {
+      return outputFiles;
+    }
+
+    outputFiles.push({
+      fileName: `${baseName}.csv`,
+      content: buildNodeCsv(records),
+    });
+    return outputFiles;
+  }
+
+  const sensors = collectSensorSamples(records);
+
+  if (sensors.accel.length > 0) {
+    outputFiles.push({
+      fileName: `${baseName}_accelerometer.csv`,
+      content: buildAccelCsv(sensors.accel),
+    });
+  }
+
+  if (sensors.inclin.length > 0) {
+    outputFiles.push({
+      fileName: `${baseName}_inclinometer.csv`,
+      content: buildInclinCsv(sensors.inclin),
+    });
+  }
+
+  if (sensors.temp.length > 0) {
+    outputFiles.push({
+      fileName: `${baseName}_temperature.csv`,
+      content: buildTempCsv(sensors.temp),
+    });
+  }
+
+  return outputFiles;
+}
+
+// Collect supported decoder input files without changing their contents.
+export async function collectDecoderInputEntries(files: File[]) {
   const entries: RawInputEntry[] = [];
   const rejectedNames: string[] = [];
 
   for (const file of files) {
-    if (isRawSensorFileName(file.name)) {
+    if (isSupportedDecoderFileName(file.name)) {
       entries.push({
         sourceName: file.name,
         entryName: file.name,
@@ -819,7 +1158,7 @@ export async function collectRawInputEntries(files: File[]) {
 }
 
 // Decode all queued files and trigger the browser download.
-export async function decodeRawEntriesToCsv(
+export async function decodeEntriesToCsv(
   entries: RawInputEntry[],
   outputMode: DecodeOutputMode,
   onProgress?: (progress: ProgressSnapshot) => void
@@ -870,11 +1209,11 @@ export async function decodeRawEntriesToCsv(
         : inputBytes;
 
       const baseName = normalizeRawOutputBaseName(entry.entryName);
-      const outputFiles = await decodeThresholdEncodedBinaryToCsvFiles(
-        binaryBytes,
-        baseName,
-        outputMode
-      );
+      const inputKind = inferDecoderInputKind(entry.entryName);
+      const outputFiles =
+        inputKind === "raw"
+          ? await decodeRawArchiveBinaryToCsvFiles(binaryBytes, baseName, outputMode)
+          : await decodeThresholdEncodedBinaryToCsvFiles(binaryBytes, baseName, outputMode);
 
       if (outputFiles.length === 0) {
         failures.push({

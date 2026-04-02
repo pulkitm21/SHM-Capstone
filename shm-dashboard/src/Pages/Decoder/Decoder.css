@@ -104,7 +104,7 @@
   background: #f8fbfd;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 0;
   cursor: pointer;
   transition: border-color 0.18s ease, background 0.18s ease;
 }
@@ -120,27 +120,14 @@
   color: #11212d;
 }
 
-.decoder-dropzone-copy {
-  font-size: 14px;
-  color: #5c6f7f;
-}
-
 .decoder-output-mode-panel {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 0;
   border: 1px solid #d9e1e8;
   border-radius: 16px;
   background: #fbfcfd;
   padding: 16px;
-}
-
-.decoder-output-mode-label {
-  font-size: 13px;
-  font-weight: 700;
-  color: #5c6f7f;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
 }
 
 .decoder-output-mode-toggle {
@@ -163,13 +150,6 @@
 
 .decoder-output-mode-copy {
   line-height: 1.4;
-}
-
-.decoder-output-mode-help {
-  margin: 0;
-  font-size: 13px;
-  line-height: 1.5;
-  color: #5c6f7f;
 }
 
 .decoder-summary-grid {

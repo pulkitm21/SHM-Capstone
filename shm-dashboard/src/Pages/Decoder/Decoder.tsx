@@ -1,7 +1,7 @@
 import { useMemo, useRef, useState } from "react";
 import {
-  collectRawInputEntries,
-  decodeRawEntriesToCsv,
+  collectDecoderInputEntries,
+  decodeEntriesToCsv,
   EMPTY_PROGRESS,
   type DecodeBatchResult,
   type DecodeOutputMode,
@@ -16,7 +16,8 @@ type QueueSummary = {
   rejectedNames: string[];
 };
 
-const ACCEPTED_FILE_TYPES = ".bin,.bin.gz";
+// Allow both processed backend files and raw files.
+const ACCEPTED_FILE_TYPES = ".bin,.bin.gz,.rawbin";
 
 function formatProgressLabel(progress: ProgressSnapshot) {
   if (progress.phase === "idle") return "Waiting for files";
@@ -53,7 +54,7 @@ export default function DecoderPage() {
     setProgress(EMPTY_PROGRESS);
 
     try {
-      const { entries, rejectedNames } = await collectRawInputEntries(files);
+      const { entries, rejectedNames } = await collectDecoderInputEntries(files);
 
       setQueueEntries(entries);
       setSummary({
@@ -63,7 +64,7 @@ export default function DecoderPage() {
       });
 
       if (entries.length === 0) {
-        setError("No supported .bin or .bin.gz files were found in the selected input.");
+        setError("No supported .bin, .bin.gz, or .rawbin files were found in the selected input.");
       }
     } catch (err) {
       setQueueEntries([]);
@@ -82,7 +83,7 @@ export default function DecoderPage() {
 
   async function handleDecode() {
     if (!hasQueue) {
-      setError("Add at least one supported raw file before decoding.");
+      setError("Add at least one supported file before decoding.");
       return;
     }
 
@@ -91,7 +92,7 @@ export default function DecoderPage() {
     setResult(null);
 
     try {
-      const nextResult = await decodeRawEntriesToCsv(queueEntries, outputMode, setProgress);
+      const nextResult = await decodeEntriesToCsv(queueEntries, outputMode, setProgress);
       setResult(nextResult);
 
       if (!nextResult.downloadedFileName && nextResult.failures.length > 0) {
@@ -147,19 +148,18 @@ export default function DecoderPage() {
           />
 
           <label htmlFor="decoder-file-input" className="decoder-dropzone">
-            <span className="decoder-dropzone-title">Choose raw .bin or .bin.gz files</span>
-            <span className="decoder-dropzone-copy">
-              Supported input types: .bin and .bin.gz only
-            </span>
+            <span className="decoder-dropzone-title">Choose .bin, .bin.gz, or .rawbin files</span>
           </label>
         </div>
 
         <div className="decoder-output-mode-panel">
-          <span className="decoder-output-mode-label">Decoded output</span>
-
-          {/* Toggle whether decoded node files stay combined or split by sensor. */}
-          <label className="decoder-output-mode-toggle">
+          {/* Toggle whether decoded files stay combined or split by sensor. */}
+          <label
+            className="decoder-output-mode-toggle"
+            htmlFor="decoder-output-mode-toggle"
+          >
             <input
+              id="decoder-output-mode-toggle"
               type="checkbox"
               checked={outputMode === "sensor"}
               onChange={(event) =>
@@ -167,15 +167,8 @@ export default function DecoderPage() {
               }
               disabled={processing}
             />
-            <span className="decoder-output-mode-copy">
-              Split decoded node files into separate sensor CSVs
-            </span>
+            <span className="decoder-output-mode-copy">Split output by sensor</span>
           </label>
-
-          <p className="decoder-output-mode-help">
-            Checked: create separate accelerometer, inclinometer, and temperature CSV files.
-            Unchecked: keep each decoded node file as one combined CSV.
-          </p>
         </div>
 
         <div className="decoder-summary-grid">
@@ -184,7 +177,7 @@ export default function DecoderPage() {
             <strong>{summary.sourceFileCount}</strong>
           </div>
           <div className="decoder-stat-card">
-            <span className="decoder-stat-label">Queued raw files</span>
+            <span className="decoder-stat-label">Queued files</span>
             <strong>{summary.rawEntryCount}</strong>
           </div>
           <div className="decoder-stat-card">
@@ -201,7 +194,7 @@ export default function DecoderPage() {
 
         <div className="decoder-queue-list">
           {queueEntries.length === 0 ? (
-            <div className="decoder-empty">No raw files queued yet.</div>
+            <div className="decoder-empty">No files queued yet.</div>
           ) : (
             queueEntries.map((entry) => (
               <div key={`${entry.sourceName}:${entry.entryName}`} className="decoder-queue-item">
