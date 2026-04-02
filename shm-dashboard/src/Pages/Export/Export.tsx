@@ -79,6 +79,7 @@ export default function ExportPage() {
   const [sensorEndDay, setSensorEndDay] = useState(defaultRange.end_day);
   const [sensorStartHour, setSensorStartHour] = useState("");
   const [sensorEndHour, setSensorEndHour] = useState("");
+  const [includeRawData, setIncludeRawData] = useState(false);
 
   const [faultExporting, setFaultExporting] = useState(false);
   const [sensorExporting, setSensorExporting] = useState(false);
@@ -174,6 +175,7 @@ export default function ExportPage() {
     setSensorEndDay(defaultRange.end_day);
     setSensorStartHour("");
     setSensorEndHour("");
+    setIncludeRawData(false);
     setSelectedNodeIds([]);
   }
 
@@ -249,6 +251,7 @@ export default function ExportPage() {
         end_day: sensorEndDay,
         start_hour: sensorStartHour || undefined,
         end_hour: sensorEndHour || undefined,
+        include_raw_data: includeRawData,
       });
 
       setMessage("Sensor data ZIP download started.");
@@ -327,6 +330,24 @@ export default function ExportPage() {
                 </option>
               ))}
             </select>
+          </div>
+
+          <div className="export-field export-field-wide export-option-field">
+            <label htmlFor="sensor-export-include-raw">Export Options</label>
+
+            {/* Toggle whether matching raw files are included in the ZIP. */}
+            <label
+              className="export-option-toggle"
+              htmlFor="sensor-export-include-raw"
+            >
+              <input
+                id="sensor-export-include-raw"
+                type="checkbox"
+                checked={includeRawData}
+                onChange={(e) => setIncludeRawData(e.target.checked)}
+              />
+              <span className="export-option-copy">Include raw files</span>
+            </label>
           </div>
 
           <div className="export-field export-field-wide export-node-field">

@@ -9,6 +9,10 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 AUTH_BOOTSTRAP_ADMIN_USERNAME = os.getenv("AUTH_BOOTSTRAP_ADMIN_USERNAME", "").strip()
 AUTH_BOOTSTRAP_ADMIN_PASSWORD = os.getenv("AUTH_BOOTSTRAP_ADMIN_PASSWORD", "")
 
+# Bootstrap admin credentials read from the process environment.
+AUTH_BOOTSTRAP_ADMIN_USERNAME = os.getenv("AUTH_BOOTSTRAP_ADMIN_USERNAME", "").strip()
+AUTH_BOOTSTRAP_ADMIN_PASSWORD = os.getenv("AUTH_BOOTSTRAP_ADMIN_PASSWORD", "")
+
 # Session cookie settings shared by routes and dependencies.
 SESSION_COOKIE_NAME = "session_id"
 SESSION_IDLE_MINUTES = int(os.getenv("AUTH_SESSION_IDLE_MINUTES", "5"))
