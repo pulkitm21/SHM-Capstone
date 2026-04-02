@@ -299,7 +299,7 @@ def export_sensor_data(
     filename = build_sensor_export_zip_filename(
         start_day=start_day,
         end_day=end_day,
-        serial_numbers=[str(node["serial"]) for node in resolved_nodes],
+        serial_number=[str(node["serial"]) for node in resolved_nodes],
         start_hour=parsed_start_hour,
         end_hour=parsed_end_hour,
     )

@@ -6,6 +6,8 @@ import LogNode from "./LogNode";
 import LogTable from "./LogTable";
 import "./Log.css";
 
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
+
 export type FaultLogVariant = "recent" | "node" | "full";
 
 type FaultLogProps = {
@@ -80,7 +82,7 @@ export default function FaultLog({
 
     // In preview mode, skip API calls and use the provided mock data.
     if (previewMode) {
-      const previewRows = normalizeFaultRows(safePreviewFaults.slice(0, limit));
+      const previewRows = normalizeFaultRows(safePreviewFaults).slice(0, limit);
       setFaults(previewRows);
       lastFaultIdRef.current = previewRows.reduce(
         (maxId, fault) => Math.max(maxId, Number(fault.id ?? 0)),
@@ -103,13 +105,14 @@ export default function FaultLog({
 
         const response = await getFaults({
           serial_number,
-          limit,
+          page: 1,
+          page_size: limit,
         });
 
         if (!mounted) return;
 
         const nextRows = normalizeFaultRows(response.faults);
-        setFaults(nextRows);
+        setFaults(nextRows.slice(0, limit));
         lastFaultIdRef.current = nextRows.reduce(
           (maxId, fault) => Math.max(maxId, Number(fault.id ?? 0)),
           0
@@ -135,9 +138,7 @@ export default function FaultLog({
       const query = params.toString();
 
       eventSource = new EventSource(
-        `${import.meta.env.VITE_API_BASE_URL}/api/events/faults${
-          query ? `?${query}` : ""
-        }`
+        `${API_BASE}/api/events/faults${query ? `?${query}` : ""}`
       );
 
       eventSource.onopen = () => {
@@ -205,11 +206,11 @@ export default function FaultLog({
     };
   }, [serial_number, limit, previewMode, safePreviewFaults, variant]);
 
-  // Only active faults are shown in the recent and node variants.
+  // Recent and node variants should show the most recent faults, not only active ones.
   const displayFaults = useMemo(() => {
     if (variant === "full") return faults;
-    return getActiveFaultRows(faults);
-  }, [faults, variant]);
+    return normalizeFaultRows(faults).slice(0, limit);
+  }, [faults, limit, variant]);
 
   if (variant === "recent") {
     return <LogRecent faults={displayFaults} loading={loading} error={error} />;

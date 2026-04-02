@@ -1110,7 +1110,7 @@ export default function SensorManagement() {
             <FaultLog
               variant="node"
               serial_number={selectedNode?.serial ?? ""}
-              limit={5}
+              limit={3}
               previewMode={UI_PREVIEW_MODE}
               previewFaults={PREVIEW_FAULTS_BY_SERIAL[selectedNode?.serial ?? ""] ?? []}
             />

@@ -85,8 +85,10 @@ FAULTS_DB = FAULT_DIR / "faults.db"
 SENSOR_STATUS_WINDOW_SECONDS = 120
 SENSOR_KEYS = ("accelerometer", "inclinometer", "temperature")
 
-# Keep raw preview plots limited to short windows so the backend stays lightweight.
+# Keep raw preview plots limited to short windows to keep the backend lightweight.
 PLOT_MAX_WINDOW_MINUTES = 60
+FAULT_LOG_MAX_PAGES = 10
+
 
 # Stateful fault types that should be reduced to current state.
 STATEFUL_FAULT_TYPES = (
@@ -1000,8 +1002,10 @@ def _build_fault_where_sql(where_clauses: list[str]) -> str:
 def _get_fault_filter_options(
     con: sqlite3.Connection,
     serial_number: Optional[str] = None,
+    recent_row_limit: int = 180,
 ) -> Dict[str, List[Any]]:
     serial_number_value = _normalize_fault_text(serial_number)
+    safe_recent_row_limit = max(1, recent_row_limit)
 
     if serial_number_value:
         serial_number_where_sql = "WHERE serial_number LIKE ?"
@@ -1014,45 +1018,69 @@ def _get_fault_filter_options(
 
     cur.execute(
         f"""
+        WITH recent_faults AS (
+            SELECT *
+            FROM faults
+            ORDER BY ts DESC, id DESC
+            LIMIT ?
+        )
         SELECT DISTINCT sensor_type
-        FROM faults
+        FROM recent_faults
         {serial_number_where_sql}
         ORDER BY sensor_type COLLATE NOCASE ASC
         """,
-        serial_number_params,
+        [safe_recent_row_limit, *serial_number_params],
     )
     sensor_types = [row[0] for row in cur.fetchall() if row[0] not in (None, "")]
 
     cur.execute(
         f"""
+        WITH recent_faults AS (
+            SELECT *
+            FROM faults
+            ORDER BY ts DESC, id DESC
+            LIMIT ?
+        )
         SELECT DISTINCT fault_type
-        FROM faults
+        FROM recent_faults
         {serial_number_where_sql}
         ORDER BY fault_type COLLATE NOCASE ASC
         """,
-        serial_number_params,
+        [safe_recent_row_limit, *serial_number_params],
     )
     fault_types = [row[0] for row in cur.fetchall() if row[0] not in (None, "")]
 
     cur.execute(
         f"""
+        WITH recent_faults AS (
+            SELECT *
+            FROM faults
+            ORDER BY ts DESC, id DESC
+            LIMIT ?
+        )
         SELECT DISTINCT severity
-        FROM faults
+        FROM recent_faults
         {serial_number_where_sql}
         ORDER BY severity ASC
         """,
-        serial_number_params,
+        [safe_recent_row_limit, *serial_number_params],
     )
     severities = [row[0] for row in cur.fetchall() if row[0] is not None]
 
     cur.execute(
         f"""
+        WITH recent_faults AS (
+            SELECT *
+            FROM faults
+            ORDER BY ts DESC, id DESC
+            LIMIT ?
+        )
         SELECT DISTINCT fault_status
-        FROM faults
+        FROM recent_faults
         {serial_number_where_sql}
         ORDER BY fault_status COLLATE NOCASE ASC
         """,
-        serial_number_params,
+        [safe_recent_row_limit, *serial_number_params],
     )
     statuses = [row[0] for row in cur.fetchall() if row[0] not in (None, "")]
 
@@ -1083,8 +1111,9 @@ def read_fault_rows(
     if not FAULTS_DB.exists():
         return empty_fault_response(page=page, page_size=effective_page_size)
 
-    safe_page = max(1, page)
     safe_page_size = max(1, effective_page_size)
+    safe_page = min(max(1, page), FAULT_LOG_MAX_PAGES)
+    recent_row_limit = safe_page_size * FAULT_LOG_MAX_PAGES
     offset = (safe_page - 1) * safe_page_size
 
     con: Optional[sqlite3.Connection] = None
@@ -1106,17 +1135,53 @@ def read_fault_rows(
 
         cur.execute(
             f"""
+            WITH recent_faults AS (
+                SELECT
+                    id,
+                    serial_number,
+                    fault_code,
+                    sensor_type,
+                    fault_type,
+                    state_key,
+                    is_stateful,
+                    severity,
+                    fault_status,
+                    description,
+                    ts
+                FROM faults
+                ORDER BY ts DESC, id DESC
+                LIMIT ?
+            )
             SELECT COUNT(*) AS count
-            FROM faults
+            FROM recent_faults
             {where_sql}
             """,
-            where_params,
+            [recent_row_limit, *where_params],
         )
         total_items = int(cur.fetchone()["count"])
-        total_pages = max(1, (total_items + safe_page_size - 1) // safe_page_size)
+        total_pages = max(1, min(FAULT_LOG_MAX_PAGES, (total_items + safe_page_size - 1) // safe_page_size))
+        safe_page = min(safe_page, total_pages)
+        offset = (safe_page - 1) * safe_page_size
 
         cur.execute(
             f"""
+            WITH recent_faults AS (
+                SELECT
+                    id,
+                    serial_number,
+                    fault_code,
+                    sensor_type,
+                    fault_type,
+                    state_key,
+                    is_stateful,
+                    severity,
+                    fault_status,
+                    description,
+                    ts
+                FROM faults
+                ORDER BY ts DESC, id DESC
+                LIMIT ?
+            )
             SELECT
                 id,
                 serial_number,
@@ -1129,16 +1194,20 @@ def read_fault_rows(
                 fault_status,
                 description,
                 ts
-            FROM faults
+            FROM recent_faults
             {where_sql}
-            ORDER BY ts DESC
+            ORDER BY ts DESC, id DESC
             LIMIT ? OFFSET ?
             """,
-            [*where_params, safe_page_size, offset],
+            [recent_row_limit, *where_params, safe_page_size, offset],
         )
         rows = [dict(r) for r in cur.fetchall()]
 
-        filter_options = _get_fault_filter_options(con=con, serial_number=serial_number)
+        filter_options = _get_fault_filter_options(
+            con=con,
+            serial_number=serial_number,
+            recent_row_limit=recent_row_limit,
+        )
 
         return {
             "faults": rows,
@@ -1471,7 +1540,7 @@ def _get_plot_node_serial(node_id: int) -> str:
     return serial
 
 
-def _plot_time_window(minutes: int) -> tuple[float, float, str, str]:
+def _plot_time_window(minutes: int) -> tuple[float, float, str, str, datetime]:
     end_dt = datetime.now().astimezone()
     start_dt = end_dt - timedelta(minutes=minutes)
 
@@ -1480,7 +1549,13 @@ def _plot_time_window(minutes: int) -> tuple[float, float, str, str]:
         end_dt.timestamp(),
         start_dt.isoformat(),
         end_dt.isoformat(),
+        end_dt,
     )
+
+
+def _current_hour_plot_file_path(serial: str, reference_dt: datetime) -> Path:
+    hour_str = reference_dt.strftime("%Y%m%d_%H")
+    return DATA_DIR / "data" / f"data_{serial}_{hour_str}.bin"
 
 
 def _min_spacing_seconds(minutes: int, target_points: int) -> float:
@@ -1500,10 +1575,9 @@ def read_accel_points(node_id: int, minutes: int, limit: int = 1200):
         return []
 
     serial = _get_plot_node_serial(node_id)
-    start_ts, end_ts, _, _ = _plot_time_window(minutes)
+    start_ts, end_ts, _, _, end_dt = _plot_time_window(minutes)
 
-    hour_str = datetime.now().strftime("%Y%m%d_%H")
-    file_path = DATA_DIR / "data" / f"data_{serial}_{hour_str}.bin"
+    file_path = _current_hour_plot_file_path(serial, end_dt)
 
     if not file_path.exists():
         return []
@@ -1543,10 +1617,9 @@ def read_inclinometer_points(node_id: int, minutes: int, limit: int = 1200):
         return []
 
     serial = _get_plot_node_serial(node_id)
-    start_ts, end_ts, _, _ = _plot_time_window(minutes)
+    start_ts, end_ts, _, _, end_dt = _plot_time_window(minutes)
 
-    hour_str = datetime.now().strftime("%Y%m%d_%H")
-    file_path = DATA_DIR / "data" / f"data_{serial}_{hour_str}.bin"
+    file_path = _current_hour_plot_file_path(serial, end_dt)
 
     if not file_path.exists():
         return []
@@ -1587,10 +1660,9 @@ def read_temperature_points(node_id: int, minutes: int, limit: int = 2000):
         return []
 
     serial = _get_plot_node_serial(node_id)
-    start_ts, end_ts, _, _ = _plot_time_window(minutes)
+    start_ts, end_ts, _, _, end_dt = _plot_time_window(minutes)
 
-    hour_str = datetime.now().strftime("%Y%m%d_%H")
-    file_path = DATA_DIR / "data" / f"data_{serial}_{hour_str}.bin"
+    file_path = _current_hour_plot_file_path(serial, end_dt)
 
     if not file_path.exists():
         return []

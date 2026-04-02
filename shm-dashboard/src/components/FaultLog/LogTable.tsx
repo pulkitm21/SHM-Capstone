@@ -168,11 +168,11 @@ export default function LogTable({ serial_number }: Props) {
     <section className="faultlog-panel faultlog-table-panel">
       <div className="faultlog-panel-top">
         <div className="faultlog-panel-summary">
-          {/* Summary pill for total matching records across all pages. */}
+                    {/* Summary pill for total matching records across all pages. */}
           <span className="faultlog-summary-chip">Total: {totalItems}</span>
 
           <div className="faultlog-panel-actions">
-            {/* Last successful refresh time for manual polling visibility. */}
+               {/* Last successful refresh time for manual polling visibility. */}
             <span className="faultlog-last-updated">
               {lastUpdated
                 ? `Updated ${lastUpdated.toLocaleTimeString()}`
@@ -301,7 +301,7 @@ export default function LogTable({ serial_number }: Props) {
           </div>
 
           <div className="faultlog-filter-field faultlog-filter-field-button">
-            {/* Hidden spacer keeps the button aligned with the rest of the grid. */}
+              {/* Hidden spacer keeps the button aligned with the rest of the grid. */}
             <label className="faultlog-filter-spacer" aria-hidden="true">
               Actions
             </label>
@@ -378,7 +378,7 @@ export default function LogTable({ serial_number }: Props) {
           </div>
 
           <div className="faultlog-pagination">
-            {/* Simple page indicator for the current table state. */}
+                        {/* Simple page indicator for the current table state. */}
             <div className="faultlog-pagination-info">
               Page {page} of {totalPages}
             </div>
@@ -402,6 +402,15 @@ export default function LogTable({ serial_number }: Props) {
                 disabled={page >= totalPages}
               >
                 Next
+              </button>
+
+              <button
+                type="button"
+                className="faultlog-page-btn"
+                onClick={() => setPage(totalPages)}
+                disabled={page >= totalPages}
+              >
+                Last
               </button>
             </div>
           </div>
