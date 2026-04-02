@@ -649,6 +649,7 @@ export type SensorExportParams = {
   end_day: string;
   start_hour?: string;
   end_hour?: string;
+  include_raw_data?: boolean;
 };
 
 async function downloadFromEndpoint(
@@ -704,6 +705,7 @@ export async function downloadSensorExport(
   qs.set("end_day", params.end_day);
   if (params.start_hour) qs.set("start_hour", params.start_hour);
   if (params.end_hour) qs.set("end_hour", params.end_hour);
+  if (params.include_raw_data) qs.set("include_raw_data", "true");
 
   await downloadFromEndpoint(`/api/exports/sensor-data?${qs.toString()}`, signal);
 }

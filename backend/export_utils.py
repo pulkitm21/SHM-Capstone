@@ -12,7 +12,11 @@ from typing import Any, Iterable, Optional
 
 DATA_DIR = Path("/mnt/ssd")
 FAULTS_DB = DATA_DIR / "fault" / "faults.db"
+# Processed sensor data files are stored in hourly buckets with filenames like:
+# data_{serial}_{YYYYMMDD}_{HH}.bin for the active/current hour or .bin.gz for previous hours.
 SENSOR_DATA_DIR = DATA_DIR / "data"
+# Raw MQTT capture files are stored separately from processed backend storage files.
+RAW_SENSOR_DATA_DIR = DATA_DIR / "raw"
 EXPORT_TMP_DIR = Path("/tmp/shm_exports")
 
 FAULT_EXPORT_HEADERS = [
@@ -41,6 +45,11 @@ def is_fault_db_available() -> bool:
 
 def is_sensor_data_available() -> bool:
     return is_ssd_available() and SENSOR_DATA_DIR.exists() and SENSOR_DATA_DIR.is_dir()
+
+
+# Check whether the raw capture directory is available on the SSD.
+def is_raw_sensor_data_available() -> bool:
+    return is_ssd_available() and RAW_SENSOR_DATA_DIR.exists() and RAW_SENSOR_DATA_DIR.is_dir()
 
 
 def normalize_fault_text(value: Optional[str]) -> str:
@@ -378,11 +387,46 @@ def find_sensor_files_for_serial(
     return matched
 
 
-def build_sensor_scope_filename_part(node_ids: list[int]) -> str:
-    if len(node_ids) == 1:
-        return f"node_{node_ids[0]}"
-    joined_ids = "-".join(str(node_id) for node_id in node_ids)
-    return f"nodes_{joined_ids}"
+# Return matching raw capture files.
+def find_raw_sensor_files_for_serial(
+    serial: str,
+    start_iso: str,
+    end_exclusive_iso: str,
+) -> list[Path]:
+    matched: list[Path] = []
+
+    # Use the Pi's local time so hour buckets match the raw filenames.
+    start_dt = datetime.fromisoformat(start_iso).astimezone()
+    end_dt = datetime.fromisoformat(end_exclusive_iso).astimezone()
+    current = start_dt.replace(minute=0, second=0, microsecond=0)
+
+    while current < end_dt:
+        hour_str = current.strftime("%Y%m%d_%H")
+        raw_path = RAW_SENSOR_DATA_DIR / serial / f"{serial}_{hour_str}.rawbin"
+
+        if raw_path.exists():
+            matched.append(raw_path)
+
+        current += timedelta(hours=1)
+
+    return matched
+
+
+# Build the ZIP scope name from serial number.
+def build_sensor_scope_filename_part(serial_number: list[str]) -> str:
+    cleaned_serials = [
+        sanitize_filename_part(serial)
+        for serial in serial_number
+        if str(serial).strip()
+    ]
+
+    if not cleaned_serials:
+        return "all_nodes"
+
+    if len(cleaned_serials) == 1:
+        return cleaned_serials[0]
+
+    return "serials_" + "-".join(cleaned_serials)
 
 
 def build_sensor_range_filename_part(day_value: str, hour_value: Optional[int]) -> str:
@@ -395,11 +439,11 @@ def build_sensor_export_zip_filename(
     *,
     start_day: str,
     end_day: str,
-    node_ids: list[int],
+    serial_number: list[str],
     start_hour: Optional[int] = None,
     end_hour: Optional[int] = None,
 ) -> str:
-    scope = build_sensor_scope_filename_part(node_ids)
+    scope = build_sensor_scope_filename_part(serial_number)
     start_part = build_sensor_range_filename_part(start_day, start_hour)
     end_part = build_sensor_range_filename_part(end_day, end_hour)
     return f"{scope}_{start_part}_{end_part}.zip"
@@ -415,10 +459,12 @@ def build_raw_sensor_export_metadata_text(
     nodes: list[dict[str, Any]],
     node_file_counts: dict[str, int],
     exported_files: dict[str, list[str]],
+    raw_node_file_counts: Optional[dict[str, int]] = None,
+    raw_exported_files: Optional[dict[str, list[str]]] = None,
 ) -> str:
     lines: list[str] = []
 
-    lines.append("SHM Raw Sensor File Export Metadata")
+    lines.append("SHM Sensor File Export Metadata")
     lines.append("=" * 35)
     lines.append(f"generated_at_utc: {generated_at}")
     lines.append(f"start_day: {start_day}")
@@ -437,23 +483,31 @@ def build_raw_sensor_export_metadata_text(
         lines.append(f"node_id={node_id}, label={label}, serial={serial}")
     lines.append("")
 
-    lines.append("Matched Hourly Files")
+    lines.append("Matched Processed Storage Files")
     lines.append("-" * 20)
     for node in nodes:
         serial = str(node.get("serial"))
         file_count = node_file_counts.get(serial, 0)
-        lines.append(f"{serial}: {file_count} matching file(s)")
+        lines.append(f"{serial}: {file_count} matching processed file(s)")
         for file_name in exported_files.get(serial, []):
             lines.append(f"  - {file_name}")
     lines.append("")
 
+    if raw_node_file_counts is not None and raw_exported_files is not None:
+        lines.append("Matched Raw Capture Files")
+        lines.append("-" * 25)
+        for node in nodes:
+            serial = str(node.get("serial"))
+            file_count = raw_node_file_counts.get(serial, 0)
+            lines.append(f"{serial}: {file_count} matching raw file(s)")
+            for file_name in raw_exported_files.get(serial, []):
+                lines.append(f"  - {file_name}")
+        lines.append("")
+
     lines.append("Notes")
     lines.append("-" * 5)
-    lines.append("This export contains raw hourly backend storage files.")
-    lines.append("Files are copied into this ZIP archive with user-facing export names.")
-    lines.append("Current hour files may appear as .bin.")
-    lines.append("Finalized historical files may appear as .bin.gz.")
-    lines.append("No decode or CSV conversion was performed by the backend.")
+    lines.append("Processed backend storage files are exported as .bin for current hour or .bin.gz for previous hours.")
+    lines.append("Raw capture files are exported as .rawbin.")
 
     return "\n".join(lines) + "\n"
 
@@ -469,13 +523,37 @@ def build_export_member_name(
         suffix = ".bin.gz"
     else:
         suffix = ".bin"
-    return f"node_{node_id}_{bucket_day}_{bucket_hour}{suffix}"
+
+    # Keep processed files in their own ZIP folder.
+    return f"processed_data/node_{node_id}_{bucket_day}_{bucket_hour}{suffix}"
+
+
+# Build a user-facing export filename for a raw capture file.
+def build_raw_export_member_name(
+    *,
+    node_id: int,
+    bucket_day: str,
+    bucket_hour: str,
+) -> str:
+    # Keep raw files in their own ZIP folder.
+    return f"raw_data/node_{node_id}_{bucket_day}_{bucket_hour}.rawbin"
 
 
 def extract_sensor_bucket_from_filename(source_name: str) -> tuple[str, str]:
     match = re.match(r"^data_.+_(\d{8})_(\d{2})\.bin(?:\.gz)?$", source_name)
     if not match:
         raise ValueError(f"Unrecognized sensor export source filename: {source_name}")
+
+    day_token = match.group(1)
+    hour_token = match.group(2)
+    bucket_day = f"{day_token[0:4]}-{day_token[4:6]}-{day_token[6:8]}"
+    return bucket_day, hour_token
+
+# Parse the date/hour bucket from a raw capture filename.
+def extract_raw_bucket_from_filename(source_name: str) -> tuple[str, str]:
+    match = re.match(r"^.+_(\d{8})_(\d{2})\.rawbin$", source_name)
+    if not match:
+        raise ValueError(f"Unrecognized raw sensor export source filename: {source_name}")
 
     day_token = match.group(1)
     hour_token = match.group(2)
@@ -495,17 +573,29 @@ def stage_files_for_zip(
 
     for source_path, destination_name in members:
         destination = export_dir / destination_name
+
+        # Create ZIP subfolders before copying files.
+        destination.parent.mkdir(parents=True, exist_ok=True)
+
         shutil.copy2(source_path, destination)
         staged_paths.append(destination)
 
     return staged_paths
 
 
-def create_zip_from_paths(zip_path: Path, members: list[Path]) -> None:
+def create_zip_from_paths(
+    zip_path: Path,
+    members: list[Path],
+    *,
+    root_dir: Optional[Path] = None,
+) -> None:
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for member in members:
-            zf.write(member, arcname=member.name)
+            # Preserve staged subfolder paths inside the ZIP.
+            arcname = str(member.relative_to(root_dir)) if root_dir is not None else member.name
+            zf.write(member, arcname=arcname)
 
 
 def write_text_file(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
+    

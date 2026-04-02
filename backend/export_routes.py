@@ -13,15 +13,19 @@ from export_utils import (
     build_export_member_name,
     build_fault_export_filename,
     build_fault_export_where,
+    build_raw_export_member_name,
     build_raw_sensor_export_metadata_text,
     build_sensor_export_zip_filename,
     build_where_sql,
     create_temp_export_dir,
     create_temp_export_path,
     create_zip_from_paths,
+    extract_raw_bucket_from_filename,
     extract_sensor_bucket_from_filename,
+    find_raw_sensor_files_for_serial,
     find_sensor_files_for_serial,
     is_fault_db_available,
+    is_raw_sensor_data_available,
     is_sensor_data_available,
     parse_node_ids_csv,
     remove_temp_dir,
@@ -134,19 +138,30 @@ def export_sensor_data(
     end_day: str = Query(...),
     start_hour: Optional[str] = Query(default=None),
     end_hour: Optional[str] = Query(default=None),
+    include_raw_data: bool = Query(default=False),
 ):
     """
-    Export raw hourly sensor storage files for the selected nodes and date/hour range.
+    Export matching sensor storage files for the selected nodes and date/hour range.
 
     Output format:
     - always returns a ZIP
-    - contains the matching .bin and/or .bin.gz files
+    - includes processed .bin / .bin.gz files when available
+    - includes raw .rawbin files unchanged when include_raw_data=true
     - includes export_metadata.txt
     """
-    if not is_sensor_data_available():
+    processed_available = is_sensor_data_available()
+    raw_available = is_raw_sensor_data_available()
+
+    if not processed_available and not (include_raw_data and raw_available):
         raise HTTPException(
             status_code=503,
-            detail="Sensor export unavailable because the SSD or sensor data directory is not available.",
+            detail="Sensor export unavailable because the SSD storage directories are not available.",
+        )
+
+    if include_raw_data and not raw_available:
+        raise HTTPException(
+            status_code=503,
+            detail="Raw sensor export unavailable because /mnt/ssd/raw is not available.",
         )
 
     try:
@@ -186,20 +201,26 @@ def export_sensor_data(
     staged_sources: list[tuple[Path, str]] = []
     node_file_counts: dict[str, int] = {}
     exported_files: dict[str, list[str]] = {}
+    raw_node_file_counts: dict[str, int] = {}
+    raw_exported_files: dict[str, list[str]] = {}
 
     try:
         for node in resolved_nodes:
             node_id = int(node["node_id"])
             serial = str(node["serial"])
 
-            matching_files = find_sensor_files_for_serial(
-                serial=serial,
-                start_iso=start_iso,
-                end_exclusive_iso=end_exclusive_iso,
+            processed_matching_files = (
+                find_sensor_files_for_serial(
+                    serial=serial,
+                    start_iso=start_iso,
+                    end_exclusive_iso=end_exclusive_iso,
+                )
+                if processed_available
+                else []
             )
 
-            renamed_files: list[str] = []
-            for source_path in matching_files:
+            renamed_processed_files: list[str] = []
+            for source_path in processed_matching_files:
                 bucket_day, bucket_hour = extract_sensor_bucket_from_filename(source_path.name)
                 export_name = build_export_member_name(
                     node_id=node_id,
@@ -208,10 +229,31 @@ def export_sensor_data(
                     source_name=source_path.name,
                 )
                 staged_sources.append((source_path, export_name))
-                renamed_files.append(export_name)
+                renamed_processed_files.append(export_name)
 
-            node_file_counts[serial] = len(matching_files)
-            exported_files[serial] = renamed_files
+            node_file_counts[serial] = len(processed_matching_files)
+            exported_files[serial] = renamed_processed_files
+
+            if include_raw_data:
+                raw_matching_files = find_raw_sensor_files_for_serial(
+                    serial=serial,
+                    start_iso=start_iso,
+                    end_exclusive_iso=end_exclusive_iso,
+                )
+
+                renamed_raw_files: list[str] = []
+                for source_path in raw_matching_files:
+                    bucket_day, bucket_hour = extract_raw_bucket_from_filename(source_path.name)
+                    export_name = build_raw_export_member_name(
+                        node_id=node_id,
+                        bucket_day=bucket_day,
+                        bucket_hour=bucket_hour,
+                    )
+                    staged_sources.append((source_path, export_name))
+                    renamed_raw_files.append(export_name)
+
+                raw_node_file_counts[serial] = len(raw_matching_files)
+                raw_exported_files[serial] = renamed_raw_files
 
         if not staged_sources:
             raise HTTPException(
@@ -231,11 +273,15 @@ def export_sensor_data(
             nodes=resolved_nodes,
             node_file_counts=node_file_counts,
             exported_files=exported_files,
+            raw_node_file_counts=raw_node_file_counts if include_raw_data else None,
+            raw_exported_files=raw_exported_files if include_raw_data else None,
         )
         write_text_file(metadata_path, metadata_text)
 
         zip_members = [metadata_path, *staged_file_paths]
-        create_zip_from_paths(zip_path=zip_path, members=zip_members)
+
+        # Preserve processed_data/ and raw_data/ inside the ZIP.
+        create_zip_from_paths(zip_path=zip_path, members=zip_members, root_dir=export_dir)
 
     except HTTPException:
         remove_temp_file(zip_path)
@@ -249,10 +295,11 @@ def export_sensor_data(
             detail=f"Failed to export sensor data: {exc}",
         ) from exc
 
+    # Use serial numbers in the ZIP filename.
     filename = build_sensor_export_zip_filename(
         start_day=start_day,
         end_day=end_day,
-        node_ids=parsed_node_ids,
+        serial_numbers=[str(node["serial"]) for node in resolved_nodes],
         start_hour=parsed_start_hour,
         end_hour=parsed_end_hour,
     )
