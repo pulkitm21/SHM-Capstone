@@ -17,7 +17,7 @@ FAULTS_DB = DATA_DIR / "fault" / "faults.db"
 SENSOR_DATA_DIR = DATA_DIR / "data"
 # Raw MQTT capture files are stored separately from processed backend storage files.
 RAW_SENSOR_DATA_DIR = DATA_DIR / "raw"
-EXPORT_TMP_DIR = Path("/tmp/shm_exports")
+EXPORT_TMP_DIR = Path("/mnt/ssd/tmp/shm_exports")
 
 FAULT_EXPORT_HEADERS = [
     "id",
