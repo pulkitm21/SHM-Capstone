@@ -2,14 +2,16 @@ import {
   Chart as ChartJS,
   Filler,
   Legend,
+  LineElement,
   LinearScale,
   PointElement,
   Tooltip,
   type ChartData,
   type ChartOptions,
 } from "chart.js";
-import { useEffect, useMemo, useState } from "react";
-import { Scatter } from "react-chartjs-2";
+import zoomPlugin from "chartjs-plugin-zoom";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { Line } from "react-chartjs-2";
 
 import "./SensorPlot.css";
 
@@ -22,22 +24,37 @@ import type {
 
 ChartJS.register(
   PointElement,
+  LineElement,
   LinearScale,
   Tooltip,
   Legend,
-  Filler
+  Filler,
+  zoomPlugin
 );
 
 type Props = {
   title: string;
   data: ApiResponse;
   height?: number;
+  onZoomStateChange?: (zoomed: boolean) => void;
 };
 
-type ScatterPoint = {
+type PlotPoint = {
   x: number;
   y: number;
   ts: string;
+};
+
+type SensorDataset = {
+  label: string;
+  data: PlotPoint[];
+  borderColor: string;
+  backgroundColor: string;
+  pointRadius: number;
+  pointHoverRadius: number;
+  borderWidth: number;
+  tension: number;
+  fill: boolean;
 };
 
 function formatTimeLabel(ts: string): string {
@@ -50,10 +67,10 @@ function formatTimeLabel(ts: string): string {
   });
 }
 
-function buildAxisScatterData<T extends { ts: string }>(
+function buildAxisPlotData<T extends { ts: string }>(
   points: T[],
   getValue: (point: T) => number | null
-): ScatterPoint[] {
+): PlotPoint[] {
   return points.flatMap((point, index) => {
     const value = getValue(point);
     if (value == null) return [];
@@ -67,89 +84,202 @@ function buildAxisScatterData<T extends { ts: string }>(
   });
 }
 
-function buildAccelerometerDatasets(points: AccelerometerPlotPoint[]) {
+function buildAccelerometerDatasets(points: AccelerometerPlotPoint[]): SensorDataset[] {
   return [
     {
       label: "X",
-      data: buildAxisScatterData(points, (p) => p.x),
+      data: buildAxisPlotData(points, (p) => p.x),
       borderColor: "#2563eb",
       backgroundColor: "#2563eb",
-      pointRadius: 2,
+      pointRadius: 0,
       pointHoverRadius: 3,
-      showLine: false,
+      borderWidth: 2,
+      tension: 0,
+      fill: false,
     },
     {
       label: "Y",
-      data: buildAxisScatterData(points, (p) => p.y),
+      data: buildAxisPlotData(points, (p) => p.y),
       borderColor: "#059669",
       backgroundColor: "#059669",
-      pointRadius: 2,
+      pointRadius: 0,
       pointHoverRadius: 3,
-      showLine: false,
+      borderWidth: 2,
+      tension: 0,
+      fill: false,
     },
     {
       label: "Z",
-      data: buildAxisScatterData(points, (p) => p.z),
+      data: buildAxisPlotData(points, (p) => p.z),
       borderColor: "#dc2626",
       backgroundColor: "#dc2626",
-      pointRadius: 2,
+      pointRadius: 0,
       pointHoverRadius: 3,
-      showLine: false,
+      borderWidth: 2,
+      tension: 0,
+      fill: false,
     },
   ];
 }
 
-function buildInclinometerDatasets(points: InclinometerPlotPoint[]) {
+function buildInclinometerDatasets(points: InclinometerPlotPoint[]): SensorDataset[] {
   return [
     {
       label: "Roll",
-      data: buildAxisScatterData(points, (p) => p.roll),
+      data: buildAxisPlotData(points, (p) => p.roll),
       borderColor: "#7c3aed",
       backgroundColor: "#7c3aed",
-      pointRadius: 2,
+      pointRadius: 0,
       pointHoverRadius: 3,
-      showLine: false,
+      borderWidth: 2,
+      tension: 0,
+      fill: false,
     },
     {
       label: "Pitch",
-      data: buildAxisScatterData(points, (p) => p.pitch),
+      data: buildAxisPlotData(points, (p) => p.pitch),
       borderColor: "#ea580c",
       backgroundColor: "#ea580c",
-      pointRadius: 2,
+      pointRadius: 0,
       pointHoverRadius: 3,
-      showLine: false,
+      borderWidth: 2,
+      tension: 0,
+      fill: false,
     },
     {
       label: "Yaw",
-      data: buildAxisScatterData(points, (p) => p.yaw),
+      data: buildAxisPlotData(points, (p) => p.yaw),
       borderColor: "#0891b2",
       backgroundColor: "#0891b2",
-      pointRadius: 2,
+      pointRadius: 0,
       pointHoverRadius: 3,
-      showLine: false,
+      borderWidth: 2,
+      tension: 0,
+      fill: false,
     },
   ];
 }
 
-function buildTemperatureDatasets(points: TemperaturePlotPoint[], unit: string) {
+function buildTemperatureDatasets(
+  points: TemperaturePlotPoint[],
+  unit: string
+): SensorDataset[] {
   return [
     {
       label: unit ? `Temperature (${unit})` : "Temperature",
-      data: buildAxisScatterData(points, (p) => p.value),
+      data: buildAxisPlotData(points, (p) => p.value),
       borderColor: "#d97706",
       backgroundColor: "#d97706",
-      pointRadius: 2,
+      pointRadius: 0,
       pointHoverRadius: 3,
-      showLine: false,
+      borderWidth: 2,
+      tension: 0,
+      fill: false,
     },
   ];
 }
 
-export default function SensorLineChart({
+function buildChartOptions(
+  points: { ts: string }[],
+  yAxisLabel: string,
+  onViewportChange?: (zoomed: boolean) => void
+): ChartOptions<"line"> {
+  const maxIndex = Math.max(points.length - 1, 1);
+  const minRange = Math.max(Math.min(points.length - 1, 20), 1);
+
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    parsing: false,
+    interaction: {
+      mode: "nearest",
+      intersect: false,
+    },
+    plugins: {
+      legend: {
+        display: false,
+      },
+      tooltip: {
+        enabled: true,
+        callbacks: {
+          title(items) {
+            const raw = items[0]?.raw as PlotPoint | undefined;
+            return raw ? formatTimeLabel(raw.ts) : "";
+          },
+        },
+      },
+      zoom: {
+        limits: {
+          x: {
+            min: 0,
+            max: maxIndex,
+            minRange,
+          },
+        },
+        pan: {
+          enabled: true,
+          mode: "x",
+          modifierKey: "shift",
+          onPanStart() {
+            onViewportChange?.(true);
+          },
+        },
+        zoom: {
+          mode: "x",
+          wheel: {
+            enabled: true,
+            modifierKey: "ctrl",
+            speed: 0.08,
+          },
+          drag: {
+            enabled: true,
+            modifierKey: "alt",
+            backgroundColor: "rgba(37, 99, 235, 0.10)",
+            borderColor: "rgba(37, 99, 235, 0.35)",
+            borderWidth: 1,
+          },
+          onZoomStart() {
+            onViewportChange?.(true);
+          },
+        },
+      },
+    },
+    scales: {
+      x: {
+        type: "linear",
+        ticks: {
+          maxTicksLimit: 8,
+          callback(value) {
+            const index = Math.round(Number(value));
+            const point = points[index];
+            return point ? formatTimeLabel(point.ts) : "";
+          },
+        },
+        title: {
+          display: true,
+          text: "Time",
+        },
+      },
+      y: {
+        beginAtZero: false,
+        title: {
+          display: true,
+          text: yAxisLabel,
+        },
+      },
+    },
+  };
+}
+
+function SensorLineChart({
   title,
   data,
   height = 420,
+  onZoomStateChange,
 }: Props) {
+  const chartRefs = useRef<Record<string, ChartJS<"line"> | null>>({});
+  const [chartZoomState, setChartZoomState] = useState<Record<string, boolean>>({});
+
   const channelOptions = useMemo(() => {
     if (data.sensor === "accelerometer") {
       return [
@@ -174,7 +304,6 @@ export default function SensorLineChart({
     channelOptions.map((option) => option.key)
   );
 
-  // Reset channel selection when the plotted sensor type changes.
   useEffect(() => {
     setSelectedChannels(channelOptions.map((option) => option.key));
   }, [channelOptions]);
@@ -183,81 +312,75 @@ export default function SensorLineChart({
     data.sensor === "accelerometer"
       ? buildAccelerometerDatasets(data.points)
       : data.sensor === "inclinometer"
-      ? buildInclinometerDatasets(data.points)
-      : buildTemperatureDatasets(data.points, data.unit ?? "");
+        ? buildInclinometerDatasets(data.points)
+        : buildTemperatureDatasets(data.points, data.unit ?? "");
 
-  const datasets = allDatasets.filter((dataset) => {
+  const visibleDatasets = allDatasets.filter((dataset) => {
     if (!channelOptions.length) return true;
     return selectedChannels.includes(String(dataset.label));
   });
 
-  const chartData: ChartData<"scatter"> = {
-    datasets,
-  };
+  const visibleDatasetLabelsKey = visibleDatasets
+    .map((dataset) => dataset.label)
+    .join("|");
 
-  const options: ChartOptions<"scatter"> = {
-    responsive: true,
-    maintainAspectRatio: false,
-    parsing: false,
-    interaction: {
-      mode: "nearest",
-      intersect: false,
-    },
-    plugins: {
-      legend: {
-        display: true,
-        position: "top",
-      },
-      tooltip: {
-        enabled: true,
-        callbacks: {
-          title(items) {
-            const raw = items[0]?.raw as ScatterPoint | undefined;
-            return raw ? formatTimeLabel(raw.ts) : "";
-          },
-        },
-      },
-      title: {
-        display: true,
-        text: title,
-      },
-    },
-    scales: {
-      x: {
-        type: "linear",
-        ticks: {
-          maxTicksLimit: 8,
-          callback(value) {
-            const index = Math.round(Number(value));
-            const point = data.points[index];
-            return point ? formatTimeLabel(point.ts) : "";
-          },
-        },
-        title: {
-          display: true,
-          text: "Time",
-        },
-      },
-      y: {
-        beginAtZero: false,
-        title: {
-          display: true,
-          text: data.unit ?? "",
-        },
-      },
-    },
-  };
+  useEffect(() => {
+    setChartZoomState((prev) => {
+      const visibleLabels = new Set(visibleDatasets.map((dataset) => dataset.label));
+      let changed = false;
+      const next: Record<string, boolean> = {};
+
+      Object.entries(prev).forEach(([label, zoomed]) => {
+        if (visibleLabels.has(label)) {
+          next[label] = zoomed;
+        } else {
+          changed = true;
+        }
+      });
+
+      return changed ? next : prev;
+    });
+  }, [visibleDatasetLabelsKey, visibleDatasets]);
+
+  useEffect(() => {
+    onZoomStateChange?.(Object.values(chartZoomState).some(Boolean));
+  }, [chartZoomState, onZoomStateChange]);
+
+  useEffect(() => {
+    return () => {
+      onZoomStateChange?.(false);
+    };
+  }, [onZoomStateChange]);
+
+  const perChartHeight = visibleDatasets.length > 1 ? 250 : height;
 
   function handleChannelToggle(channel: string) {
     setSelectedChannels((current) => {
       if (current.includes(channel)) {
-        // Keep at least one channel selected so the plot never goes blank by accident.
+                // Keep at least one channel selected so the plot never goes blank by accident.
         if (current.length === 1) return current;
         return current.filter((value) => value !== channel);
       }
 
       return [...current, channel];
     });
+  }
+
+  function getYAxisLabel(datasetLabel: string): string {
+    if (!data.unit) return datasetLabel;
+    return `${datasetLabel} (${data.unit})`;
+  }
+
+  function setDatasetZoomState(label: string, zoomed: boolean) {
+    setChartZoomState((prev) => {
+      if ((prev[label] ?? false) === zoomed) return prev;
+      return { ...prev, [label]: zoomed };
+    });
+  }
+
+  function handleResetZoom(label: string) {
+    chartRefs.current[label]?.resetZoom();
+    setDatasetZoomState(label, false);
   }
 
   return (
@@ -281,9 +404,60 @@ export default function SensorLineChart({
         </div>
       )}
 
-      <div style={{ width: "100%", height }}>
-        <Scatter data={chartData} options={options} />
+      <div className="sp-plot-stack">
+        {visibleDatasets.map((dataset) => {
+          const chartData: ChartData<"line"> = {
+            datasets: [dataset],
+          };
+
+          return (
+            <section key={dataset.label} className="sp-plot-card">
+              <div className="sp-plot-card-header">
+                <div className="sp-plot-heading">
+                  <div className="sp-plot-title-row">
+                    <span className="sp-plot-title">{title}</span>
+                    <span className="sp-plot-badge">{dataset.label}</span>
+                  </div>
+
+                  <div className="sp-plot-meta">
+                    {dataset.data.length} samples
+                  </div>
+                </div>
+
+                <div className="sp-plot-actions">
+                  <button
+                    type="button"
+                    className="sp-plot-btn"
+                    onClick={() => handleResetZoom(dataset.label)}
+                  >
+                    Reset zoom
+                  </button>
+                </div>
+              </div>
+
+              <div className="sp-plot-canvas" style={{ height: perChartHeight }}>
+                <Line
+                  ref={(chart) => {
+                    chartRefs.current[dataset.label] = chart ?? null;
+                  }}
+                  data={chartData}
+                  options={buildChartOptions(
+                    data.points,
+                    getYAxisLabel(dataset.label),
+                    (zoomed) => setDatasetZoomState(dataset.label, zoomed)
+                  )}
+                />
+              </div>
+
+              <div className="sp-plot-hint">
+                Ctrl + wheel to zoom, Alt + drag to zoom box, Shift + drag to pan
+              </div>
+            </section>
+          );
+        })}
       </div>
     </div>
   );
 }
+
+export default memo(SensorLineChart);

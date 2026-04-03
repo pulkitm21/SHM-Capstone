@@ -148,52 +148,126 @@
 .sm-plot-toolbar {
   display: flex;
   justify-content: space-between;
-  align-items: flex-start;
-  gap: 16px;
-  margin-bottom: 14px;
+  align-items: flex-end;
+  gap: 18px;
+  margin-bottom: 16px;
 }
 
-.sm-filter-row {
+.sm-plot-copy {
   display: flex;
-  gap: 12px;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sm-plot-controls {
+  display: flex;
+  align-items: flex-end;
+  gap: 14px;
   flex-wrap: wrap;
 }
 
-.sm-filter-group {
+.sm-control-block {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
+  min-width: 170px;
 }
 
-.sm-filter-group label {
-  font-size: 12px;
-  font-weight: 700;
+.sm-control-label {
+  font-size: 11px;
+  font-weight: 800;
   color: #6f7c8d;
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.05em;
+  line-height: 1;
 }
 
-.sm-filter-group select {
-  min-width: 140px;
+.sm-control-select {
+  min-width: 170px;
   height: 38px;
-  border-radius: 10px;
+  border-radius: 14px;
   border: 1px solid #d6dde6;
   background: #ffffff;
-  padding: 0 12px;
+  padding: 0 42px 0 14px;
   color: #223042;
-  font-weight: 600;
-}
-
-.sm-plot-status {
-  margin-bottom: 10px;
   font-size: 13px;
-  color: #5f6b7a;
+  font-weight: 700;
+  box-shadow: none;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
 }
 
-.sm-plot-note {
-  margin-bottom: 12px;
+.sm-control-select:hover {
+  border-color: #bfd0e0;
+  background: #fbfcfe;
+}
+
+.sm-control-select:focus {
+  border-color: #b7c8da;
+  box-shadow: 0 0 0 3px rgba(191, 208, 224, 0.22);
+  background: #ffffff;
+}
+
+.sm-plot-meta-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.sm-refresh-state {
   font-size: 12px;
-  color: #6f7c8d;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+}
+
+.sm-refresh-state.live {
+  color: #1e6b36;
+}
+
+.sm-refresh-state.paused {
+  color: #a05c00;
+}
+
+.sm-last-updated-pill {
+  min-height: 34px;
+  padding: 0 14px;
+  border-radius: 999px;
+  background: #eef2f7;
+  color: #223042;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.sm-refresh-button {
+  min-height: 34px;
+  padding: 0 16px;
+  border-radius: 999px;
+  border: 1px solid #d6dde6;
+  background: #ffffff;
+  color: #223042;
+  font-size: 13px;
+  font-weight: 800;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.sm-refresh-button:hover:not(:disabled) {
+  background: #f7f9fc;
+  border-color: #bfd0e0;
+}
+
+.sm-refresh-button:active {
+  background: #eef3f8;
+}
+
+.sm-refresh-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .sm-plot-wrap {
@@ -259,49 +333,21 @@
   .sm-sensor-grid {
     grid-template-columns: 1fr;
   }
-}
-.sm-refresh-button {
-  padding: 6px 12px;
-  font-size: 13px;
-  font-weight: 500;
-  border-radius: 6px;
-  border: 1px solid #d1d5db;
-  background-color: #ffffff;
-  cursor: pointer;
-  transition: all 0.15s ease;
-}
 
-.sm-refresh-button:hover {
-  background-color: #f3f4f6;
-  border-color: #9ca3af;
-}
+  .sm-plot-controls {
+    width: 100%;
+    align-items: stretch;
+  }
 
-.sm-refresh-button:active {
-  background-color: #e5e7eb;
-}
+  .sm-control-block {
+    width: 100%;
+  }
 
-.sm-refresh-button:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
-.sm-plot-actions {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
+  .sm-control-select {
+    width: 100%;
+  }
 
-.sm-last-updated {
-  min-height: 30px;
-  padding: 0 10px;
-  border-radius: 999px;
-  background: #eef2f7;
-  font-size: 12px;
-  font-weight: 700;
-  display: inline-flex;
-  align-items: center;
-  color: #223042;
-}
-
-.sm-refresh-button:hover:not(:disabled) {
-  background: #f3f7fa;
+  .sm-plot-meta-group {
+    width: 100%;
+  }
 }

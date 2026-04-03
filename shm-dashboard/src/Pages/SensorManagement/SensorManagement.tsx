@@ -9,6 +9,7 @@ import FaultLog from "../../components/FaultLog/Log";
 import SensorLineChart from "../../components/SensorPlot/SensorPlot";
 import NodeTable from "../../components/NodeTable/NodeTable";
 import SensorCardGrid from "../../components/SensorCardGrid/SensorCardGrid";
+import NodeControlCard from "../../components/NodeControlCard/NodeControlCard";
 
 import {
   getSettings,
@@ -42,6 +43,7 @@ import "./SensorManagement.css";
 const SETTINGS_CACHE_KEY = "shm_settings_cache";
 const PLOT_CACHE_KEY = "shm_plot_cache";
 const SENSOR_STATUS_POLL_MS = 5000;
+const PLOT_AUTO_REFRESH_MS = 5000;
 
 type PlotCacheRecord = {
   savedAt: string;
@@ -402,8 +404,9 @@ export default function SensorManagement() {
   const [plotStatus, setPlotStatus] = useState("Loading…");
   const [plotRefreshKey, setPlotRefreshKey] = useState(0);
   const [plotLastUpdated, setPlotLastUpdated] = useState<Date | null>(null);
+  const [isPlotPaused, setIsPlotPaused] = useState(false);
 
-  // Refresh settings from backend and merge them with fallback defaults.
+    // Refresh settings from backend and merge them with fallback defaults.
   const refreshSettingsFromBackend = useCallback(async () => {
     const json = await getSettings();
 
@@ -466,7 +469,7 @@ export default function SensorManagement() {
     };
   }, []);
 
-  // Select the requested serial if present, otherwise keep current or default to the first node.
+    // Select the requested serial if present, otherwise keep current or default to the first node.
   useEffect(() => {
     if (!nodes.length) {
       setSelectedNodeLabel("");
@@ -495,7 +498,7 @@ export default function SensorManagement() {
   const nodeId = selectedNode?.node_id ?? 0;
   const nodeKey = selectedNode?.serial ?? "none";
 
-  // Load sensor metadata and saved configuration.
+    // Load sensor metadata and saved configuration.
   useEffect(() => {
     if (UI_PREVIEW_MODE) {
       setMetaByNode(PREVIEW_META_BY_NODE);
@@ -539,7 +542,7 @@ export default function SensorManagement() {
     };
   }, [refreshSettingsFromBackend]);
 
-  // Ensure the selected node always has fallback meta/config entries.
+    // Ensure the selected node always has fallback meta/config entries.
   function ensureNodeDefaults(n: number) {
     if (!n) return;
 
@@ -555,7 +558,7 @@ export default function SensorManagement() {
     if (nodeId) ensureNodeDefaults(nodeId);
   }, [nodeId]);
 
-  // Apply accelerometer configuration optimistically, then publish to backend.
+    // Apply accelerometer configuration, then publish to backend.
   async function handleApplyAccelerometerConfig(updated: {
     odr_index: 0 | 1 | 2;
     range: 1 | 2 | 3;
@@ -660,7 +663,7 @@ export default function SensorManagement() {
     }
   }
 
-  // Load recent node-specific faults for the selected node.
+    // Load recent node-specific faults for the selected node.
   useEffect(() => {
     if (UI_PREVIEW_MODE) {
       if (!selectedNode?.serial) {
@@ -711,7 +714,7 @@ export default function SensorManagement() {
     return () => controller.abort();
   }, [selectedNode?.serial]);
 
-  // Load lightweight fault summaries for the node table.
+    // Load lightweight fault summaries for the node table.
   useEffect(() => {
     if (!nodes.length) {
       setAllFaultCountsBySerial({});
@@ -764,7 +767,7 @@ export default function SensorManagement() {
     }
   }, [sensor, timeframeMin]);
 
-  // Load backend-driven per-sensor status so each sensor can be independent of node status.
+    // Load backend-driven per-sensor status so each sensor can be independent of node status.
   useEffect(() => {
     if (!selectedNode) {
       setSensorStatusMap(buildFallbackSensorStatus(false, []));
@@ -851,7 +854,23 @@ export default function SensorManagement() {
     setPlotRefreshKey((prev) => prev + 1);
   }
 
-  // Load plot data for the currently selected sensor and time window.
+    // Load plot data for the currently selected sensor and time window.
+  useEffect(() => {
+    setIsPlotPaused(false);
+  }, [nodeId, nodeKey, sensor, timeframeMin]);
+
+  useEffect(() => {
+    if (UI_PREVIEW_MODE || !nodeId || isPlotPaused) return;
+
+    const intervalId = window.setInterval(() => {
+      setPlotRefreshKey((prev) => prev + 1);
+    }, PLOT_AUTO_REFRESH_MS);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [nodeId, nodeKey, sensor, timeframeMin, isPlotPaused]);
+
   useEffect(() => {
     if (UI_PREVIEW_MODE) {
       if (!nodeId) {
@@ -883,9 +902,9 @@ export default function SensorManagement() {
 
       const cache = loadPlotCache();
       const cachedEntry = cache[cacheKey];
-      const isManualRefresh = plotRefreshKey > 0;
+      const isRefresh = plotRefreshKey > 0;
 
-      if (!isManualRefresh && hasPlotPoints(cachedEntry?.data ?? null)) {
+      if (!isRefresh && hasPlotPoints(cachedEntry?.data ?? null)) {
         setApiData(cachedEntry!.data);
         setPlotLastUpdated(new Date(cachedEntry!.savedAt));
         setPlotStatus(
@@ -894,7 +913,7 @@ export default function SensorManagement() {
           ).toLocaleString()})`
         );
       } else {
-        setPlotStatus(isManualRefresh ? "Refreshing…" : "Loading…");
+        setPlotStatus(isRefresh ? "Refreshing…" : "Loading…");
         if (!hasPlotPoints(cachedEntry?.data ?? null)) {
           setApiData(null);
         }
@@ -937,8 +956,9 @@ export default function SensorManagement() {
     ? configByNode[nodeId] ?? FALLBACK_CONFIG
     : FALLBACK_CONFIG;
   const config = configForNode[sensor];
+  const nodeRuntimeState = configForNode.accelerometer.current_state;
 
-  // Build sensor cards from backend-provided per-sensor status.
+    // Build sensor cards from backend-provided per-sensor status.
   const sensorCards = useMemo(() => {
     return SENSOR_DEFINITIONS.map((sensorDef) => {
       const sensorMeta =
@@ -1028,36 +1048,44 @@ export default function SensorManagement() {
               onSelectSensor={setSensor}
             />
 
-            <SensorConfigCard
-              title={`${selectedSensorDef.label} Configuration`}
-              config={config}
-              onApply={handleApplyAccelerometerConfig}
+            <NodeControlCard
+              title="Node Control"
+              state={nodeRuntimeState}
               onStart={() => handleNodeControl("start")}
               onStop={() => handleNodeControl("stop")}
               onReset={() => handleNodeControl("reset")}
-              disabled={
-                !selectedNode ||
-                sensor !== "accelerometer" ||
-                !isAdmin
-              }
+              disabled={!selectedNode || !isAdmin}
             />
+
+            {/* Show configuration only for the accelerometer. */}
+            {sensor === "accelerometer" && (
+              <SensorConfigCard
+                title={`${selectedSensorDef.label} Configuration`}
+                config={config}
+                onApply={handleApplyAccelerometerConfig}
+                disabled={!selectedNode || !isAdmin}
+              />
+            )}
 
             <div className="sm-panel sm-full-width-panel">
               <div className="sm-plot-toolbar">
-                <div>
+                <div className="sm-plot-copy">
                   <h2 className="sm-panel-title">
                     {selectedSensorDef.label} Raw Live Preview
                   </h2>
                   <p className="sm-panel-subtitle">
-                    Current-hour raw preview for {selectedNode.serial}. Use Export for long-range analysis.
+                    Use Export for long-range analysis.
                   </p>
                 </div>
 
-                <div className="sm-filter-row">
-                  <div className="sm-filter-group">
-                    <label htmlFor="sm-timeframe">Window</label>
+                <div className="sm-plot-controls">
+                  <div className="sm-control-block">
+                    <label htmlFor="sm-timeframe" className="sm-control-label">
+                      Window
+                    </label>
                     <select
                       id="sm-timeframe"
+                      className="sm-control-select"
                       value={timeframeMin}
                       onChange={(e) => setTimeframeMin(Number(e.target.value))}
                     >
@@ -1069,10 +1097,16 @@ export default function SensorManagement() {
                     </select>
                   </div>
 
-                  <div className="sm-plot-actions">
-                    <span className="sm-last-updated">
+                  <div className="sm-plot-meta-group">
+                    <span className={`sm-refresh-state ${isPlotPaused ? "paused" : "live"}`}>
+                      {isPlotPaused
+                        ? "Auto-refresh paused"
+                        : `Auto-refresh every ${PLOT_AUTO_REFRESH_MS / 1000}s`}
+                    </span>
+
+                    <span className="sm-last-updated-pill">
                       {plotLastUpdated
-                        ? `Updated ${plotLastUpdated.toLocaleTimeString()}`
+                        ? `Last updated ${plotLastUpdated.toLocaleTimeString()}`
                         : "Not updated yet"}
                     </span>
 
@@ -1087,22 +1121,16 @@ export default function SensorManagement() {
                 </div>
               </div>
 
-              <div className="sm-plot-status">{plotStatus}</div>
-              <div className="sm-plot-note">
-                Raw live preview is limited to short windows from the current hour file.
-              </div>
-
               <div className="sm-plot-wrap">
                 {apiData && selectedNode && hasPlotPoints(apiData) ? (
                   <SensorLineChart
                     title={`${selectedSensorDef.label} (${selectedNode.serial})`}
                     data={apiData}
                     height={420}
+                    onZoomStateChange={setIsPlotPaused}
                   />
                 ) : (
-                  <div className="sm-plot-empty">
-                    {plotEmptyMessage}
-                  </div>
+                  <div className="sm-plot-empty">{plotEmptyMessage}</div>
                 )}
               </div>
             </div>

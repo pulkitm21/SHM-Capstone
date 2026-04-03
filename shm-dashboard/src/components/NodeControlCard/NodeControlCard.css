@@ -1,0 +1,132 @@
+.nc-shell {
+  background: #ffffff;
+  border-radius: 18px;
+  padding: 20px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.08);
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.nc-topbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.nc-title {
+  margin: 0;
+  font-size: 1.5rem;
+  line-height: 1.1;
+  font-weight: 800;
+  color: #111827;
+}
+
+.nc-subtitle {
+  margin: 6px 0 0;
+  font-size: 0.95rem;
+  color: #5f6b7a;
+}
+
+.nc-topbar-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.nc-action-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.nc-btn {
+  min-height: 42px;
+  border-radius: 999px;
+  border: 1px solid #d6dde6;
+  background: #ffffff;
+  color: #223042;
+  padding: 0 16px;
+  font-size: 14px;
+  font-weight: 800;
+  cursor: pointer;
+  transition: transform 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease;
+}
+
+.nc-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.08);
+}
+
+.nc-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.nc-btn-neutral {
+  background: #ffffff;
+  color: #223042;
+}
+
+.nc-btn-danger {
+  background: #f8eef0;
+  border-color: #e7b5bf;
+  color: #9b2f45;
+}
+
+.nc-btn-warning {
+  background: #fff4e5;
+  border-color: #ffd59e;
+  color: #a35c00;
+}
+
+.nc-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+  background: #eef2f7;
+  color: #223042;
+}
+
+.nc-pill-success {
+  background: #edf9f0;
+  color: #1e6b36;
+}
+
+.nc-pill-warning {
+  background: #fff7e8;
+  color: #a05c00;
+}
+
+.nc-pill-danger {
+  background: #f8eef0;
+  color: #9b2f45;
+}
+
+.nc-note {
+  margin: 0;
+  font-size: 13px;
+  color: #6f7c8d;
+}
+
+@media (max-width: 900px) {
+  .nc-topbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .nc-topbar-actions,
+  .nc-action-group {
+    justify-content: flex-start;
+  }
+}
