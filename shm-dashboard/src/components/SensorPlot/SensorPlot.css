@@ -40,8 +40,130 @@
   font-weight: 700;
   color: #223042;
   cursor: pointer;
+  transition: background 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.sp-channel-option:hover {
+  background: #f7f9fc;
+  border-color: #bfd0e0;
 }
 
 .sp-channel-option input {
   margin: 0;
+}
+
+.sp-plot-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.sp-plot-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 14px 12px;
+  border: 1px solid #d6dde6;
+  border-radius: 16px;
+  background: #ffffff;
+  box-shadow: 0 6px 18px rgba(17, 33, 45, 0.06);
+}
+
+.sp-plot-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.sp-plot-heading {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sp-plot-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.sp-plot-title {
+  font-size: 14px;
+  font-weight: 800;
+  color: #223042;
+}
+
+.sp-plot-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: #eef4ff;
+  color: #1d4ed8;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.sp-plot-meta {
+  font-size: 12px;
+  font-weight: 700;
+  color: #6f7c8d;
+}
+
+.sp-plot-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sp-plot-btn {
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid #d6dde6;
+  border-radius: 999px;
+  background: #ffffff;
+  color: #223042;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+  transition: background 0.18s ease, border-color 0.18s ease;
+}
+
+.sp-plot-btn:hover {
+  background: #f7f9fc;
+  border-color: #bfd0e0;
+}
+
+.sp-plot-canvas {
+  width: 100%;
+  min-height: 220px;
+  padding: 8px 6px 2px;
+  border-radius: 12px;
+  background: linear-gradient(180deg, #fcfdff 0%, #f8fbff 100%);
+  border: 1px solid #edf2f7;
+}
+
+.sp-plot-hint {
+  font-size: 12px;
+  font-weight: 700;
+  color: #6f7c8d;
+}
+
+@media (max-width: 768px) {
+  .sp-plot-card {
+    padding: 12px;
+  }
+
+  .sp-plot-card-header {
+    align-items: stretch;
+  }
+
+  .sp-plot-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
 }

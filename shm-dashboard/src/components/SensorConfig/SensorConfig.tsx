@@ -21,8 +21,7 @@ export type SensorConfig = {
 
   current_state: NodeState;
 
-  // These are kept optional for compatibility with any cached/settings payloads,
-  // but the UI no longer depends on them.
+  // These are kept optional for compatibility with any cached/settings payloads.
   pending_seq?: number | null;
   applied_seq?: number | null;
   last_ack_at?: string | null;
@@ -48,7 +47,7 @@ const DEFAULT_CONFIG: SensorConfig = {
   applied_hpf_corner: null,
   current_state: "unknown",
 
-  // ACK/SEQ fields retained only as inert compatibility fields.
+    // ACK/SEQ fields retained only as inert compatibility fields.
   pending_seq: null,
   applied_seq: null,
   last_ack_at: null,
@@ -75,8 +74,6 @@ function withDefaults(cfg?: Partial<SensorConfig> | null): SensorConfig {
     applied_range: cfg?.applied_range ?? DEFAULT_CONFIG.applied_range,
     applied_hpf_corner: cfg?.applied_hpf_corner ?? DEFAULT_CONFIG.applied_hpf_corner,
     current_state: cfg?.current_state ?? DEFAULT_CONFIG.current_state,
-
-    // compatibility defaults only.
     pending_seq: cfg?.pending_seq ?? DEFAULT_CONFIG.pending_seq,
     applied_seq: cfg?.applied_seq ?? DEFAULT_CONFIG.applied_seq,
     last_ack_at: cfg?.last_ack_at ?? DEFAULT_CONFIG.last_ack_at,
@@ -110,44 +107,10 @@ function prettyRange(value: AccelerometerRange | null) {
   return "±8g";
 }
 
-function prettyState(value: NodeState) {
-  switch (value) {
-    case "idle":
-      return "Idle";
-    case "configured":
-      return "Configured";
-    case "recording":
-      return "Recording";
-    case "reconfig":
-      return "Reconfiguring";
-    case "error":
-      return "Error";
-    default:
-      return "Unknown";
-  }
-}
-
-function pillClassForNodeState(state: NodeState) {
-  switch (state) {
-    case "recording":
-      return "sc-pill sc-pill-success";
-    case "configured":
-    case "reconfig":
-      return "sc-pill sc-pill-warning";
-    case "error":
-      return "sc-pill sc-pill-danger";
-    default:
-      return "sc-pill";
-  }
-}
-
 export default function SensorConfigCard({
   title = "Accelerometer Configuration",
   config,
   onApply,
-  onStart,
-  onStop,
-  onReset,
   disabled = false,
 }: {
   title?: string;
@@ -157,9 +120,6 @@ export default function SensorConfigCard({
     range: AccelerometerRange;
     hpf_corner: number;
   }) => void;
-  onStart: () => void;
-  onStop: () => void;
-  onReset: () => void;
   disabled?: boolean;
 }) {
   const safeConfig = useMemo(() => withDefaults(config), [config]);
@@ -173,6 +133,7 @@ export default function SensorConfigCard({
   const [draftHpf, setDraftHpf] = useState<number>(safeConfig.desired_hpf_corner);
   const [isEditing, setIsEditing] = useState(false);
 
+  // Keep the local draft aligned with backend-backed config changes.
   useEffect(() => {
     setDraftOdr(safeConfig.desired_odr_index);
     setDraftRange(safeConfig.desired_range);
@@ -188,23 +149,16 @@ export default function SensorConfigCard({
     draftRange !== safeConfig.desired_range ||
     draftHpf !== safeConfig.desired_hpf_corner;
 
-  // Always show desired/local config. We are not switching display state based on ACK.
+  // Always show desired config rather than ACK-dependent values.
   const displayConfig = {
     odr: safeConfig.desired_odr_index,
     range: safeConfig.desired_range,
     hpf: safeConfig.desired_hpf_corner,
   };
 
-  const startDisabled =
-    disabled || isEditing || safeConfig.current_state === "recording";
-
-  const stopDisabled =
-    disabled || isEditing || safeConfig.current_state !== "recording";
-
-  const resetDisabled = disabled || isEditing;
-
   const applyDisabled = disabled || !isDirty;
 
+  // Reset the local edit state without touching backend state.
   function handleCancelEdit() {
     setDraftOdr(safeConfig.desired_odr_index);
     setDraftRange(safeConfig.desired_range);
@@ -212,6 +166,7 @@ export default function SensorConfigCard({
     setIsEditing(false);
   }
 
+  // Send the updated accelerometer config to the page handler.
   function handleApplyClick() {
     onApply({
       odr_index: draftOdr,
@@ -227,19 +182,11 @@ export default function SensorConfigCard({
         <div>
           <h2 className="sc-title">{title}</h2>
           <p className="sc-subtitle">
-            Live configuration and acquisition status for the selected node.
+            Configuration values for the selected node.
           </p>
         </div>
 
         <div className="sc-topbar-actions">
-          <span className={pillClassForNodeState(safeConfig.current_state)}>
-            {prettyState(safeConfig.current_state)}
-          </span>
-
-          {/* 
-              Config/Control ACK pills intentionally removed.
-              Old UI depended on sync_status and control_status. */}
-
           {!disabled && !isEditing && (
             <button
               type="button"
@@ -254,12 +201,33 @@ export default function SensorConfigCard({
 
       <div className="sc-grid">
         <div className="sc-item">
-          <span className="sc-item-label">ODR</span>
+          <div className="sc-label-row">
+            <span className="sc-item-label">ODR</span>
+
+            {/* Tooltip for the ODR field. */}
+            <span className="sc-tooltip-wrap">
+              <button
+                type="button"
+                className="sc-tooltip-trigger"
+                aria-label="More information about ODR"
+              >
+                ?
+              </button>
+              <span className="sc-tooltip-bubble">
+                Output Data Rate. This controls how often the accelerometer
+                samples data. Higher values capture faster vibration changes, 
+                and are more resistance to noise, currently all ODR's downsample to 200Hz.
+              </span>
+            </span>
+          </div>
+
           {isEditing ? (
             <select
               className="sc-select"
               value={draftOdr}
-              onChange={(e) => setDraftOdr(Number(e.target.value) as AccelerometerOdrIndex)}
+              onChange={(e) =>
+                setDraftOdr(Number(e.target.value) as AccelerometerOdrIndex)
+              }
               disabled={disabled}
             >
               <option value={0}>{prettyDraftOdr(0)}</option>
@@ -277,7 +245,9 @@ export default function SensorConfigCard({
             <select
               className="sc-select"
               value={draftRange}
-              onChange={(e) => setDraftRange(Number(e.target.value) as AccelerometerRange)}
+              onChange={(e) =>
+                setDraftRange(Number(e.target.value) as AccelerometerRange)
+              }
               disabled={disabled}
             >
               <option value={1}>±2g</option>
@@ -290,7 +260,25 @@ export default function SensorConfigCard({
         </div>
 
         <div className="sc-item">
-          <span className="sc-item-label">HPF Corner</span>
+          <div className="sc-label-row">
+            <span className="sc-item-label">HPF Corner</span>
+
+            {/* Tooltip for the HPF field. */}
+            <span className="sc-tooltip-wrap">
+              <button
+                type="button"
+                className="sc-tooltip-trigger"
+                aria-label="More information about HPF Corner"
+              >
+                ?
+              </button>
+              <span className="sc-tooltip-bubble">
+                High-pass filter corner setting. This reduces low-frequency
+                content in the signal. A value of 0 keeps the filter off.
+              </span>
+            </span>
+          </div>
+
           {isEditing ? (
             <select
               className="sc-select"
@@ -310,59 +298,32 @@ export default function SensorConfigCard({
         </div>
       </div>
 
-      <div className="sc-footer-row">
-        {/* 
-            Runtime ACK/SEQ chips intentionally removed.
-            The old section displayed pending seq, applied seq, ACK timestamps, etc. */}
-
-        <div className="sc-action-group">
-          {isEditing ? (
-            <>
-              <button type="button" className="sc-btn sc-btn-neutral" onClick={handleCancelEdit}>
-                Cancel
-              </button>
-              <button
-                type="button"
-                className="sc-btn sc-btn-success"
-                onClick={handleApplyClick}
-                disabled={applyDisabled}
-              >
-                Apply
-              </button>
-            </>
-          ) : (
-            <>
-              <button
-                type="button"
-                className="sc-btn sc-btn-neutral"
-                onClick={onStart}
-                disabled={startDisabled}
-              >
-                Start
-              </button>
-              <button
-                type="button"
-                className="sc-btn sc-btn-danger"
-                onClick={onStop}
-                disabled={stopDisabled}
-              >
-                Stop
-              </button>
-              <button
-                type="button"
-                className="sc-btn sc-btn-warning"
-                onClick={onReset}
-                disabled={resetDisabled}
-              >
-                Reset
-              </button>
-            </>
-          )}
+      {isEditing && (
+        <div className="sc-footer-row">
+          <div className="sc-action-group">
+            <button
+              type="button"
+              className="sc-btn sc-btn-neutral"
+              onClick={handleCancelEdit}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="sc-btn sc-btn-success"
+              onClick={handleApplyClick}
+              disabled={applyDisabled}
+            >
+              Apply
+            </button>
+          </div>
         </div>
-      </div>
+      )}
 
       {disabled && (
-        <p className="sc-note">Configuration controls are only enabled for the accelerometer.</p>
+        <p className="sc-note">
+          Configuration editing is only enabled for the accelerometer.
+        </p>
       )}
     </section>
   );
