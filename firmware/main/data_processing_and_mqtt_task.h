@@ -2,13 +2,15 @@
  * @file data_processing_and_mqtt_task.h
  * @brief MQTT Publishing Task - Reads from sensor_task ring buffers
  *
- * Decimation factor, batch size, and sensitivity are runtime values read from
- * node_config_get(). They update automatically when the node is reconfigured.
- * See node_config.h for the ODR lookup table.
+ * Output rates (fixed, independent of accelerometer ODR):
+ *  - Acceleration:  200 Hz  (200 samples per 1-second packet)
+ *  - Inclination:    20 Hz  (20 samples batched per packet)
+ *  - Temperature:     1 Hz  (1 polled reading per packet)
  *
  * DATA INTEGRITY:
- * - No inclinometer/temperature data → shows null in JSON.
+ * - No sensor data / disconnected sensor -> NaN in JSON.
  * - Data gap during reconfiguration is expected and documented behaviour.
+ * - Each sensor is independent: one disconnected sensor does not affect others.
  */
 
 #ifndef DATA_PROCESSING_AND_MQTT_TASK_H

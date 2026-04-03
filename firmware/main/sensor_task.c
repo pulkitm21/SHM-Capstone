@@ -79,9 +79,10 @@ static const char *TAG = "sensor_task";
  * SCL3300 COMMANDS
  *****************************************************************************/
 
-// Angle register commands (0x24/0x28/0x2C) — NOT the acceleration registers
-// (0x04/0x08/0x0C). Using the wrong set caused ~33° Z reading when flat
-// because 1g of ACC_Z x (90/16384) x 6000 LSB/g = 32.96 degrees.
+// Angle register commands — must use 0x24/0x28/0x2C (READ_ANG_X/Y/Z).
+// The acceleration registers 0x04/0x08/0x0C look similar but return g-force,
+// which convert_scl3300_to_deg() then misinterprets: 1g * (90/16384) * 6000
+// = 32.96 degrees, causing the flat-surface Z reading of ~33 degrees.
 #define SCL3300_CMD_X           0x240000C7u   // READ_ANG_X
 #define SCL3300_CMD_Y           0x280000CDu   // READ_ANG_Y
 #define SCL3300_CMD_Z           0x2C0000CBu   // READ_ANG_Z
@@ -138,6 +139,15 @@ static bool s_scl_pipeline_primed = false;
 static bool s_scl_discard_first_sample = true;
 
 /*
+ * ISR inhibit flags: set by the task context reinit code to prevent the ISR
+ * from issuing SPI transactions to a sensor that is being re-initialised.
+ * The ISR checks these at the top of each sensor block and skips the entire
+ * read if the flag is set. volatile because written from task, read from ISR.
+ */
+static volatile bool s_adxl355_isr_inhibit = false;
+static volatile bool s_scl3300_isr_inhibit = false;
+
+/*
  * ISR-safe diagnostic counters for SCL3300 pipeline.
  * Written only from ISR; read from task context for logging.
  * volatile is sufficient - monotonically increasing debug counters only.
@@ -153,7 +163,7 @@ static volatile uint32_t s_scl_overflow_dbg = 0; // ring buffer full at ISR time
  * ACCESS FUNCTIONS FOR ISR
  *****************************************************************************/
 
-static inline void IRAM_ATTR read_adxl355_raw(int32_t *raw_x, int32_t *raw_y, int32_t *raw_z)
+static inline bool IRAM_ATTR read_adxl355_raw(int32_t *raw_x, int32_t *raw_y, int32_t *raw_z)
 {
     uint8_t tx[10] = {0};
     uint8_t rx[10] = {0};
@@ -175,6 +185,19 @@ static inline void IRAM_ATTR read_adxl355_raw(int32_t *raw_x, int32_t *raw_y, in
        ADXL355 uses automatic CS in its driver config. */
     spi_device_polling_transmit(adxl355_spi_handle, &t);
 
+    /*
+     * Detect disconnected sensor: if all data bytes are identical (all 0xFF
+     * or all 0x00), the MISO line is floating. rx[0] is the response to the
+     * address byte so we check data bytes rx[1..9].
+     */
+    bool all_same = true;
+    for (int i = 2; i <= 9; i++) {
+        if (rx[i] != rx[1]) { all_same = false; break; }
+    }
+    if (all_same && (rx[1] == 0xFF || rx[1] == 0x00)) {
+        return false;
+    }
+
     uint32_t x_u = ((uint32_t)rx[1] << 12) | ((uint32_t)rx[2] << 4) | ((uint32_t)rx[3] >> 4);
     uint32_t y_u = ((uint32_t)rx[4] << 12) | ((uint32_t)rx[5] << 4) | ((uint32_t)rx[6] >> 4);
     uint32_t z_u = ((uint32_t)rx[7] << 12) | ((uint32_t)rx[8] << 4) | ((uint32_t)rx[9] >> 4);
@@ -182,6 +205,8 @@ static inline void IRAM_ATTR read_adxl355_raw(int32_t *raw_x, int32_t *raw_y, in
     *raw_x = (x_u & 0x80000u) ? (int32_t)(x_u | 0xFFF00000u) : (int32_t)x_u;
     *raw_y = (y_u & 0x80000u) ? (int32_t)(y_u | 0xFFF00000u) : (int32_t)y_u;
     *raw_z = (z_u & 0x80000u) ? (int32_t)(z_u | 0xFFF00000u) : (int32_t)z_u;
+
+    return true;
 }
 
 static inline void IRAM_ATTR scl3300_isr_transfer(uint32_t cmd, uint32_t *resp_out)
@@ -217,6 +242,32 @@ static inline void IRAM_ATTR scl3300_isr_transfer(uint32_t cmd, uint32_t *resp_o
     }
 }
 
+/**
+ * @brief Validate an SCL3300 SPI response frame.
+ *
+ * The 32-bit response is structured as:
+ *   [opcode:2][RS:2][data:16][CRC:8]    (bits 31..0)
+ *
+ * Return Status (RS) bits [25:24]:
+ *   0x00 = Startup in progress   → invalid
+ *   0x01 = Normal operation      → VALID
+ *   0x02 = Reserved              → invalid
+ *   0x03 = Error                 → invalid
+ *
+ * Additionally, all-0x00 or all-0xFF frames indicate a physically absent
+ * sensor (MISO floating low or high). Reject those unconditionally.
+ */
+static inline bool IRAM_ATTR scl3300_response_valid(uint32_t resp)
+{
+    /* Reject trivially invalid frames from disconnected sensor */
+    if (resp == 0x00000000u || resp == 0xFFFFFFFFu) {
+        return false;
+    }
+    /* Check RS bits — only 0x01 (normal operation) is valid data */
+    uint8_t rs = (uint8_t)((resp >> 24) & 0x03u);
+    return (rs == SCL3300_RS_NORMAL);
+}
+
 static inline int16_t IRAM_ATTR scl3300_unpack_raw16(uint32_t resp)
 {
     return (int16_t)((resp >> 8) & 0xFFFFu);
@@ -249,6 +300,15 @@ static inline bool IRAM_ATTR read_scl3300_raw(int16_t *raw_x, int16_t *raw_y, in
     scl3300_isr_transfer(SCL3300_CMD_Y, &resp_x);
     scl3300_isr_transfer(SCL3300_CMD_Z, &resp_y);
     scl3300_isr_transfer(SCL3300_CMD_X, &resp_z);
+
+    /* Validate all three response frames. If any frame has bad RS bits
+       or looks like a disconnected sensor, reject the whole sample. */
+    if (!scl3300_response_valid(resp_x) ||
+        !scl3300_response_valid(resp_y) ||
+        !scl3300_response_valid(resp_z)) {
+        s_scl_invalid_count++;
+        return false;
+    }
 
     *raw_x = scl3300_unpack_raw16(resp_x);
     *raw_y = scl3300_unpack_raw16(resp_y);
@@ -288,7 +348,8 @@ static bool IRAM_ATTR timer_isr_handler(gptimer_handle_t timer,
     uint32_t current_read_index;
 
     /* ADXL355 @ 1000 Hz */
-    if (((tick_counter - ADXL355_OFFSET) & (ADXL355_TICK_DIVISOR - 1u)) == 0u)
+    if (!s_adxl355_isr_inhibit &&
+        ((tick_counter - ADXL355_OFFSET) & (ADXL355_TICK_DIVISOR - 1u)) == 0u)
     {
         next_write_index = (adxl355_ring_buffer.write_index + 1u) & (ADXL355_BUFFER_SIZE - 1u);
         current_read_index = adxl355_ring_buffer.read_index;
@@ -299,21 +360,27 @@ static bool IRAM_ATTR timer_isr_handler(gptimer_handle_t timer,
         }
         else
         {
-            adxl355_ring_buffer.buffer[adxl355_ring_buffer.write_index].tick = tick_counter;
+            int32_t rx, ry, rz;
+            bool valid = read_adxl355_raw(&rx, &ry, &rz);
 
-            read_adxl355_raw(
-                &adxl355_ring_buffer.buffer[adxl355_ring_buffer.write_index].raw_x,
-                &adxl355_ring_buffer.buffer[adxl355_ring_buffer.write_index].raw_y,
-                &adxl355_ring_buffer.buffer[adxl355_ring_buffer.write_index].raw_z
-            );
+            if (valid) {
+                adxl355_ring_buffer.buffer[adxl355_ring_buffer.write_index].tick = tick_counter;
+                adxl355_ring_buffer.buffer[adxl355_ring_buffer.write_index].raw_x = rx;
+                adxl355_ring_buffer.buffer[adxl355_ring_buffer.write_index].raw_y = ry;
+                adxl355_ring_buffer.buffer[adxl355_ring_buffer.write_index].raw_z = rz;
 
-            adxl355_ring_buffer.write_index = next_write_index;
-            adxl355_sample_count++;
+                adxl355_ring_buffer.write_index = next_write_index;
+                adxl355_sample_count++;
+            }
+            /* If invalid (disconnected sensor), sample is silently dropped.
+             * The watchdog in data_processing_task detects the stalled
+             * sample_count and emits NaN packets + fault codes. */
         }
     }
 
     /* SCL3300 @ 20 Hz */
-    if (((tick_counter - SCL3300_OFFSET) % SCL3300_TICK_DIVISOR) == 0u)
+    if (!s_scl3300_isr_inhibit &&
+        ((tick_counter - SCL3300_OFFSET) % SCL3300_TICK_DIVISOR) == 0u)
     {
         s_scl_isr_fired++;
 
@@ -640,6 +707,29 @@ void sensor_acquisition_reset_stats(void)
      * two SCL3300 samples on every start, causing "null" inclinometer readings
      * if startup is delayed (e.g. by network timeouts).
      */
+}
+
+void scl3300_reset_isr_pipeline(void)
+{
+    /*
+     * Reset the SCL3300 pipeline state so the ISR re-primes on the next tick.
+     * This must be called from task context after the sensor has been
+     * re-initialised (hot-plug reconnect). The ISR will see pipeline_primed=false,
+     * send a priming command, discard the first sample, then resume normal
+     * rolling reads.
+     */
+    s_scl_pipeline_primed      = false;
+    s_scl_discard_first_sample = true;
+}
+
+void adxl355_isr_set_inhibit(bool inhibit)
+{
+    s_adxl355_isr_inhibit = inhibit;
+}
+
+void scl3300_isr_set_inhibit(bool inhibit)
+{
+    s_scl3300_isr_inhibit = inhibit;
 }
 
 uint32_t adxl355_get_overflow_count(void)

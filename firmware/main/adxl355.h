@@ -125,6 +125,26 @@ esp_err_t adxl355_set_range(uint8_t range);
 esp_err_t adxl355_read_temperature(float *temperature_c);
 
 /**
+ * @brief Run a self-test on the ADXL355.
+ *
+ * Activates the built-in electrostatic self-test (ST1/ST2 bits in SELF_TEST
+ * register), waits for the output to settle, reads the Z-axis deflection, then
+ * disables the self-test and waits for recovery.
+ *
+ * The datasheet specifies that with ST1=1 and ST2=0 the Z output must deflect
+ * by a positive amount in the range [0.3g, 3.0g] for ±2g range.  We verify
+ * this deflection is present and within limits.  If it passes we know:
+ *   1. The sensor is electrically present and communicating.
+ *   2. The mechanical sensing element is functional.
+ *   3. The ADC is producing reasonable values.
+ *
+ * @param[out] passed  Set to true if all checks pass, false otherwise.
+ * @return ESP_OK if the SPI transfers succeeded (check *passed for result).
+ *         ESP_ERR_INVALID_STATE if the sensor is not initialised.
+ */
+esp_err_t adxl355_selftest(bool *passed);
+
+/**
  * @brief Low-level register read (used by node_config for reconfiguration).
  * @param reg    Register address
  * @param data   Output buffer

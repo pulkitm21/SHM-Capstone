@@ -51,6 +51,15 @@ static esp_netif_t *s_eth_netif = NULL;
 static esp_eth_handle_t s_eth_handle = NULL;
 static esp_eth_netif_glue_handle_t s_eth_glue = NULL;
 static bool s_initialized = false;
+static bool s_eth_ever_connected = false; // distinguish first link-up from recovery
+
+/* Optional callback invoked every time an IP is obtained */
+static ethernet_got_ip_cb_t s_got_ip_cb = NULL;
+
+void ethernet_set_got_ip_cb(ethernet_got_ip_cb_t cb)
+{
+    s_got_ip_cb = cb;
+}
 
 // ethernet_init_all() allocates an array of handles
 static esp_eth_handle_t *s_eth_handles = NULL;
@@ -78,8 +87,12 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
         if (s_eth_event_group) {
             xEventGroupSetBits(s_eth_event_group, ETH_CONNECTED_BIT);
         }
-        /* FAULT 2: Ethernet link came back up */
-        fault_log_record(FAULT_ETH_LINK_RECOVERED);
+        /* Only log recovery for reconnects, not the initial link-up at boot */
+        if (s_eth_ever_connected) {
+            fault_log_record(FAULT_ETH_LINK_RECOVERED);
+        } else {
+            s_eth_ever_connected = true;
+        }
         break;
 
     case ETHERNET_EVENT_DISCONNECTED:
@@ -87,7 +100,6 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
         if (s_eth_event_group) {
             xEventGroupClearBits(s_eth_event_group, ETH_CONNECTED_BIT | ETH_GOT_IP_BIT);
         }
-        /* FAULT 1: Ethernet link lost */
         fault_log_record(FAULT_ETH_LINK_DOWN);
         break;
 
@@ -124,6 +136,12 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
 
     if (s_eth_event_group) {
         xEventGroupSetBits(s_eth_event_group, ETH_GOT_IP_BIT);
+    }
+
+    /* Notify application layer — used to start MQTT/SNTP on first IP,
+     * and to allow reconnection logic on subsequent IP events. */
+    if (s_got_ip_cb) {
+        s_got_ip_cb(s_eth_netif);
     }
 }
 
@@ -318,7 +336,6 @@ esp_err_t ethernet_wait_for_ip(uint32_t timeout_ms)
         return ESP_OK;
     }
     ESP_LOGW(TAG, "Timeout waiting for IP address");
-    /* FAULT 3: Failed to obtain IP within the timeout */
     fault_log_record(FAULT_ETH_NO_IP);
     return ESP_ERR_TIMEOUT;
 }

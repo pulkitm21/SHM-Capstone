@@ -294,6 +294,95 @@ esp_err_t adxl355_read_temperature(float *temperature_c)
     return ESP_OK;
 }
 /* -------------------------------------------------------------------------
+ * Self-test
+ * Per ADXL355 datasheet Table 52: write ST1=1, ST2=0 to SELF_TEST register
+ * to apply an electrostatic force on the sensing element.  The Z axis must
+ * deflect by +0.3 g to +3.0 g (for ±2g range, 256000 LSB/g nominal).
+ * ST1=1 ST2=1 drives in the opposite direction; we use ST1 only.
+ * After the test, restore SELF_TEST=0 and wait for the output to settle.
+ * ---------------------------------------------------------------------- */
+
+esp_err_t adxl355_selftest(bool *passed)
+{
+    if (passed == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_dev) {
+        ESP_LOGE(TAG, "Self-test: sensor not initialized");
+        *passed = false;
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    *passed = false;
+
+    /* Sensor must be in measurement mode (POWER_CTL = 0x00) to apply ST */
+    esp_err_t err;
+
+    /* Baseline: read Z with self-test OFF */
+    uint8_t b[9] = {0};
+    err = adxl355_read_reg(ADXL355_REG_XDATA3, b, 9);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Self-test: baseline read failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    uint32_t z0_u = ((uint32_t)b[6] << 12) | ((uint32_t)b[7] << 4) | ((uint32_t)b[8] >> 4);
+    int32_t  z0   = sign_extend_20b(z0_u);
+
+    /* Enable self-test: ST1=1, ST2=0 */
+    err = adxl355_write_reg(ADXL355_REG_SELF_TEST, 0x01);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Self-test: ST enable failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    /* Wait for self-test deflection to settle (datasheet: ≥4 ODR periods;
+     * at 1000 Hz that is 4 ms — use 20 ms for margin) */
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    /* Read Z with self-test ON */
+    memset(b, 0, sizeof(b));
+    err = adxl355_read_reg(ADXL355_REG_XDATA3, b, 9);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Self-test: ST read failed: %s", esp_err_to_name(err));
+        /* Disable ST before returning */
+        (void)adxl355_write_reg(ADXL355_REG_SELF_TEST, 0x00);
+        return err;
+    }
+    uint32_t z1_u = ((uint32_t)b[6] << 12) | ((uint32_t)b[7] << 4) | ((uint32_t)b[8] >> 4);
+    int32_t  z1   = sign_extend_20b(z1_u);
+
+    /* Disable self-test and wait for output to recover */
+    err = adxl355_write_reg(ADXL355_REG_SELF_TEST, 0x00);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Self-test: ST disable failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    /* Evaluate deflection.
+     * Datasheet: ±2g range → sensitivity ~256000 LSB/g
+     * Expected deflection: +0.3g to +3.0g → +76800 to +768000 LSB.
+     * We use a relaxed lower bound (0.15g) to accommodate unit variation. */
+    int32_t delta = z1 - z0;
+    const int32_t ST_MIN_LSB = (int32_t)(0.15f * 256000.0f); /*  38400 */
+    const int32_t ST_MAX_LSB = (int32_t)(4.0f  * 256000.0f); /* 1024000 */
+
+    ESP_LOGI(TAG, "Self-test: z0=%ld z1=%ld delta=%ld (min=%ld max=%ld)",
+             (long)z0, (long)z1, (long)delta,
+             (long)ST_MIN_LSB, (long)ST_MAX_LSB);
+
+    if (delta >= ST_MIN_LSB && delta <= ST_MAX_LSB) {
+        *passed = true;
+        ESP_LOGI(TAG, "Self-test PASS");
+    } else {
+        ESP_LOGW(TAG, "Self-test FAIL: delta %ld out of range [%ld, %ld]",
+                 (long)delta, (long)ST_MIN_LSB, (long)ST_MAX_LSB);
+    }
+
+    return ESP_OK;
+}
+
+/* -------------------------------------------------------------------------
  * Public register access wrappers
  * Used by node_config.c for reconfiguration and self-test.
  * Thin wrappers around the static SPI helpers to avoid duplicating framing.

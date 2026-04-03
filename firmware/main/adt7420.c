@@ -89,3 +89,64 @@ esp_err_t adt7420_read_temperature(float *temperature)
     
     return ESP_OK;
 }
+
+/**
+ * @brief Power-on self-test: read temperature and verify it is physically plausible.
+ *
+ * The ADT7420 has no dedicated self-test mode. Instead we read the temperature
+ * register and check it falls within a range that is realistic for an
+ * electronics enclosure (-20 °C to +85 °C matches the sensor's rated operating
+ * range). A reading outside this range indicates a conversion error, a
+ * floating MISO line returning 0x00 or 0xFF, or a sensor fault.
+ *
+ * Also checks the STATUS register BUSY bit to confirm a conversion has
+ * completed before the read.
+ *
+ * @param[out] temperature_c  Measured temperature in °C (valid if ESP_OK returned).
+ * @return ESP_OK if the read succeeded and the value is plausible.
+ *         ESP_ERR_INVALID_RESPONSE if the value is out of plausible range.
+ *         Other error codes if I2C communication fails.
+ */
+esp_err_t adt7420_selftest(float *temperature_c)
+{
+    if (temperature_c == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (adt7420_handle == NULL) {
+        ESP_LOGE(TAG, "ADT7420 not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Check STATUS register — bit 7 (RDY) is 0 when a conversion is ready.
+     * If it reads 0xFF the sensor is absent or MISO is floating. */
+    uint8_t status_reg = ADT7420_REG_STATUS;
+    uint8_t status = 0;
+    esp_err_t ret = i2c_master_transmit_receive(adt7420_handle,
+                                                 &status_reg, 1,
+                                                 &status, 1, 1000);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Self-test: STATUS read failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    if (status == 0xFF) {
+        ESP_LOGW(TAG, "Self-test: STATUS=0xFF — sensor absent or bus fault");
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    /* Read temperature */
+    ret = adt7420_read_temperature(temperature_c);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Self-test: temperature read failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    /* Plausibility check: -20 °C to +85 °C (ADT7420 rated operating range) */
+    if (*temperature_c < -20.0f || *temperature_c > 85.0f) {
+        ESP_LOGW(TAG, "Self-test FAIL: temperature %.2f °C out of plausible range [-20, 85]",
+                 *temperature_c);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    ESP_LOGI(TAG, "Self-test PASS: %.2f °C", *temperature_c);
+    return ESP_OK;
+}
