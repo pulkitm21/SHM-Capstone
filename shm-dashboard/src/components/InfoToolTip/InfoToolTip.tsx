@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import "./InfoTooltip.css";
+import "./InfoToolTip.css";
 
 export default function InfoTooltip({
   label = "More information",

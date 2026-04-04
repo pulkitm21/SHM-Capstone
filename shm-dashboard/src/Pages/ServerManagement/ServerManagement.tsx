@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import useAuth from "../../Auth/useAuth";
+import InfoTooltip from "../../components/InfoToolTip/InfoToolTip";
 import {
   clearFaults,
   getHealth,
@@ -85,6 +86,30 @@ function getPillClass(state: BackendHealthBadgeState) {
 function getPillLabel(state: BackendHealthBadgeState) {
   if (state === "OK") return "Online";
   return "Offline";
+}
+
+function ActionInfo({
+  title,
+  tooltip,
+  button,
+}: {
+  title: string;
+  tooltip: string;
+  button: ReactNode;
+}) {
+  return (
+    <div className="server-action-item">
+      <div className="server-action-heading-row">
+        <h3 className="server-action-title">{title}</h3>
+        <InfoTooltip
+          label={`More information about ${title}`}
+          content={tooltip}
+        />
+      </div>
+
+      <div className="server-action-cta">{button}</div>
+    </div>
+  );
 }
 
 export default function ServerManagementPage() {
@@ -486,17 +511,23 @@ export default function ServerManagementPage() {
           </div>
 
           <div className="server-button-row">
-            <button
-              type="button"
-              className="server-action-btn server-action-btn-danger"
-              onClick={() => void handleUnmountStorage()}
-              disabled={!isAdmin || runningAction === "unmount-storage"}
-              title={!isAdmin ? "Admin only" : "Unmount SSD"}
-            >
-              {runningAction === "unmount-storage"
-                ? "Unmounting..."
-                : "Unmount SSD"}
-            </button>
+            <ActionInfo
+              title="Unmount SSD"
+              tooltip="Safely disconnects the SSD from the system. Use before removing the SSD or when checking storage-related issues."
+              button={
+                <button
+                  type="button"
+                  className="server-action-btn server-action-btn-danger"
+                  onClick={() => void handleUnmountStorage()}
+                  disabled={!isAdmin || runningAction === "unmount-storage"}
+                  title={!isAdmin ? "Admin only" : "Unmount SSD"}
+                >
+                  {runningAction === "unmount-storage"
+                    ? "Unmounting..."
+                    : "Unmount SSD"}
+                </button>
+              }
+            />
           </div>
         </article>
 
@@ -549,79 +580,105 @@ export default function ServerManagementPage() {
           </div>
 
           <div className="server-button-stack">
-            <button
-              type="button"
-              className="server-action-btn"
-              onClick={() =>
-                void runServerAction(
-                  "restart-backend",
-                  "Restart backend",
-                  restartBackendService,
-                  "Restart the backend service now?"
-                )
+            <ActionInfo
+              title="Restart Backend"
+              tooltip="Restarts the dashboard backend service. Use when pages stop loading, API requests fail, or login/auth stops responding."
+              button={
+                <button
+                  type="button"
+                  className="server-action-btn"
+                  onClick={() =>
+                    void runServerAction(
+                      "restart-backend",
+                      "Restart backend",
+                      restartBackendService,
+                      "Restart the backend service now?"
+                    )
+                  }
+                  disabled={!isAdmin || runningAction === "restart-backend"}
+                  title={!isAdmin ? "Admin only" : "Restart Backend"}
+                >
+                  {runningAction === "restart-backend"
+                    ? "Restarting..."
+                    : "Restart Backend"}
+                </button>
               }
-              disabled={!isAdmin || runningAction === "restart-backend"}
-              title={!isAdmin ? "Admin only" : "Restart Backend"}
-            >
-              {runningAction === "restart-backend"
-                ? "Restarting..."
-                : "Restart Backend"}
-            </button>
+            />
 
-            <button
-              type="button"
-              className="server-action-btn"
-              onClick={() =>
-                void runServerAction(
-                  "restart-mqtt",
-                  "Restart MQTT",
-                  restartMqttService,
-                  "Restart the MQTT broker service now?"
-                )
+            <ActionInfo
+              title="Restart MQTT"
+              tooltip="Restarts the MQTT broker used by the sensor nodes. Use when MQTT is offline or node data is not reaching the backend."
+              button={
+                <button
+                  type="button"
+                  className="server-action-btn"
+                  onClick={() =>
+                    void runServerAction(
+                      "restart-mqtt",
+                      "Restart MQTT",
+                      restartMqttService,
+                      "Restart the MQTT broker service now?"
+                    )
+                  }
+                  disabled={!isAdmin || runningAction === "restart-mqtt"}
+                  title={!isAdmin ? "Admin only" : "Restart MQTT"}
+                >
+                  {runningAction === "restart-mqtt"
+                    ? "Restarting..."
+                    : "Restart MQTT"}
+                </button>
               }
-              disabled={!isAdmin || runningAction === "restart-mqtt"}
-              title={!isAdmin ? "Admin only" : "Restart MQTT"}
-            >
-              {runningAction === "restart-mqtt"
-                ? "Restarting..."
-                : "Restart MQTT"}
-            </button>
+            />
 
-            <button
-              type="button"
-              className="server-action-btn"
-              onClick={() =>
-                void runServerAction(
-                  "renew-vpn",
-                  "Renew VPN certificate",
-                  renewVpnCertificate,
-                  "Renew the VPN certificate now?"
-                )
+            <ActionInfo
+              title="Renew VPN Certificate"
+              tooltip="Renews the VPN certificate used for remote access. Use when the certificate is close to expiring or VPN access fails because of certificate issues."
+              button={
+                <button
+                  type="button"
+                  className="server-action-btn"
+                  onClick={() =>
+                    void runServerAction(
+                      "renew-vpn",
+                      "Renew VPN certificate",
+                      renewVpnCertificate,
+                      "Renew the VPN certificate now?"
+                    )
+                  }
+                  disabled={!isAdmin || runningAction === "renew-vpn"}
+                  title={!isAdmin ? "Admin only" : "Renew VPN Certificate"}
+                >
+                  {runningAction === "renew-vpn"
+                    ? "Renewing..."
+                    : "Renew VPN Certificate"}
+                </button>
               }
-              disabled={!isAdmin || runningAction === "renew-vpn"}
-              title={!isAdmin ? "Admin only" : "Renew VPN Certificate"}
-            >
-              {runningAction === "renew-vpn"
-                ? "Renewing..."
-                : "Renew VPN Certificate"}
-            </button>
+            />
 
-            <button
-              type="button"
-              className="server-action-btn server-action-btn-danger"
-              onClick={() =>
-                void runServerAction(
-                  "reboot-server",
-                  "Reboot server",
-                  rebootServer,
-                  "Reboot the Raspberry Pi now? This will disconnect the dashboard temporarily."
-                )
+            <ActionInfo
+              title="Reboot Pi"
+              tooltip="Fully restarts the Raspberry Pi and all services. Use when multiple services are failing or smaller recovery actions did not work."
+              button={
+                <button
+                  type="button"
+                  className="server-action-btn server-action-btn-danger"
+                  onClick={() =>
+                    void runServerAction(
+                      "reboot-server",
+                      "Reboot server",
+                      rebootServer,
+                      "Reboot the Raspberry Pi now? This will disconnect the dashboard temporarily."
+                    )
+                  }
+                  disabled={!isAdmin || runningAction === "reboot-server"}
+                  title={!isAdmin ? "Admin only" : "Reboot Pi"}
+                >
+                  {runningAction === "reboot-server"
+                    ? "Rebooting..."
+                    : "Reboot Pi"}
+                </button>
               }
-              disabled={!isAdmin || runningAction === "reboot-server"}
-              title={!isAdmin ? "Admin only" : "Reboot Pi"}
-            >
-              {runningAction === "reboot-server" ? "Rebooting..." : "Reboot Pi"}
-            </button>
+            />
           </div>
         </article>
 
@@ -633,51 +690,46 @@ export default function ServerManagementPage() {
             </div>
           </div>
 
-          <div className="server-maintenance-grid">
-            <div className="server-maintenance-panel">
-              <h3 className="server-panel-title">Delete Old Data</h3>
-              <p className="server-panel-text">
-                Remove stored data files older than the selected retention
-                window.
-              </p>
+          <div className="server-maintenance-row">
+            <ActionInfo
+              title="Delete Old Data"
+              tooltip="Deletes stored sensor files older than the selected retention period. Use when storage is getting full and older files are no longer needed."
+              button={
+                <div className="server-inline-form">
+                  <label className="server-field">
+                    <span className="server-field-label">Retention (days)</span>
+                    <input
+                      type="number"
+                      min={1}
+                      step={1}
+                      value={retentionDays}
+                      onChange={(event) =>
+                        setRetentionDays(Number(event.target.value))
+                      }
+                      className="server-input"
+                      disabled={!isAdmin}
+                    />
+                  </label>
 
-              <div className="server-inline-form">
-                <label className="server-field">
-                  <span className="server-field-label">Retention (days)</span>
-                  <input
-                    type="number"
-                    min={1}
-                    step={1}
-                    value={retentionDays}
-                    onChange={(event) =>
-                      setRetentionDays(Number(event.target.value))
-                    }
-                    className="server-input"
-                    disabled={!isAdmin}
-                  />
-                </label>
+                  <button
+                    type="button"
+                    className="server-action-btn server-action-btn-danger"
+                    onClick={() => void handlePruneData()}
+                    disabled={!isAdmin || runningAction === "prune-data"}
+                    title={!isAdmin ? "Admin only" : "Delete Old Data"}
+                  >
+                    {runningAction === "prune-data"
+                      ? "Deleting..."
+                      : "Delete Old Data"}
+                  </button>
+                </div>
+              }
+            />
 
-                <button
-                  type="button"
-                  className="server-action-btn server-action-btn-danger"
-                  onClick={() => void handlePruneData()}
-                  disabled={!isAdmin || runningAction === "prune-data"}
-                  title={!isAdmin ? "Admin only" : "Delete Old Data"}
-                >
-                  {runningAction === "prune-data"
-                    ? "Deleting..."
-                    : "Delete Old Data"}
-                </button>
-              </div>
-            </div>
-
-            <div className="server-maintenance-panel">
-              <h3 className="server-panel-title">Clear Faults</h3>
-              <p className="server-panel-text">
-                Delete every fault log entry from the faults database.
-              </p>
-
-              <div className="server-button-row">
+            <ActionInfo
+              title="Clear Faults"
+              tooltip="Clears all saved fault log entries. Use after reviewing the fault history or when resetting the system after maintenance/testing."
+              button={
                 <button
                   type="button"
                   className="server-action-btn server-action-btn-danger"
@@ -689,8 +741,8 @@ export default function ServerManagementPage() {
                     ? "Clearing..."
                     : "Clear Faults"}
                 </button>
-              </div>
-            </div>
+              }
+            />
           </div>
         </article>
       </section>

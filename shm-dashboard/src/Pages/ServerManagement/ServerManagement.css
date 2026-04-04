@@ -29,6 +29,13 @@
   color: #5c6f7f;
 }
 
+.server-page-subtitle {
+  margin: 10px 0 0;
+  font-size: 14px;
+  font-weight: 700;
+  color: #7a5a00;
+}
+
 .server-hero-actions {
   display: flex;
   align-items: center;
@@ -244,6 +251,10 @@
   margin-top: 16px;
 }
 
+.server-button-row-tight {
+  margin-top: 0;
+}
+
 .server-action-btn {
   font-size: 13px;
   font-weight: 700;
@@ -253,8 +264,11 @@
   background: #f7fafc;
   color: #173140;
   cursor: pointer;
-  transition: background 0.2s ease, transform 0.2s ease,
-    border-color 0.2s ease, opacity 0.2s ease;
+  transition:
+    background 0.2s ease,
+    transform 0.2s ease,
+    border-color 0.2s ease,
+    opacity 0.2s ease;
 }
 
 .server-action-btn:hover {
@@ -280,33 +294,42 @@
   border-color: rgba(178, 65, 59, 0.3);
 }
 
-.server-maintenance-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(220px, 1fr));
-  gap: 16px;
-}
-
-.server-maintenance-panel {
-  background: #f7fafc;
-  border: 1px solid rgba(17, 33, 45, 0.06);
-  border-radius: 16px;
-  padding: 16px;
+.server-action-item {
   display: flex;
-  flex-direction: column;
-  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(17, 33, 45, 0.06);
+  background: #f7fafc;
 }
 
-.server-panel-title {
+.server-action-heading-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.server-action-title {
   margin: 0;
-  font-size: 16px;
+  font-size: 15px;
+  font-weight: 800;
   color: #11212d;
 }
 
-.server-panel-text {
-  margin: 0;
-  font-size: 13px;
-  line-height: 1.6;
-  color: #5c6f7f;
+.server-action-cta {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-shrink: 0;
+}
+
+.server-maintenance-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(320px, 1fr));
+  gap: 16px;
 }
 
 .server-inline-form {
@@ -358,7 +381,7 @@
     grid-template-columns: repeat(2, minmax(150px, 1fr));
   }
 
-  .server-maintenance-grid {
+  .server-maintenance-row {
     grid-template-columns: 1fr;
   }
 }
@@ -379,6 +402,16 @@
 
   .server-storage-stats {
     grid-template-columns: 1fr;
+  }
+
+  .server-action-item {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .server-action-cta {
+    width: 100%;
+    justify-content: flex-start;
   }
 }
 
